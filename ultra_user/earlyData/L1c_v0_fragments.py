@@ -4,17 +4,16 @@ import matplotlib.pyplot as plt
 import healpy as hp
 
 
-droot = '/Users/demajr1/files/imap_ultra/SDC/imap_data/imap/ultra/'
+droot = 'data/imap/ultra'
 l1aRoot = droot+'l1a/2025/10/'
 l1bRoot = droot+'l1b/2025/10/'
 l1cRoot = droot+'l1c/2025/10/'
-repoint_string = '20251022-repoint00025'
+repoint_string = '20251021-repoint00024'
 head_string = '45'
 ver='v001'
 de = cdflib.CDF(l1bRoot+'imap_ultra_l1b_'+head_string+'sensor-de_'+repoint_string+'_'+ver+'.cdf')
 xspin = cdflib.CDF(l1bRoot+'imap_ultra_l1b_'+head_string+'sensor-extendedspin_'+repoint_string+'_'+ver+'.cdf')
 l1c = cdflib.CDF(l1cRoot+'imap_ultra_l1c_'+head_string+'sensor-spacecraftpset_'+repoint_string+'_'+ver+'.cdf')
-l1cNp = cdflib.CDF(l1cRoot+'imap_ultra_l1c_'+head_string+'sensor-spacecraftpset-nonproton_'+repoint_string+'_'+ver+'.cdf')
 
 
 deVars = de.cdf_info().zVariables

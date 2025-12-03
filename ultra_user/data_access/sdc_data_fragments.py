@@ -25,9 +25,14 @@ files = imap_data_access.query(instrument='ultra',data_level='l1b')
 files.extend(imap_data_access.query(instrument='ultra',data_level='l1a'))
 files.extend(imap_data_access.query(instrument='ultra',data_level='l1c'))
 
+# go for all l1b and l1c
+files = imap_data_access.query(instrument='ultra',data_level='l1b')
+files.extend(imap_data_access.query(instrument='ultra',data_level='l1c'))
+
 ic=0
+nf=len(files)
 for f in files:
-    print(f"{ic}:   {f['file_path']}")
+    print(f"{ic} of {nf}:   {f['file_path']}")
     imap_data_access.download(f['file_path'])
     ic=ic+1
 
