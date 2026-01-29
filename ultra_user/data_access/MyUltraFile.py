@@ -46,10 +46,10 @@ class MyUltraFile:
         fileName = candidates[np.argsort(vers)[-1]]
         if self.version != 'Latest':
             try:
-                iver = verNames.index('version')
+                iver = verNames.index(self.version)
             except ValueError:
                 return ""
-            fileName = fileName[iver]
+            fileName = candidates[iver]
         return fileName
 
 
@@ -67,6 +67,9 @@ def L1Bde(repointNum, version='Latest', sensor='90', rootDir='data/imap') -> MyU
     descriptor = 'de'
     return MyUltraFile('l1b', descriptor, repointNum, version=version, sensor=sensor, rootDir=rootDir)
 
+def L1Ade(repointNum, version='Latest', sensor='90', rootDir='data/imap') -> MyUltraFile:
+    descriptor = 'de'
+    return MyUltraFile('l1a', descriptor, repointNum, version=version, sensor=sensor, rootDir=rootDir)
 
 def L1Bxspin(repointNum, version='Latest', sensor='90', rootDir='data/imap') -> MyUltraFile:
     descriptor = 'extendedspin'
