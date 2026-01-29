@@ -37,7 +37,7 @@ energy_ranges = np.transpose(eranges)
 
 cnt_data = dict()
 
-repointings = np.append(range(27,48),range(50,59))
+repointings = np.append(range(27,48),range(50,64))
 
 #full cull
 cullData = dict()
@@ -243,92 +243,40 @@ plt.plot(cbins['center_time']-t0,cullData[repoint].get_count_summary()[:,1])
 plt.xlim(13000,18000)
 plt.show()
 
-# outdated - all channels
-fig,axs = plt.subplots(2,3)
-mxval = np.ndarray(6)
+
+
+## look at spin flags
+
+reject_ratio = np.ndarray( (len(repointings), 5))
+ip=0
 for repoint in repointings:
-    for ichan in range(6):
-        print(f"{repoint},{ichan}")
-        i = int(np.floor(ichan/3))
-        j =int(ichan % 3)
-        spinCenter = (cnt_data[repoint].spinbins[:,0]+cnt_data[repoint].spinbins[:,1])*.5
-        ii=np.nonzero(np.logical_and(spinCenter<1.e7,spinCenter>spinCenter[0]))[0]
-        cdat = cnt_data[repoint].get_count_summary()[ii,ichan]
-        axs[i,j].plot(spinCenter[ii],cdat,label=str(repoint))
-        mxval[ichan]=max([mxval[ichan],np.median(cdat)*2])
-for ichan in range(6):
-    i = int(np.floor(ichan / 3))
-    j = int(ichan % 3)
-    axs[i,j].set_ylim([0,mxval[ichan]])
+    de = MyUltraFile.L1Bde(repoint).data
+    ii1 = de['quality_outliers'] == 0
+    for ich in range(5):
+        ii0 = np.logical_and(de['energy_spacecraft'] > energy_ranges[ich, 0],de['energy_spacecraft'] < energy_ranges[ich, 1])
+        reject_ratio[ip,ich] = len(np.nonzero(ii0 & ii1)[0])/len(np.nonzero(ii0)[0])
+    ip+=1
+
+for ich in range(4):
+    plt.plot(repointings,reject_ratio[:,ich],label=f"Energy Range {ich}")
+plt.xlabel('pointing')
+plt.ylabel('acceptance ratio')
+plt.legend()
 plt.show()
 
-## demonstration of spin timimg problem
-repointing = 37
+
+repoint = 30
+ich = 1
 de = MyUltraFile.L1Bde(repoint).data
-xspin = MyUltraFile.L1Bxspin(repoint).data
-l1c = MyUltraFile.L1C(repoint).data
-status = MyUltraFile.L1Bstatus(repoint).data
-
-ispin = np.max(np.nonzero(xspin['spin_start_time'] < de['de_event_met'][0]))
-spindif = xspin['spin_number'][ispin] - de['spin'][0]
-print(spindif)
-
-############
-
-spinave=10
-n_spinbin = int(len(xspin['spin_number'])/spinave)
-
-spinRange = [np.min(xspin['spin_number']),np.max(xspin['spin_number'])]
-
-cnts = np.ndarray((n_spinbin,len(ebin_start)))
-eranges = np.ndarray((2,len(ebin_start)))
-spinranges = np.ndarray((2,int((spinRange[1]-spinRange[0])/spinave)))
-for ic in range(len(ebin_start)):
-    eranges[:,ic] = [l1c_ebins[ebin_start[ic]][0],l1c_ebins[ebin_end[ic]][1]]
-    ii0=np.nonzero(np.logical_and(de['energy_spacecraft'] > eranges[0,ic],de['energy_spacecraft'] < eranges[1,ic]))
-    spins = de['spin'][ii0]
-    for jc in range(int((spinRange[1]-spinRange[0])/spinave)):
-        spinranges[:,jc] = [jc*spinave+spinRange[0],(jc+1)*spinave+spinRange[0]]
-        jj0 = np.nonzero(np.logical_and(spins >= jc*spinave+spinRange[0], spins < (jc+1)*spinave+spinRange[0]))
-        cnts[jc,ic] = len(jj0[0])
-
-
-energy_ranges = np.transpose(eranges)
-cull0 = UltraCull0.UltraCull0(repoint,energy_ranges)
-cnts2 = cull0.get_count_summary()
-
-scaledCnts2 = np.zeros_like(cnts)
-for ic in range(len(cnts[0,:])):
-    scaledCnts2[:,ic] = (cnts[:,ic]-np.mean(cnts[:,ic]))/np.std(cnts[:,ic])
-
-cnt_data = dict()
-for repoint in range(35,48):
-    cnt_data[repoint] = UltraCull0.UltraCull0(repoint,energy_ranges)
-
-fig,axs = plt.subplots(2,3)
-mxval = np.ndarray(6)
-for repoint in range(35,51):
-    for ichan in range(6):
-        i = int(np.floor(ichan/3))
-        j =int(ichan % 3)
-        spinCenter = (cnt_data[repoint].spinbins[:,0]+cnt_data[repoint].spinbins[:,1])*.5
-        ii=np.nonzero(np.logical_and(spinCenter<1.e7,spinCenter>spinCenter[0]))[0]
-        cdat = cnt_data[repoint].get_count_summary()[ii,ichan]
-        axs[i,j].plot(spinCenter[ii],cdat,label=str(repoint))
-        mxval[ichan]=max([mxval[ichan],np.median(cdat)*2])
-for ichan in range(6):
-    i = int(np.floor(ichan / 3))
-    j = int(ichan % 3)
-    axs[i,j].set_ylim([0,mxval[ichan]])
+flag_names = ['FOV','PHCORR','COINPH','INVALID_ENERGY','DURINGPOINT','BACKTOF']
+for ic in range(6):
+    plt.plot(de['energy_spacecraft'],np.bitwise_and(de['quality_outliers'],2**ic),'.',label=flag_names[ic])
+plt.xlabel('Energy (keV)')
+plt.ylabel('Outlier flag')
+plt.xlim(1,1000)
+plt.xscale('log')
+#plt.yscale('log')
+plt.legend()
 plt.show()
 
-ichan=2
-mxd=0
-for repoint in range(35,48):
-    spinCenter = (cnt_data[repoint].spinbins[:, 0] + cnt_data[repoint].spinbins[:, 1]) * .5
-    ii = np.nonzero(np.logical_and(spinCenter < 1.e7, spinCenter > spinCenter[0]))[0]
-    cdat = cnt_data[repoint].get_count_summary()[ii, ichan]
-    plt.plot(spinCenter[ii], cdat, label=str(repoint))
-    mxd = max([mxd, np.median(cdat) * 2])
-plt.ylim(0,mxd)
-plt.show()
+
