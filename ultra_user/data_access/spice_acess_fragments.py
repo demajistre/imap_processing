@@ -37,8 +37,8 @@ for file in files:
     print(f"file {ic} of {len(files)}:{file['file_name']}")
     ic=ic+1
 
-repoint_url =  "https://api.imap-mission.com/repoint-table?start_date=20250101&end_date=20260108"
-spin_url = "https://api.imap-mission.com/spin-table?start_date=20250101&end_date=20260108"
+repoint_url =  "https://api.imap-mission.com/repoint-table?start_date=20250101&end_date=20260201"
+spin_url = "https://api.imap-mission.com/spin-table?start_date=20250101&end_date=20260201"
 files=requests.get(repoint_url).json()
 files.extend(requests.get(spin_url).json())
 ic=0

@@ -1,5 +1,6 @@
 from typing import Dict, Any, List
 
+import numpy
 import numpy as np
 import ultra_user.data_access.MyUltraFile as MyUltraFile
 import numpy.typing as npt
@@ -33,11 +34,7 @@ class UltraCull0():
     def get_count_summary(self) -> npt.NDArray[int]:
         cnts = np.ndarray((self.n_spinbin, len(self.energy_ranges[:, 0])))
         for ic in range(len(self.energy_ranges[:, 0])):
-            ii0 = np.nonzero(
-                np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ic, 0],
-                               self.de['energy_spacecraft'] < self.energy_ranges[ic, 1]))
-            #    spins = self.de['spin'][ii0]
-            deMet = self.de['de_event_met'][ii0]
+            deMet = self.goodEventMet(ic)
             for jc in range(self.n_spinbin):
                 #            jj0 = np.nonzero(
                 #                np.logical_and(spins >= self.spinbins[jc, 0], spins < self.spinbins[jc, 1]))
@@ -45,6 +42,17 @@ class UltraCull0():
                     np.logical_and(deMet >= self.binTimes[jc, 0], deMet < self.binTimes[jc, 1]))
                 cnts[jc, ic] = len(jj0[0])
         return cnts
+
+    def goodEventMet(self, ieBin:int) -> npt.NDArray:
+        ebin_range = [1, 19]
+        ii = np.nonzero(np.logical_and(
+                np.logical_and(
+                np.logical_and(np.logical_and(
+                    np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
+                               self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
+                    self.de['quality_outliers'] == 0), self.de['quality_scattering'] == 0),
+                self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]))
+        return self.de['de_event_met'][ii]
 
     def get_dvolt_summary(self) -> (npt.NDArray[float], npt.NDArray[float], npt.NDArray[float]):
         dvMean = np.full(self.n_spinbin, np.nan)
@@ -172,6 +180,13 @@ class UltraCull0():
                 mask[ic, :] = np.logical_and(mask[ic, :], emask)
             self.add_mask(mask, opName=f"energy channel {cull_channel} counts < {threshold}")
         result["mask"] = emask
+        return result
+
+    def currentCullFraction(self) -> npt.NDArray[float]:
+        nen = len(self.energy_ranges[:, 0])
+        result = numpy.ndarray(nen, dtype=float)
+        for ic in range(nen):
+            result[ic] = len(np.nonzero(self.currentMask['bin_mask'][ic])[0])/self.n_spinbin
         return result
 
 
