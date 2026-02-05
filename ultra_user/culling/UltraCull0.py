@@ -8,13 +8,16 @@ import imap_processing.spice.time as spiceTime
 
 
 class UltraCull0():
-    def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=10, rootDir='data/imap'):
+    def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=20, rootDir='data/imap',
+                 sensor='90',thetaLim45=-10):
         self.currentMask = None
         self.repoint = repoint
         self.energy_ranges = energy_ranges
-        self.de = MyUltraFile.L1Bde(repoint, rootDir=rootDir).data
-        self.xspin = MyUltraFile.L1Bxspin(repoint, rootDir=rootDir).data
-        self.status = MyUltraFile.L1Bstatus(repoint, rootDir=rootDir).data
+        self.sensor = sensor
+        self.thetaLim45 = thetaLim45
+        self.de = MyUltraFile.L1Bde(repoint, rootDir=rootDir,sensor=sensor).data
+        self.xspin = MyUltraFile.L1Bxspin(repoint, rootDir=rootDir,sensor=sensor).data
+        self.status = MyUltraFile.L1Bstatus(repoint, rootDir=rootDir,sensor=sensor).data
         self.spin_range = spin_range
         self.n_spinbin = int(len(self.xspin['spin_number']) / self.spin_range)
         self.spinbins = np.ndarray((self.n_spinbin, 2))
@@ -26,7 +29,7 @@ class UltraCull0():
             if kc < self.n_spinbin:
                 self.spinbins[kc, 0] = self.xspin['spin_number'][ic]
                 self.binTimes[kc, 0] = self.xspin['spin_start_time'][ic]
-                lastInd = np.min([ic + 9, iLast])
+                lastInd = np.min([ic + self.spin_range-1, iLast])
                 self.spinbins[kc, 1] = self.xspin['spin_number'][lastInd]
                 self.binTimes[kc, 1] = self.xspin['spin_start_time'][lastInd] + self.xspin['spin_period'][lastInd]
             kc = kc + 1
@@ -45,13 +48,24 @@ class UltraCull0():
 
     def goodEventMet(self, ieBin:int) -> npt.NDArray:
         ebin_range = [1, 19]
-        ii = np.nonzero(np.logical_and(
+        if self.sensor == 90:
+            ii = np.nonzero(np.logical_and(
                 np.logical_and(
                 np.logical_and(np.logical_and(
                     np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
                                self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
                     self.de['quality_outliers'] == 0), self.de['quality_scattering'] == 0),
                 self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]))
+        else:
+            ii = np.nonzero(np.logical_and(np.logical_and(
+                np.logical_and(
+                np.logical_and(np.logical_and(
+                    np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
+                               self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
+                    self.de['quality_outliers'] == 0), self.de['quality_scattering'] == 0),
+                self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]),
+                self.de['theta'] > self.thetaLim45))
+
         return self.de['de_event_met'][ii]
 
     def get_dvolt_summary(self) -> (npt.NDArray[float], npt.NDArray[float], npt.NDArray[float]):
@@ -173,7 +187,7 @@ class UltraCull0():
         result = {'cull_channel': cull_channel, 'threshold': threshold, 'apply': apply}
         nen = len(self.energy_ranges[:, 0])
         cnt_summary = self.get_count_summary()
-        emask = np.logical_and(cnt_summary[:, cull_channel] < threshold, cnt_summary[:, cull_channel] > 0)
+        emask = np.logical_and(cnt_summary[:, cull_channel] < threshold, cnt_summary[:, cull_channel] >= 0)
         if apply is True:
             mask = self.currentMask['bin_mask'].copy()
             for ic in range(len(self.energy_ranges[:, 0])):

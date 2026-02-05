@@ -55,7 +55,7 @@ for repoint in repointings:
     cnt_sum[repoint] = cullData[repoint].get_count_summary()
     vcull[repoint] = cullData[repoint].voltage_cull()
     ecull[repoint] = cullData[repoint].high_energy_cull()
-    scull[repoint] = cullData[repoint].statistical_cull(n_iter=10)
+    scull[repoint] = cullData[repoint].statistical_cull()
     cullFrac[repoint] = cullData[repoint].currentCullFraction()
 
 cFrac = np.ndarray((nen,len(repointings)))
@@ -77,7 +77,6 @@ for ech in range(4):
 plt.legend()
 plt.show()
 
-print()
 for ic in range(len(repointings)):
     print(repointings[ic],cFrac[0:3,ic],cfrac2[0:3,ic])
 
@@ -122,5 +121,82 @@ for repoint in repointings:
         axs[ech].plot([np.mean(tDay)], [np.mean(cnt_sum[repoint][:,ech])], '.r')
 axs[nch-1].set_xlabel("day of 2025")
 plt.show()
+
+#full cull
+t0 = spiceypy.sce2t(-43,spiceypy.str2et("2025-01-01T00"))*2.e-5 +1#magic number time conversion
+nch=4
+fig,axs = plt.subplots(nch)
+for repoint in repointings:
+    print(repoint)
+    tDay = (cullData[repoint].center_spin()['center_time']-t0)/86400
+    for ech in range(nch):
+        cnts = cullData[repoint].get_count_summary()[:,ech]
+        ii = np.nonzero(cullData[repoint].currentMask['bin_mask'][ech,:])[0]
+        axs[ech].plot(tDay, cnts,'r')
+        if len(ii) > 0:
+            color='g'
+            if scull[repoint]['converge'][ech] == False:
+                color='b'
+            axs[ech].plot(tDay[ii], cnts[ii], color)
+for ech in range(nch):
+    axs[ech].set_ylim(0,30)
+    axs[ech].set_ylabel(f"counts ({ech})")
+axs[nch-1].set_xlabel("day of 2025")
+plt.show()
+
+# look for non-converged
+ich = 0
+nonconv = list()
+for repoint in repointings:
+    if not scull[repoint]['converge'][ich]:
+        nonconv.append(repoint)
+
+
+# focus on 1 repointing (from scratch - then check against full run
+pointing = nonconv[0] # non convergent
+
+c0 = UltraCull0.UltraCull0(pointing,energy_ranges,spin_range=20)
+ctime = c0.center_spin()['center_time']
+
+cnts0 = c0.get_count_summary()[:,ich]
+cntsHi = c0.get_count_summary()[:,4]
+ctime0 = ctime
+minv=np.minimum(c0.status['rightdeflection_v'], c0.status['leftdeflection_v'])
+vc = c0.voltage_cull()
+iiv = np.nonzero(vc['binMask'])[0]
+ec = c0.high_energy_cull()
+iie = np.nonzero(ec['mask'])[0]
+sc = c0.statistical_cull()
+iis = np.nonzero(sc['mask'][ich,:])[0]
+
+
+fig,ax1 = plt.subplots()
+ax1.set_xlabel('MET seconds')
+ax2 = ax1.twinx()
+ax2.set_ylabel('Mininum deflector voltage (V)')
+ax1.set_ylabel(f"Bin {ich} counts/bin")  # we already handled the x-label with ax1
+ax2.plot(c0.status['shcoarse'],minv,'r',label='Mininum deflector voltage (V)')
+ax1.plot(ctime,cnts0,'b',label=f"Bin {ich} counts/bin")
+ax1.legend()
+ax2.legend()
+plt.show()
+
+fig,ax1 = plt.subplots()
+ax1.set_xlabel('MET seconds')
+ax2 = ax1.twinx()
+ax2.set_ylabel('High energy channel')
+ax1.set_ylabel(f"Bin {ich} counts/bin")  # we already handled the x-label with ax1
+ax2.plot(ctime,cntsHi,'r',label=f"Counts in high energy Bin")
+ax2.plot(ctime,cntsHi*0+25,'-r')
+ax1.plot(ctime,cnts0,'b',label=f"Counts in Energy Bin {ich}")
+ax1.plot(ctime[iis],cnts0[iis],'g')
+ax1.legend()
+ax2.legend(loc='upper right')
+plt.show()
+
+#convergence check
+mu = np.mean(cnts0[iis])
+sig = np.std(cnts0[iis])
+
 
 #%% md
