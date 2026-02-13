@@ -14,7 +14,7 @@ from importlib import reload
 spiceypy.furnsh('data/imap/spice/sclk/imap_sclk_0103.tsc')
 spiceypy.furnsh('data/imap/spice/lsk/naif0012.tls')
 
-repoint = 32
+repoint = 53
 de = MyUltraFile.L1Bde(repoint,sensor='45').data
 xspin = MyUltraFile.L1Bxspin(repoint,sensor='45').data
 l1c = MyUltraFile.L1C(repoint,sensor='45').data

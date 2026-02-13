@@ -5,16 +5,17 @@ import numpy as np
 import ultra_user.data_access.MyUltraFile as MyUltraFile
 import numpy.typing as npt
 import imap_processing.spice.time as spiceTime
+import ultra_user.planets.ENA_planets as ENA_planets
 
 
 class UltraCull0():
     def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=20, rootDir='data/imap',
-                 sensor='90',thetaLim45=-10):
+                 sensor='90',earthAng45=np.radians(15)):
         self.currentMask = None
         self.repoint = repoint
         self.energy_ranges = energy_ranges
         self.sensor = sensor
-        self.thetaLim45 = thetaLim45
+        self.earthAng45 = earthAng45
         self.de = MyUltraFile.L1Bde(repoint, rootDir=rootDir,sensor=sensor).data
         self.xspin = MyUltraFile.L1Bxspin(repoint, rootDir=rootDir,sensor=sensor).data
         self.status = MyUltraFile.L1Bstatus(repoint, rootDir=rootDir,sensor=sensor).data
@@ -48,24 +49,20 @@ class UltraCull0():
 
     def goodEventMet(self, ieBin:int) -> npt.NDArray:
         ebin_range = [1, 19]
-        if self.sensor == 90:
-            ii = np.nonzero(np.logical_and(
-                np.logical_and(
+        ii = np.nonzero(np.logical_and(
+            np.logical_and(
                 np.logical_and(np.logical_and(
                     np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
-                               self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
+                                   self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
                     self.de['quality_outliers'] == 0), self.de['quality_scattering'] == 0),
                 self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]))
-        else:
-            ii = np.nonzero(np.logical_and(np.logical_and(
-                np.logical_and(
-                np.logical_and(np.logical_and(
-                    np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
-                               self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
-                    self.de['quality_outliers'] == 0), self.de['quality_scattering'] == 0),
-                self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]),
-                self.de['theta'] > self.thetaLim45))
-
+        if self.sensor == 45:
+            t0 = np.mean(self.de['de_event_met'][ii])
+            earth = ENA_planets.ENA_planets(t0)
+            local_uv = earth.local_uvec(self.de['velocity_dps_sc'][ii,:])
+            coslim = np.cos(self.earthAng45)
+            jj = np.nonzero(np.abs(local_uv[0, :] < coslim))[0]
+            ii = ii[jj]
         return self.de['de_event_met'][ii]
 
     def get_dvolt_summary(self) -> (npt.NDArray[float], npt.NDArray[float], npt.NDArray[float]):

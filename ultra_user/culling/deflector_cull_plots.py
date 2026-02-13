@@ -8,8 +8,6 @@ import imap_processing.spice.time as spiceTime
 from importlib import reload
 
 
-
-
 # change this to something better
 spiceypy.furnsh('data/imap/spice/sclk/imap_sclk_0103.tsc')
 spiceypy.furnsh('data/imap/spice/lsk/naif0012.tls')
@@ -44,13 +42,66 @@ energy_ranges = np.transpose(eranges)
 #repointings = np.append(range(27,48),range(50,64))
 repointings = np.append(range(27,99),range(125,136))
 
+#
+
+thresh=range(0,3500,50)
+nb10 = np.ndarray((len(repointings),len(thresh)))
+nb20 = np.ndarray((len(repointings),len(thresh)))
+nb100 = np.ndarray((len(repointings)))
+nb200 = np.ndarray((len(repointings)))
+ip=0
+for repoint in repointings:
+    cullData20 = UltraCull0.UltraCull0(repoint,energy_ranges,spin_range=20)
+    cullData10 = UltraCull0.UltraCull0(repoint,energy_ranges,spin_range=10)
+    vc200 = cullData20.voltage_cull(v_threshold=0,apply=False)
+    vc100 = cullData10.voltage_cull(v_threshold=0,apply=False)
+    nb200[ip]= len(np.nonzero(vc200['binMask'])[0])
+    nb100[ip]= len(np.nonzero(vc100['binMask'])[0])
+    it=0
+    for iv in thresh:
+        vc10 = cullData10.voltage_cull(v_threshold=iv, apply=False)
+        vc20 = cullData20.voltage_cull(v_threshold=iv, apply=False)
+        nb10[ip,it] = len(np.nonzero(vc10['binMask'])[0])
+        nb20[ip,it] = len(np.nonzero(vc20['binMask'])[0])
+        it=it+1
+    ip=ip+1
+    print(repoint)
+
+nthresh = len(thresh)
+frac10 = np.ndarray(nthresh)
+frac20 = np.ndarray(nthresh)
+
+n10total0 = np.sum(nb100)
+n20total0 = np.sum(nb200)
+
+frac20 = np.sum(nb20,0)/n20total0
+frac10 = np.sum(nb10,0)/n10total0
+
+#
+cullData20 = UltraCull0.UltraCull0(28,energy_ranges,spin_range=20)
+cullData10 = UltraCull0.UltraCull0(28,energy_ranges,spin_range=10)
+
+vc10 = cullData10.voltage_cull()
+vc20 = cullData20.voltage_cull()
+
+plt.plot(thresh,frac10, label='10 spins/bin (~150s)')
+plt.plot(thresh,frac20, label='20 spins/bin (~300s)')
+plt.xlabel('Voltage Threhold (V)')
+plt.ylabel('Fraction culled')
+plt.legend()
+plt.show()
+
+plt.plot(thresh,frac10 - frac20)
+plt.ylabel('fraction difference between 20 and 10 spins/bin')
+plt.xlabel('Voltage Threhold (V)')
+plt.show()
+
 #full cull
 cullData = dict()
 ecull = dict()
 scull = dict()
 vcull = dict()
 cnt_sum = dict()
-cullFrac0 = dict()
 cullFrac = dict()
 for repoint in repointings:
     print(repoint)
@@ -58,53 +109,5 @@ for repoint in repointings:
     cnt_sum[repoint] = cullData[repoint].get_count_summary()
     vcull[repoint] = cullData[repoint].voltage_cull()
     ecull[repoint] = cullData[repoint].high_energy_cull()
-    cullFrac0[repoint] = cullData[repoint].currentCullFraction()
     scull[repoint] = cullData[repoint].statistical_cull()
     cullFrac[repoint] = cullData[repoint].currentCullFraction()
-
-
-cFrac0 = np.ndarray((nen,len(repointings)))
-cFrac1 = np.ndarray((nen,len(repointings)))
-cFrac2 = np.ndarray((nen,len(repointings)))
-for ic in range(len(repointings)):
-    cFrac0[:,ic] = cullFrac0[repointings[ic]]
-    cFrac1[:,ic] = cullFrac[repointings[ic]]
-    cFrac2[:,ic] = cFrac1[:,ic]
-    for jc in range(nen):
-        if not scull[repointings[ic]]['converge'][jc]:
-            cFrac2[jc, ic]=0
-
-np.savetxt('/Users/demajr1/tmp/cfrac0.csv',np.transpose(cFrac0[0:4]),delimiter=',')
-np.savetxt('/Users/demajr1/tmp/cfrac1.csv',np.transpose(cFrac1[0:4]),delimiter=',')
-np.savetxt('/Users/demajr1/tmp/cfrac2.csv',np.transpose(cFrac2[0:4]),delimiter=',')
-
-#looking at george's list these are the questionable pointings (good days with ~< 0.9 cfrac)
-qps = [51,62,69,75,98,127,129]
-qps.sort(key=lambda p:cullFrac0[p][0]) #sorted from worst to best
-
-for repoint in qps:
-    c0 = cullData[repoint]
-    minv = np.minimum(c0.status['rightdeflection_v'], c0.status['leftdeflection_v'])
-    cntsHi = c0.get_count_summary()[:, 4]
-    ctime = c0.center_spin()['center_time']
-    fig, ax = plt.subplots(5)
-    fig.suptitle(f"repoint {repoint}")
-    ax[0].set_xlabel('MET seconds')
-    ax2 = ax[0].twinx()
-    ax2.set_ylabel('High counts')
-    ax[0].set_ylabel('def. (V)')
-    # ax2.set_yscale('log')
-    ax2.set_ylim([0, 40])
-    ax[0].plot(c0.status['shcoarse'], minv, 'b', label='Mininum deflector voltage (V)')
-    ax2.plot(ctime, cntsHi, 'r', label='Mininum deflector voltage (V)')
-    ax2.plot(ctime, cntsHi * 0 + 25, 'r')
-    for ic in range(4):
-        ii = np.nonzero(c0.currentMask['bin_mask'][ic, :])[0]
-        ax[ic + 1].set_ylabel(f"chan {ic}")
-        ax[ic + 1].set_ylim([0, 20])
-        ax[ic + 1].plot(ctime, c0.get_count_summary()[:, ic], 'b')
-        ax[ic + 1].plot(ctime[ii], c0.get_count_summary()[ii, ic], '.g')
-
-    plt.show()
-
-
