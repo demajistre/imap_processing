@@ -46,9 +46,11 @@ def runculls(pointings:list,energy_ranges:np.ndarray,sensor='90'):
 
     return {'cullData':cullData, 'ecull':ecull, 'scull':scull, 'vcull':vcull, 'cnt_sum':cnt_sum, 'cullFrac':cullFrac}
 
-def cullplot(cull:dict, echans:list=None,loud=False,start_utc="2026-01-01T00"):
+def cullplot(cull:dict, echans:list=None,loud=False,start_utc="2026-01-01T00",chan_lims=False):
     if echans is None:
         echans = [0, 1, 2, 3]
+    if chan_lims is False:
+        chan_lims = [50,30,20,10]
     nch = len(echans)
     t0 = spiceypy.sce2t(-43, spiceypy.str2et(start_utc)) * 2.e-5 + 1
     cullData = cull['cullData']
@@ -70,7 +72,7 @@ def cullplot(cull:dict, echans:list=None,loud=False,start_utc="2026-01-01T00"):
                     color = 'b'
                 axs[ech].plot(tDay[ii], cnts[ii], color)
     for ech in range(nch):
-        axs[ech].set_ylim(0, 30)
+        axs[ech].set_ylim(0, chan_lims[ech])
         axs[ech].set_ylabel(f"counts ({ech})")
     axs[nch - 1].set_xlabel("day of 2025")
     plt.show()

@@ -55,14 +55,18 @@ class UltraCull0():
                     np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
                                    self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
                     self.de['quality_outliers'] == 0), self.de['quality_scattering'] == 0),
-                self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]))
-        if self.sensor == 45:
-            t0 = np.mean(self.de['de_event_met'][ii])
-            earth = ENA_planets.ENA_planets(t0)
-            local_uv = earth.local_uvec(self.de['velocity_dps_sc'][ii,:])
-            coslim = np.cos(self.earthAng45)
-            jj = np.nonzero(np.abs(local_uv[0, :] < coslim))[0]
-            ii = ii[jj]
+                self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]))[0]
+        if self.sensor == '45' and len(ii)>0:
+            t0 = np.mean(self.de['event_times'][ii])
+            try:
+                earth = ENA_planets.ENA_planets(t0)
+                local_uv = earth.local_uvec(self.de['velocity_dps_sc'][ii, :])
+                coslim = np.cos(self.earthAng45)
+                jj = np.nonzero(np.abs(local_uv[0, :] < coslim))[0]
+                ii = ii[jj]
+            except:
+                print(f"No DPS frame data for {self.repoint}")
+                ii = []
         return self.de['de_event_met'][ii]
 
     def get_dvolt_summary(self) -> (npt.NDArray[float], npt.NDArray[float], npt.NDArray[float]):

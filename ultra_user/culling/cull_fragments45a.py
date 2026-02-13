@@ -5,8 +5,11 @@ import ultra_user.data_access.MyUltraFile as MyUltraFile
 import ultra_user.culling.UltraCull0 as UltraCull0
 import ultra_user.culling.cull_util as cull_util
 import spiceypy
+import ultra_user.planets.ENA_planets as ENA_planets
 import imap_processing.spice.time as spiceTime
 from importlib import reload
+from importlib import reload
+
 
 spiceypy.furnsh('data/imap/spice/sclk/imap_sclk_0054.tsc')
 spiceypy.furnsh('data/imap/spice/lsk/naif0012.tls')
@@ -31,9 +34,22 @@ statvars = status.cdf_info().zVariables
 
 energy_ranges = cull_util.l1c_energy_ranges()
 
-repointings = cull_util.get_pointings(27,153)
+repointings90 = cull_util.get_pointings(27,153)
+repointings45 = cull_util.get_pointings(27,153,sensor='45')
 
-c90 = cull_util.runculls(repointings,energy_ranges)
-c45 = cull_util.runculls(repointings,energy_ranges,sensor='45')
+c90 = cull_util.runculls(repointings90,energy_ranges)
+c45 = cull_util.runculls(repointings45,energy_ranges,sensor='45')
 
 cull_util.cullplot(c90)
+cull_util.cullplot(c45)
+
+# find unconverged series
+unconv45 = list()
+for repointing in repointings45:
+    if not c45['scull'][repointing]['converge'][1]:
+        unconv45.append(repointing)
+
+unconv90 = list()
+for repointing in repointings45:
+    if not c90['scull'][repointing]['converge'][1]:
+        unconv90.append(repointing)
