@@ -39,9 +39,12 @@ repointings45 = cull_util.get_pointings(27,153,sensor='45')
 
 c90 = cull_util.runculls(repointings90,energy_ranges)
 c45 = cull_util.runculls(repointings45,energy_ranges,sensor='45')
+c45a = cull_util.runculls(repointings45,energy_ranges,sensor='45',earthAng45=np.radians(30))
 
 cull_util.cullplot(c90)
 cull_util.cullplot(c45)
+cull_util.cullplot(c45a)
+
 
 # find unconverged series
 unconv45 = list()
@@ -49,7 +52,15 @@ for repointing in repointings45:
     if not c45['scull'][repointing]['converge'][1]:
         unconv45.append(repointing)
 
+unconv45a = list()
+for repointing in repointings45:
+    if not c45a['scull'][repointing]['converge'][1]:
+        unconv45a.append(repointing)
+
+
 unconv90 = list()
 for repointing in repointings45:
     if not c90['scull'][repointing]['converge'][1]:
         unconv90.append(repointing)
+
+# not much difference in earth size. 15d is probably good

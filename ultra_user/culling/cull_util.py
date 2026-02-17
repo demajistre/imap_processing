@@ -5,7 +5,8 @@ import spiceypy
 import matplotlib.pyplot as plt
 import imap_processing.spice.time as spiceTime
 
-def l1c_energy_ranges(repoint=47,base_ebin=4,n_1cbins=8)->np.ndarray:
+
+def l1c_energy_ranges(repoint=47, base_ebin=4, n_1cbins=8) -> np.ndarray:
     l1c = MyUltraFile.L1C(repoint).data
     l1c_ebins = np.transpose([l1c['energy_bin_geometric_mean'] - l1c['energy_delta_minus'],
                               l1c['energy_bin_geometric_mean'] + l1c['energy_delta_plus']])
@@ -19,16 +20,17 @@ def l1c_energy_ranges(repoint=47,base_ebin=4,n_1cbins=8)->np.ndarray:
     energy_ranges = np.transpose(eranges)
     return energy_ranges
 
-def get_pointings(start_pointing, end_pointing,sensor='90') -> list:
-    result=list()
+
+def get_pointings(start_pointing, end_pointing, sensor='90') -> list:
+    result = list()
     for pointing in range(start_pointing, end_pointing):
-        files = MyUltraFile.L1Bde(pointing,silent=True,sensor=sensor).fileCandidates()
-        if len(files)>0:
+        files = MyUltraFile.L1Bde(pointing, silent=True, sensor=sensor).fileCandidates()
+        if len(files) > 0:
             result.append(pointing)
     return result
 
 
-def runculls(pointings:list,energy_ranges:np.ndarray,sensor='90'):
+def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20):
     cullData = dict()
     ecull = dict()
     scull = dict()
@@ -37,20 +39,23 @@ def runculls(pointings:list,energy_ranges:np.ndarray,sensor='90'):
     cullFrac = dict()
     for repoint in pointings:
         print(repoint)
-        cullData[repoint] = UltraCull0.UltraCull0(repoint, energy_ranges, sensor=sensor, spin_range=20)
+        cullData[repoint] = UltraCull0.UltraCull0(repoint, energy_ranges, sensor=sensor, spin_range=spin_range,
+                                                  earthAng45=earthAng45)
         cnt_sum[repoint] = cullData[repoint].get_count_summary()
         vcull[repoint] = cullData[repoint].voltage_cull()
         ecull[repoint] = cullData[repoint].high_energy_cull()
         scull[repoint] = cullData[repoint].statistical_cull()
         cullFrac[repoint] = cullData[repoint].currentCullFraction()
 
-    return {'cullData':cullData, 'ecull':ecull, 'scull':scull, 'vcull':vcull, 'cnt_sum':cnt_sum, 'cullFrac':cullFrac}
+    return {'cullData': cullData, 'ecull': ecull, 'scull': scull, 'vcull': vcull, 'cnt_sum': cnt_sum,
+            'cullFrac': cullFrac}
 
-def cullplot(cull:dict, echans:list=None,loud=False,start_utc="2026-01-01T00",chan_lims=False):
+
+def cullplot(cull: dict, echans: list = None, loud=False, start_utc="2026-01-01T00", chan_lims=False):
     if echans is None:
         echans = [0, 1, 2, 3]
     if chan_lims is False:
-        chan_lims = [50,30,20,10]
+        chan_lims = [50, 30, 20, 10]
     nch = len(echans)
     t0 = spiceypy.sce2t(-43, spiceypy.str2et(start_utc)) * 2.e-5 + 1
     cullData = cull['cullData']
@@ -76,3 +81,20 @@ def cullplot(cull:dict, echans:list=None,loud=False,start_utc="2026-01-01T00",ch
         axs[ech].set_ylabel(f"counts ({ech})")
     axs[nch - 1].set_xlabel("day of 2025")
     plt.show()
+
+
+def full_cntsum(cull: dict,precull_voltage=True) -> (np.ndarray, np.ndarray):
+    repointings = list(cull['cullData'].keys())
+    ii = range(len(cull['cullData'][repointings[0]].spinbins))
+    if precull_voltage:
+        ii = np.nonzero(cull['vcull'][repointings[0]]['binMask'])[0]
+    full_sum = cull['cnt_sum'][repointings[0]][ii,:]
+    start_spin = cull['cullData'][repointings[0]].spinbins[ii]
+    for pointing in repointings[1:]:
+        ii = np.arange(len(cull['cullData'][pointing].spinbins))
+        if precull_voltage:
+            ii = np.nonzero(cull['vcull'][pointing]['binMask'])[0]
+        full_sum = np.vstack([full_sum, cull['cnt_sum'][pointing][ii,:]])
+        start_spin = np.vstack([start_spin, cull['cullData'][pointing].spinbins[ii]])
+    start_spin = start_spin[:, 0]
+    return full_sum, start_spin

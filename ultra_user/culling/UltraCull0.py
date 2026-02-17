@@ -10,7 +10,10 @@ import ultra_user.planets.ENA_planets as ENA_planets
 
 class UltraCull0():
     def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=20, rootDir='data/imap',
-                 sensor='90',earthAng45=np.radians(15)):
+                 sensor='90', earthAng45=np.radians(15), sep_threshold_per_spin=None):
+        if sep_threshold_per_spin is None:
+            sep_threshold_per_spin = np.array([2., 1.5, 0.6, 0.35, 0.35, 0.35])
+        self.sep_threshold_per_spin = sep_threshold_per_spin
         self.currentMask = None
         self.repoint = repoint
         self.energy_ranges = energy_ranges
@@ -23,6 +26,7 @@ class UltraCull0():
         self.n_spinbin = int(len(self.xspin['spin_number']) / self.spin_range)
         self.spinbins = np.ndarray((self.n_spinbin, 2))
         self.binTimes = np.ndarray((self.n_spinbin, 2))
+        self.sep_thresh = sep_threshold_per_spin*spin_range
         self.clear_mask()
         kc = 0
         iLast = len(self.xspin['spin_number']) - 1
@@ -184,16 +188,17 @@ class UltraCull0():
             self.add_mask(mask, f"statistical: converged={conv}, thresh={std_thresh}")
         return result
 
-    def high_energy_cull(self, cull_channel=4, threshold=25, apply=True) -> dict:
-        result = {'cull_channel': cull_channel, 'threshold': threshold, 'apply': apply}
+    def high_energy_cull(self, cull_channel=4, apply=True) -> dict:
+        result = {'cull_channel': cull_channel, 'threshold': self.sep_thresh, 'apply': apply}
         nen = len(self.energy_ranges[:, 0])
         cnt_summary = self.get_count_summary()
-        emask = np.logical_and(cnt_summary[:, cull_channel] < threshold, cnt_summary[:, cull_channel] >= 0)
+        #emask = np.logical_and(cnt_summary[:, cull_channel] < threshold, cnt_summary[:, cull_channel] >= 0)
+        emask = self.empty_mask()
+        for ic in range(nen):
+            emask[ic,:] = np.logical_and(cnt_summary[:, cull_channel] < self.sep_thresh[ic],
+                                         cnt_summary[:, cull_channel] >= 0)
         if apply is True:
-            mask = self.currentMask['bin_mask'].copy()
-            for ic in range(len(self.energy_ranges[:, 0])):
-                mask[ic, :] = np.logical_and(mask[ic, :], emask)
-            self.add_mask(mask, opName=f"energy channel {cull_channel} counts < {threshold}")
+            self.add_mask(emask, opName=f"energy channel {cull_channel} counts < {self.sep_thresh}")
         result["mask"] = emask
         return result
 
