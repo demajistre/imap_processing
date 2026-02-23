@@ -8,7 +8,6 @@ import spiceypy
 import ultra_user.planets.ENA_planets as ENA_planets
 import imap_processing.spice.time as spiceTime
 from importlib import reload
-from importlib import reload
 
 
 spiceypy.furnsh('data/imap/spice/sclk/imap_sclk_0054.tsc')

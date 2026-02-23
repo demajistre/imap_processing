@@ -12,7 +12,7 @@ class UltraCull0():
     def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=20, rootDir='data/imap',
                  sensor='90', earthAng45=np.radians(15), sep_threshold_per_spin=None):
         if sep_threshold_per_spin is None:
-            sep_threshold_per_spin = np.array([2., 1.5, 0.6, 0.35, 0.35, 0.35])
+            sep_threshold_per_spin = np.array([2., 1.5, 0.6, 0.25, 0.25, 0.25])
         self.sep_threshold_per_spin = sep_threshold_per_spin
         self.currentMask = None
         self.repoint = repoint
@@ -150,7 +150,7 @@ class UltraCull0():
         return {'spin_bin': (self.spinbins[:, 0] + self.spinbins[:, 1]) / 2,
                 'center_time': (self.binTimes[:, 0] + self.binTimes[:, 1]) / 2}
 
-    def statistical_cull(self, n_iter: int = 5, std_thresh: float = 0.05, apply: bool = True) -> dict:
+    def statistical_cull(self, n_iter: int = 5, std_thresh: float = 0.05,link_echans=True, apply: bool = True) -> dict:
         result = {'n_iter': n_iter, 'std_thresh': std_thresh, 'apply': apply}
         nen = len(self.energy_ranges[:, 0])
         cnt_summary = self.get_count_summary()
@@ -158,6 +158,7 @@ class UltraCull0():
         nit = np.zeros(nen, dtype=int)
         conv = np.full(nen, dtype=bool, fill_value=False)
         std_diff = np.zeros(nen, dtype=float)
+        fullmask = mask[0, :].copy()
         for ich in range(nen):
             cnt0 = cnt_summary[:, ich]
             icnt0 = np.arange(len(cnt0), dtype=int)
@@ -169,10 +170,9 @@ class UltraCull0():
                     std_diff[ich] = -1
                     break
                 icnt = icnt0[np.nonzero(mask[ich, :])]
-                mean = np.mean(cnt)
-                std = np.std(cnt)
-                std_diff[ich] = std / np.sqrt(mean) - 1
-                submask = np.abs((cnt - mean) / std) > 3
+                sdiff, submask = self.stat_iteration(cnt,icnt)
+                std_diff[ich] = sdiff
+                fullmask[icnt0[icnt[np.nonzero(submask)[0]]]] = False
                 mask[ich, icnt0[icnt[np.nonzero(submask)[0]]]] = False
                 # mask[ich,:] = np.logical_and(mask[ich,:],submask)
                 nit[ich] = it + 1
@@ -180,6 +180,18 @@ class UltraCull0():
                     nit[ich] = it + 1
                     conv[ich] = True
                     break
+        if link_echans:
+            for ich in range(nen):
+                mask[ich,:] = fullmask
+                # recalculate convergence just in case
+                if not conv[ich]:
+                    ii = np.nonzero(fullmask)[0]
+                    cnts = cnt_summary[ii, ich]
+                    icnts = np.arange(len(cnts), dtype=int) #we're only interested in the sdiff, this is fill
+                    sdiff, _ = self.stat_iteration(cnts, icnts)
+                    if sdiff < std_thresh:
+                        conv[ich] = True
+        result["link_echans"] = link_echans
         result["converge"] = conv
         result["iterations"] = nit
         result["mask"] = mask
@@ -187,6 +199,13 @@ class UltraCull0():
         if apply:
             self.add_mask(mask, f"statistical: converged={conv}, thresh={std_thresh}")
         return result
+
+    def stat_iteration(self,cnt: np.ndarray,icnt: np.ndarray):
+        mean = np.mean(cnt)
+        std = np.std(cnt)
+        std_diff = std / np.sqrt(mean) - 1
+        submask = np.abs((cnt - mean) / std) > 3
+        return std_diff,submask
 
     def high_energy_cull(self, cull_channel=4, apply=True) -> dict:
         result = {'cull_channel': cull_channel, 'threshold': self.sep_thresh, 'apply': apply}

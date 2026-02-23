@@ -45,7 +45,7 @@ ii = np.nonzero(np.logical_and(
 
 # instrument coords plot
 de_velocity_inst = de['velocity_sc'][ii,:]
-de_vmag = np.sqrt(np.sum(de_velocity**2, axis=1))
+de_vmag = np.sqrt(np.sum(de_velocity_inst**2, axis=1))
 de_uv = de_velocity_inst*0
 for ic in range(3):
     de_uv[:,ic] = de_velocity_inst[:,ic]/de_vmag

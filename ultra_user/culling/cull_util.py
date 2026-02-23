@@ -30,7 +30,7 @@ def get_pointings(start_pointing, end_pointing, sensor='90') -> list:
     return result
 
 
-def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20):
+def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20,n_iter=5):
     cullData = dict()
     ecull = dict()
     scull = dict()
@@ -44,7 +44,7 @@ def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45
         cnt_sum[repoint] = cullData[repoint].get_count_summary()
         vcull[repoint] = cullData[repoint].voltage_cull()
         ecull[repoint] = cullData[repoint].high_energy_cull()
-        scull[repoint] = cullData[repoint].statistical_cull()
+        scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
         cullFrac[repoint] = cullData[repoint].currentCullFraction()
 
     return {'cullData': cullData, 'ecull': ecull, 'scull': scull, 'vcull': vcull, 'cnt_sum': cnt_sum,
@@ -79,7 +79,8 @@ def cullplot(cull: dict, echans: list = None, loud=False, start_utc="2026-01-01T
     for ech in range(nch):
         axs[ech].set_ylim(0, chan_lims[ech])
         axs[ech].set_ylabel(f"counts ({ech})")
-    axs[nch - 1].set_xlabel("day of 2025")
+    axs[nch - 1].set_xlabel(f"days since {start_utc}")
+    fig.suptitle(f"Ultra {cull['cullData'][repointings[0]].sensor}")
     plt.show()
 
 
