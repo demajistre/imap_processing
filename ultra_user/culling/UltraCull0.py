@@ -10,9 +10,9 @@ import ultra_user.planets.ENA_planets as ENA_planets
 
 class UltraCull0():
     def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=20, rootDir='data/imap',
-                 sensor='90', earthAng45=np.radians(15), sep_threshold_per_spin=None):
+                 sensor='90', earthAng45=np.radians(20), sep_threshold_per_spin=None):
         if sep_threshold_per_spin is None:
-            sep_threshold_per_spin = np.array([2., 1.5, 0.6, 0.25, 0.25, 0.25])
+            sep_threshold_per_spin = np.array([2., 1.5, 0.6, 0.2,.2])
         self.sep_threshold_per_spin = sep_threshold_per_spin
         self.currentMask = None
         self.repoint = repoint
@@ -207,15 +207,27 @@ class UltraCull0():
         submask = np.abs((cnt - mean) / std) > 3
         return std_diff,submask
 
-    def high_energy_cull(self, cull_channel=4, apply=True) -> dict:
+    def combine_spin_bins(self,channel:int, nAddChans:int):
+        cnt0 = np.float32(self.get_count_summary()[:,channel])
+        if nAddChans == 0:
+            return cnt0
+        nbin = len(cnt0)
+        cnt = np.zeros(nbin,dtype=float)
+        for ic in range(nbin):
+            im = np.max([0,ic-nAddChans])
+            ip = np.min([ic+nAddChans,nbin-1])+1
+            cnt[ic] = np.mean(cnt0[im:ip])
+        return cnt
+    def high_energy_cull(self, cull_channel=4, nAddChans=3, apply=True) -> dict:
         result = {'cull_channel': cull_channel, 'threshold': self.sep_thresh, 'apply': apply}
         nen = len(self.energy_ranges[:, 0])
         cnt_summary = self.get_count_summary()
+        hichan = self.combine_spin_bins(cull_channel, nAddChans)
         #emask = np.logical_and(cnt_summary[:, cull_channel] < threshold, cnt_summary[:, cull_channel] >= 0)
         emask = self.empty_mask()
         for ic in range(nen):
-            emask[ic,:] = np.logical_and(cnt_summary[:, cull_channel] < self.sep_thresh[ic],
-                                         cnt_summary[:, cull_channel] >= 0)
+            emask[ic,:] = np.logical_and(hichan < self.sep_thresh[ic],
+                                         hichan >= 0)
         if apply is True:
             self.add_mask(emask, opName=f"energy channel {cull_channel} counts < {self.sep_thresh}")
         result["mask"] = emask

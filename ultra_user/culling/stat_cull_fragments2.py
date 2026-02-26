@@ -10,6 +10,7 @@ import spiceypy
 import time
 import ultra_user.planets.ENA_planets as ENA_planets
 import imap_processing.spice.time as spiceTime
+import pytz
 from importlib import reload
 
 spiceypy.furnsh('data/imap/spice/sclk/imap_sclk_0116.tsc')
@@ -114,3 +115,37 @@ for ich in range(nch):
     ii = np.nonzero(c90['scull'][repoint]['mask'][ich,:])[0]
     #print(chisquare(c90['cnt_sum'][repoint][ii,ich]))
     print(stats.goodness_of_fit(stats.poisson,c90['cnt_sum'][repoint][ii,ich] ))
+
+
+#plot like above with utc on axis for 1 pointing
+repoint=52
+cull=c90
+
+nen=len(energy_ranges[:,0])
+cullData = cull['cullData'][repoint]
+csum = cullData.get_count_summary()
+premask = cull['ecull'][repoint]['mask']
+for ie in range(nen):
+    premask[ie,:] = np.logical_and(premask[ie,:],cull['vcull'][repoint]['binMask'])
+    scullMask = cull['scull'][repoint]['mask']
+fullMask = np.logical_and(premask,scullMask)
+ylims = [35, 20, 15, 10]
+spinStart = cullData.spinbins[:,0]
+et = np.mean(cullData.binTimes,axis=1)
+time_arr = list()
+for ic in range(len(et)):
+    time_arr.append(np.datetime64(spiceTime.met_to_utc(et[ic])))
+time_arr = np.array(time_arr)
+
+nch = 4
+fig, axs = plt.subplots(nch)
+fig.suptitle(f"repoint {repoint}")
+for ic in range(nch):
+    ii = np.nonzero(premask[ic, :])[0]
+    jj = np.nonzero(fullMask[ic, :])[0]
+    axs[ic].plot(time_arr, csum[:, ic], 'r')
+    axs[ic].plot(time_arr[ii], csum[ii, ic], 'b')
+    axs[ic].plot(time_arr[jj], csum[jj, ic], 'g')
+    axs[ic].set_ylim(0, ylims[ic])
+plt.show()
+

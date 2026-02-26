@@ -6,18 +6,23 @@ import matplotlib.pyplot as plt
 import imap_processing.spice.time as spiceTime
 
 
-def l1c_energy_ranges(repoint=47, base_ebin=4, n_1cbins=8) -> np.ndarray:
+def l1c_energy_ranges(repoint=47, base_ebin=3, n_1cbins=8,set_maxbin:bool=True,maxbin_lim:float=100) -> np.ndarray:
     l1c = MyUltraFile.L1C(repoint).data
     l1c_ebins = np.transpose([l1c['energy_bin_geometric_mean'] - l1c['energy_delta_minus'],
                               l1c['energy_bin_geometric_mean'] + l1c['energy_delta_plus']])
     ebin_start = np.arange(base_ebin, len(l1c_ebins), n_1cbins, dtype=int)
     ebin_end = np.append(ebin_start[1:] - 1, len(l1c_ebins) - 1)
     nen = len(ebin_start)
-    ebin_start = ebin_start[:-1]
+    #ebin_start = ebin_start[:-1]
     eranges = np.ndarray((2, nen))
     for ic in range(len(ebin_start)):
         eranges[:, ic] = [l1c_ebins[ebin_start[ic]][0], l1c_ebins[ebin_end[ic]][1]]
     energy_ranges = np.transpose(eranges)
+    if set_maxbin:
+        iemax = np.nonzero(eranges[0, :] > maxbin_lim)[0][0]
+        eranges1 = eranges[:, :iemax + 1]
+        eranges1[1, iemax] = np.max(eranges[1, :])
+        energy_ranges = np.transpose(eranges1)
     return energy_ranges
 
 
@@ -30,7 +35,8 @@ def get_pointings(start_pointing, end_pointing, sensor='90') -> list:
     return result
 
 
-def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20,n_iter=5):
+def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20,n_iter=5,
+             sep_threshold_per_spin=None,nAddChans=3):
     cullData = dict()
     ecull = dict()
     scull = dict()
@@ -40,10 +46,10 @@ def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45
     for repoint in pointings:
         print(repoint)
         cullData[repoint] = UltraCull0.UltraCull0(repoint, energy_ranges, sensor=sensor, spin_range=spin_range,
-                                                  earthAng45=earthAng45)
+                                                  earthAng45=earthAng45,sep_threshold_per_spin=sep_threshold_per_spin)
         cnt_sum[repoint] = cullData[repoint].get_count_summary()
         vcull[repoint] = cullData[repoint].voltage_cull()
-        ecull[repoint] = cullData[repoint].high_energy_cull()
+        ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans)
         scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
         cullFrac[repoint] = cullData[repoint].currentCullFraction()
 
