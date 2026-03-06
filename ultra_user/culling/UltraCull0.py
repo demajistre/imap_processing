@@ -12,7 +12,7 @@ class UltraCull0():
     def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=20, rootDir='data/imap',
                  sensor='90', earthAng45=np.radians(20), sep_threshold_per_spin=None):
         if sep_threshold_per_spin is None:
-            sep_threshold_per_spin = np.array([2., 1.5, 0.6, 0.2,.2])
+            sep_threshold_per_spin = np.array([4., 2., 1.25, 0.9, 0.2,.2])
         self.sep_threshold_per_spin = sep_threshold_per_spin
         self.currentMask = None
         self.repoint = repoint
@@ -218,7 +218,7 @@ class UltraCull0():
             ip = np.min([ic+nAddChans,nbin-1])+1
             cnt[ic] = np.mean(cnt0[im:ip])
         return cnt
-    def high_energy_cull(self, cull_channel=4, nAddChans=3, apply=True) -> dict:
+    def high_energy_cull(self, cull_channel=5, nAddChans=5, apply=True) -> dict:
         result = {'cull_channel': cull_channel, 'threshold': self.sep_thresh, 'apply': apply}
         nen = len(self.energy_ranges[:, 0])
         cnt_summary = self.get_count_summary()

@@ -50,7 +50,7 @@ full_sum, start_spin = cull_util.full_cntsum(c90)
 
 max_hi_energy_cnts=250
 bin_size = 1
-ihi = 4
+ihi = 5
 mean_chan0,bedge,bn0 = binned_statistic(full_sum[:,ihi],full_sum[:,ihi],bins=range(0,max_hi_energy_cnts,bin_size))
 count_chan0,bedge,bn0 = binned_statistic(full_sum[:,ihi],full_sum[:,ihi],'count',bins=range(0,max_hi_energy_cnts,bin_size))
 nbin=len(bedge)-1
@@ -91,10 +91,10 @@ for ic in range(ihi):
 plt.show()
 
 # by eye
-energy_ranges = cull_util.l1c_energy_ranges(base_ebin=3)
+energy_ranges = cull_util.l1c_energy_ranges()
 hist_breakpoints_full = [60,50,45,40,40]
 #hist_breakpoints_spin = np.array(hist_breakpoints_full)/c90['cullData'][repoint].spin_range
-hist_breakpoints_spin = np.array([2., 1.5, 0.6, 0.2,.2])
+hist_breakpoints_spin = np.array([4., 2., 1.25, 0.9, 0.2,.2])
 
-c90v1 = cull_util.runculls(repointings90,energy_ranges,sep_threshold_per_spin=hist_breakpoints_spin,nAddChans=3)
-c45v1 = cull_util.runculls(repointings45,energy_ranges,sep_threshold_per_spin=hist_breakpoints_spin,sensor='45',nAddChans=3)
+c90v1 = cull_util.runculls(repointings90,energy_ranges,sep_threshold_per_spin=hist_breakpoints_spin)
+c45v1 = cull_util.runculls(repointings45,energy_ranges,sep_threshold_per_spin=hist_breakpoints_spin,sensor='45')
