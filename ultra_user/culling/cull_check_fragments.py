@@ -94,10 +94,9 @@ for ich in range(nch):
     #axs[ich].plot(ut,maskVal,'r')
 plt.show()
 
-for ipnt in range(4):
-    myData = {'ut_range':ut_ranges[ipnt],'pointing_range':point_ranges[ipnt], 'hichan':hichan,
+myData = {'ut_range':ut_ranges[ipnt],'pointing_range':point_ranges[ipnt], 'hichan':hichan,
           'ut':ut,'met':met,'csum':csum,'mask':mask,'nch':nch,'chanlims':chanlims,'elabel':elabel,
           'energy_ranges':energy_ranges}
-    pickname = f"/Users/demajr1//tmp/cull_summary_{ipnt}_v2.pkl"
+pickname = f"/Users/demajr1//tmp/cull_summary_{ipnt}_v2.pkl"
 
-    pickle.dump(myData,open(pickname,'wb'))
+pickle.dump(myData,open(pickname,'wb'))

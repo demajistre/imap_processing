@@ -233,6 +233,45 @@ class UltraCull0():
         result["mask"] = emask
         return result
 
+    def upstream_cull(self, sigThreshold = 2.5,channels=None, apply=True) -> dict:
+        if channels is None:
+            channels = [0,1,2]
+        nch=len(channels)
+        result = {'channels':channels,'nch': nch, 'sigThreshold': sigThreshold, 'apply': apply}
+        cntmean = np.zeros(nch)
+        cntstd = np.zeros(nch)
+        csum = self.get_count_summary()[:,channels]
+        scaled_cnt = np.zeros_like(csum)
+        sumScaled_cnts = np.zeros_like(csum[:, 0])
+        weights = np.zeros_like(csum[:, 0])
+        sumScaled_cnts0 = np.zeros_like(csum[:, 0])
+        mask = self.currentMask['bin_mask'].copy()
+
+        for ic in range(nch):
+            ii = np.nonzero(mask[channels[ic], :])[0]
+            cntmean[ic] = np.mean(csum[ii, ic])
+            cntstd[ic] = np.std(csum[ii, ic])
+            scaled_cnt[ii, ic] = (csum[ii, ic] - cntmean[ic]) / cntstd[ic]
+            sumScaled_cnts[ii] += scaled_cnt[ii, ic] * cntstd[ic]
+            weights[ii] += cntstd[ic]
+            sumScaled_cnts0[ii] += scaled_cnt[ii, ic] * np.sqrt(cntmean[ic])
+        kk = np.nonzero(weights > 0)[0]
+        totalScaled = sumScaled_cnts[kk] / weights[kk]
+        totalMean = np.mean(totalScaled)
+        totalStd = np.std(totalScaled)
+        thresh = totalMean + sigThreshold*totalStd
+        jj = np.nonzero(totalScaled > thresh)[0]
+        for ic in range(len(mask[:,0])):
+            mask[ic,jj] = False
+        result["mask"] = mask
+        if apply is True:
+            self.add_mask(mask, opName="Upstream ion cull")
+        result['totalScaled'] = totalScaled
+        result['scaled_counts'] = scaled_cnt
+        result['thresh'] = thresh
+        return result
+
+
     def currentCullFraction(self) -> npt.NDArray[float]:
         nen = len(self.energy_ranges[:, 0])
         result = numpy.ndarray(nen, dtype=float)

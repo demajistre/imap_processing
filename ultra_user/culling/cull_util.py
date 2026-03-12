@@ -55,12 +55,17 @@ def get_pointings(start_pointing, end_pointing, sensor='90') -> list:
 
 
 def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20,
-             n_iter=5,
-             sep_threshold_per_spin=None, nAddChans=5):
+             n_iter=5,upstream_chans1=None, upstream_chans2=None,
+             sep_threshold_per_spin=None, nAddChans=5,cullPackage="serial_hiEnergy_stat"):
+    if upstream_chans1 is None:
+        upstream_chans1 = [0,1,2]
+        upstream_chans2 = [2,3,4]
     cullData = dict()
     ecull = dict()
     scull = dict()
     vcull = dict()
+    upcull1 = dict()
+    upcull2 = dict()
     cnt_sum = dict()
     cullFrac = dict()
     for repoint in pointings:
@@ -69,12 +74,30 @@ def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45
                                                   earthAng45=earthAng45, sep_threshold_per_spin=sep_threshold_per_spin)
         cnt_sum[repoint] = cullData[repoint].get_count_summary()
         vcull[repoint] = cullData[repoint].voltage_cull()
-        ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans)
-        scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
+        match cullPackage:
+            case "serial_hiEnergy_stat":
+                ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans)
+                scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
+            case "hiEnergy_upstream_stat_v1":
+                ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans, apply=False)
+                upcull1[repoint] = cullData[repoint].upstream_cull(apply=False,channels=upstream_chans1)
+                upcull2[repoint] = cullData[repoint].upstream_cull(apply=False, channels=upstream_chans2)
+                cullData[repoint].add_mask(ecull[repoint]["mask"], opName="Energy cull - non-serial")
+                cullData[repoint].add_mask(upcull1[repoint]["mask"],
+                                           opName=f"upstream cull - non-serial - channels {upstream_chans1}")
+                cullData[repoint].add_mask(upcull2[repoint]["mask"],
+                                           opName=f"upstream cull - non-serial - channels {upstream_chans2}")
+                scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
+            case "independent_hiEnergy_stat":
+                ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans, apply=False)
+                scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter, apply=False)
+                cullData[repoint].add_mask(ecull[repoint]["mask"], opName="Energy cull - non-serial")
+                cullData[repoint].add_mask(scull[repoint]["mask"], opName="Statistical cull - non-serial")
         cullFrac[repoint] = cullData[repoint].currentCullFraction()
 
-    return {'cullData': cullData, 'ecull': ecull, 'scull': scull, 'vcull': vcull, 'cnt_sum': cnt_sum,
-            'cullFrac': cullFrac}
+    return {'cullData': cullData, 'ecull': ecull, 'scull': scull, 'vcull': vcull,'upcull1': upcull1,'upcull2': upcull2,
+            'cnt_sum': cnt_sum,
+            'cullFrac': cullFrac, 'cullPackage': cullPackage}
 
 
 def cullplot(cull: dict, echans: list = None, loud=False, start_utc="2026-01-01T00", chan_lims=False):
