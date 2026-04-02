@@ -37,8 +37,8 @@ statvars = status.cdf_info().zVariables
 
 energy_ranges = cull_util.l1c_energy_ranges()
 
-repointings90 = cull_util.get_pointings(27,153)
-repointings45 = cull_util.get_pointings(27,153,sensor='45')
+repointings90 = cull_util.get_pointings(27,180)
+repointings45 = cull_util.get_pointings(27,180,sensor='45')
 #
 
 c90 = cull_util.runculls(repointings90,energy_ranges)

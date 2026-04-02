@@ -12,7 +12,9 @@ class UltraCull0():
     def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=20, rootDir='data/imap',
                  sensor='90', earthAng45=np.radians(20), sep_threshold_per_spin=None):
         if sep_threshold_per_spin is None:
-            sep_threshold_per_spin = np.array([4., 2., 1.25, 0.9, 0.2,.2])
+            sep_threshold_per_spin = np.array([4., 2., 1.20, 0.45, 0.1, .1])
+            # revised 3/31/26
+            #sep_threshold_per_spin = np.array([4., 2., 1.25, 0.9, 0.2,.2])
         self.sep_threshold_per_spin = sep_threshold_per_spin
         self.currentMask = None
         self.repoint = repoint
@@ -233,33 +235,42 @@ class UltraCull0():
         result["mask"] = emask
         return result
 
+    def spectral_cull(self, sigThreshold = 1,channels=None, apply=True) -> dict:
+        if channels is None:
+            channels = [0,1,2,4]
+        nch=len(channels)
+        result = {'channels':channels,'nch': nch, 'sigThreshold': sigThreshold, 'apply': apply}
+        csum = self.get_count_summary()[:,channels]
+        mask = self.currentMask['bin_mask'].copy()
+        for ic in range(nch-1):
+            diff = (csum[:, ic + 1] - csum[:, ic] - sigThreshold*(np.sqrt(csum[:,ic+1]+csum[:,ic])))
+            ii = np.nonzero(diff > 0)[0]
+            mask[:,ii] = False
+        result["mask"] = mask
+        if apply is True:
+            self.add_mask(mask, opName="Upstream ion cull")
+        return result
+
     def upstream_cull(self, sigThreshold = 2.5,channels=None, apply=True) -> dict:
         if channels is None:
             channels = [0,1,2]
         nch=len(channels)
         result = {'channels':channels,'nch': nch, 'sigThreshold': sigThreshold, 'apply': apply}
-        cntmean = np.zeros(nch)
-        cntstd = np.zeros(nch)
         csum = self.get_count_summary()[:,channels]
         scaled_cnt = np.zeros_like(csum)
         sumScaled_cnts = np.zeros_like(csum[:, 0])
         weights = np.zeros_like(csum[:, 0])
-        sumScaled_cnts0 = np.zeros_like(csum[:, 0])
         mask = self.currentMask['bin_mask'].copy()
 
         for ic in range(nch):
             ii = np.nonzero(mask[channels[ic], :])[0]
-            cntmean[ic] = np.mean(csum[ii, ic])
-            cntstd[ic] = np.std(csum[ii, ic])
-            scaled_cnt[ii, ic] = (csum[ii, ic] - cntmean[ic]) / cntstd[ic]
-            sumScaled_cnts[ii] += scaled_cnt[ii, ic] * cntstd[ic]
-            weights[ii] += cntstd[ic]
-            sumScaled_cnts0[ii] += scaled_cnt[ii, ic] * np.sqrt(cntmean[ic])
+            scaled_cnt[ii, ic] = csum[ii, ic]
+            sumScaled_cnts[ii] += scaled_cnt[ii, ic]
+            weights[ii] += 1
         kk = np.nonzero(weights > 0)[0]
-        totalScaled = sumScaled_cnts[kk] / weights[kk]
+        totalScaled = sumScaled_cnts[kk]
         totalMean = np.mean(totalScaled)
-        totalStd = np.std(totalScaled)
-        thresh = totalMean + sigThreshold*totalStd
+        thresh = totalMean + sigThreshold * np.sqrt(totalMean)
         jj = np.nonzero(totalScaled > thresh)[0]
         for ic in range(len(mask[:,0])):
             mask[ic,jj] = False
@@ -270,6 +281,34 @@ class UltraCull0():
         result['scaled_counts'] = scaled_cnt
         result['thresh'] = thresh
         return result
+
+
+#
+#        for ic in range(nch):
+#            ii = np.nonzero(mask[channels[ic], :])[0]
+#            cntmean[ic] = np.mean(csum[ii, ic])
+#            cntstd[ic] = np.std(csum[ii, ic])
+#            scaled_cnt[ii, ic] = (csum[ii, ic] - cntmean[ic]) / cntstd[ic]
+#            #sumScaled_cnts[ii] += scaled_cnt[ii, ic] * cntstd[ic]
+#            #weights[ii] += cntstd[ic]
+#            sumScaled_cnts[ii] += scaled_cnt[ii, ic]
+#            weights[ii] += 1
+#            sumScaled_cnts0[ii] += scaled_cnt[ii, ic] * np.sqrt(cntmean[ic])
+#        kk = np.nonzero(weights > 0)[0]
+#        totalScaled = sumScaled_cnts[kk] / weights[kk]
+#        totalMean = np.mean(totalScaled)
+#        totalStd = np.std(totalScaled)
+#        thresh = totalMean + sigThreshold*totalStd
+#        jj = np.nonzero(totalScaled > thresh)[0]
+#        for ic in range(len(mask[:,0])):
+#            mask[ic,jj] = False
+#        result["mask"] = mask
+#        if apply is True:
+#            self.add_mask(mask, opName="Upstream ion cull")
+#        result['totalScaled'] = totalScaled
+#        result['scaled_counts'] = scaled_cnt
+#        result['thresh'] = thresh
+#        return result
 
 
     def currentCullFraction(self) -> npt.NDArray[float]:
