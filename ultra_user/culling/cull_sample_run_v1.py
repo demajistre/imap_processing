@@ -20,8 +20,8 @@ energy_ranges = cull_util.l1c_energy_ranges()
 repointings90 = cull_util.get_pointings(27,183)
 repointings45 = cull_util.get_pointings(27,183,sensor='45')
 
-c90 = cull_util.runculls(repointings90,energy_ranges,cullPackage="hiEnergy_upstream_stat_v1")
-c45 = cull_util.runculls(repointings45,energy_ranges,sensor='45',cullPackage="hiEnergy_upstream_stat_v1")
+c90 = cull_util.runculls(repointings90,energy_ranges,cullPackage="hiEnergy_upstream_spectral_stat_v1")
+c45 = cull_util.runculls(repointings45,energy_ranges,sensor='45',cullPackage="hiEnergy_upstream_spectral_stat_v1")
 
 cull_util.cullplot(c90)
 cull_util.cullplot(c45)
