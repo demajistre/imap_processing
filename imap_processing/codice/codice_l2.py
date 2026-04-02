@@ -279,7 +279,7 @@ def get_species_efficiency(species: str, efficiency: pd.DataFrame) -> xr.DataArr
 
 
 def compute_geometric_factors(
-    dataset: xr.Dataset, geometric_factor_lookup: dict
+    dataset: xr.Dataset, geometric_factor_lookup: dict, angular_product: bool = False
 ) -> xr.DataArray:
     """
     Calculate geometric factors needed for intensity calculations.
@@ -290,10 +290,18 @@ def compute_geometric_factors(
 
     If the half-spin value is less than the corresponding rgfo_half_spin value,
     the geometric factor is set to 0.75 (full mode); otherwise, it is set to 0.5
-    (reduced mode).
+    (reduced mode). If the data is from after November 24th 2025, then reduced
+    mode is no longer applied and the geometric factor is always set to full mode.
 
     NOTE: Half spin values are associated with ESA steps which corresponds to the
     index of the energy_per_charge dimension that is between 0 and 127.
+
+    NOTE: If packet_version = 2, the Lo L1B product now contains variables that indicate
+    the esa step and spin sector during which the RGFO or NSO limits are triggered.
+    The spin sector variable ranges from 0-11 and is the instrument reported spin
+    sector. In the following algorithm, spin_angle refers to the L1B angular bin
+    (0 – 23) which is despun and spin_sector refers to the non-despun spin sector
+    reported from the instrument (0-11).
 
     Parameters
     ----------
@@ -301,6 +309,10 @@ def compute_geometric_factors(
         The L2 dataset containing rgfo_half_spin data variable.
     geometric_factor_lookup : dict
         A dict with a full and reduced mode array with shape (esa_steps, position).
+    angular_product : bool
+        Whether the product being processed is an angular product. If True, then
+        the geometric factor calculation has additional steps to determine the exact
+        rgfo boundary.
 
     Returns
     -------
@@ -308,43 +320,88 @@ def compute_geometric_factors(
         A 3D array of geometric factors with shape (epoch, esa_steps, positions).
     """
     # Get half spin values per esa step from the dataset
-    half_spin_per_esa_step = dataset.half_spin_per_esa_step.values
-
+    # Add a new dim for spin_sector
+    half_spin_per_esa_step = dataset.half_spin_per_esa_step.values[:, :, np.newaxis]
     # Expand dimensions to compare each rgfo_half_spin value against
-    # all half_spin_values
-    rgfo_half_spin = dataset.rgfo_half_spin.data[:, np.newaxis]  # Shape: (epoch, 1)
-    # Perform the comparison and calculate modes
-    # Modes will be true (reduced mode) anywhere half_spin > rgfo_half_spin otherwise
-    # false (full mode)
-    # TODO: The mode calculation will need to be revisited after FW changes in january
-    #  2026. We also need to fix this on days when the sci Lut changes.
+    # all half_spin_values and spin_sectors. Shape: (epoch, 1, 1)
+    rgfo_half_spin = dataset.rgfo_half_spin.data[:, np.newaxis, np.newaxis]
     # After November 24th 2025 we need to do this step a different way.
     start_date = dataset.attrs.get("Logical_file_id", None)
     if start_date is None:
         raise ValueError("Dataset is missing Logical_file_id attribute.")
     processing_date = datetime.datetime.strptime(start_date.split("_")[4], "%Y%m%d")
     date_switch = datetime.datetime(2025, 11, 24)
+    fsw_switch_date = datetime.datetime(2026, 1, 29)
     # Only consider valid half spins
     valid_half_spin = half_spin_per_esa_step != HALF_SPIN_FILLVAL
-    if processing_date < date_switch:
+    # TODO: Fix this calculation on days when the sci Lut changes. There may be
+    #   different packet versions in the same dataset.
+    # Perform the comparison and calculate modes
+    if angular_product and dataset.packet_version.data[0] > 1:
+        # For angular products with packet version > 1, we have spin sector information
+        # to determine the exact boundary of the RGFO mode. Shape: (epoch, 1, 1)
+        # Mod by 12 to convert rgfo_spin_sector to half spin sector range of 0-11
+        rgfo_spin_sector = dataset.rgfo_spin_sector.data[:, np.newaxis, np.newaxis] % 12
+        rgfo_esa_step = dataset.rgfo_esa_step.data[:, np.newaxis, np.newaxis]
+        # Shape: (1, 1, spin_sector (24))
+        spin_sector = dataset.spin_sector.data[np.newaxis, np.newaxis, :]
+        # Shape: (1, esa_step (128), 1)
+        esa_step = dataset.esa_step.data[np.newaxis, :, np.newaxis]
+        at_boundary = half_spin_per_esa_step == rgfo_half_spin
+
         modes = (
+            # Reduced mode (True) is applied where:
+            # 1. Half spin is valid.
             valid_half_spin
-            & (half_spin_per_esa_step > rgfo_half_spin)
-            & (rgfo_half_spin > 0)
+            & (
+                # 2. Half spin is greater than rgfo_half_spin.
+                (half_spin_per_esa_step > rgfo_half_spin)
+                | (
+                    # 3. Where half_spin_per_esa_step equals rgfo_half_spin AND
+                    at_boundary
+                    & (
+                        # a. The spin sector mod 12 is greater than rgfo_spin_sector
+                        ((spin_sector % 12) > rgfo_spin_sector)
+                        |
+                        # b. OR the spin sector mod 12 equals rgfo_spin_sector AND the
+                        # esa step is greater than rgfo_esa_step
+                        (
+                            ((spin_sector % 12) == rgfo_spin_sector)
+                            & (esa_step > rgfo_esa_step)
+                        )
+                    )
+                )
+            )
         )
+    elif (processing_date < date_switch) | (processing_date >= fsw_switch_date):
+        # Modes will be true (reduced mode) anywhere half_spin > rgfo_half_spin
+        # otherwise false (full mode)
+        modes = valid_half_spin & (half_spin_per_esa_step > rgfo_half_spin)
     else:
         # After November 24th, 2025, we no longer apply reduced geometric factors;
         # always use the full geometric factor lookup.
         modes = np.zeros_like(half_spin_per_esa_step, dtype=bool)
 
-    # Get the geometric factors based on the modes
-    gf = np.where(
-        modes[:, :, np.newaxis],  # Shape (epoch, esa_step, 1)
-        geometric_factor_lookup["reduced"],  # Shape (1, esa_step, 24) - reduced mode
-        geometric_factor_lookup["full"],  # Shape (1, esa_step, 24) - full mode
-    )  # Shape: (epoch, esa_step, inst_az)
-
-    return xr.DataArray(gf, dims=("epoch", "esa_step", "inst_az"))
+    # If the last dimension of modes is 24, we have spin sector information and
+    # need to apply the geometric factor lookup differently
+    if modes.shape[-1] == 24:
+        # Get the geometric factors based on the modes
+        # expand the mode array to include a dimension for "inst_az" (also shape=24)
+        modes = modes[:, :, :, np.newaxis]  # Shape (epoch, esa_step, 24, 1)
+        gf = np.where(
+            modes,  # Shape (epoch, esa_step, 24, 1)
+            geometric_factor_lookup["reduced"][:, np.newaxis, :],  # (esa_step, 1, 24)
+            geometric_factor_lookup["full"][:, np.newaxis, :],  # (esa_step, 1, 24)
+        )  # Shape: (epoch, esa_step, spin_sector, inst_az)
+        return xr.DataArray(gf, dims=("epoch", "esa_step", "spin_sector", "inst_az"))
+    else:
+        # Get the geometric factors based on the modes
+        gf = np.where(
+            modes,  # Shape (epoch, esa_step, 1)
+            geometric_factor_lookup["reduced"],  # (esa_step, 24)
+            geometric_factor_lookup["full"],  # (esa_step, 24)
+        )  # Shape: (epoch, esa_step, inst_az)
+        return xr.DataArray(gf, dims=("epoch", "esa_step", "inst_az"))
 
 
 def calculate_intensity(
@@ -397,7 +454,6 @@ def calculate_intensity(
     # efficiency.
     # intensity = species_rate / (gm * eff * esa_step) for position and spin angle
     for species in species_list:
-        # Select the relevant positions for the species from the efficiency LUT
         # Shape: (epoch, esa_step, inst_az)
         species_eff = get_species_efficiency(species, efficiency).isel(
             inst_az=positions
@@ -409,15 +465,13 @@ def calculate_intensity(
         if average_across_positions:
             # Take the mean efficiency across positions
             species_eff = species_eff.mean(dim="inst_az")
-
         # Shape: (epoch, esa_step, inst_az) or
         # (epoch, esa_step) if averaged
-        denominator = scalar * geometric_factors * species_eff * dataset["energy_table"]
+        denominator = (
+            scalar * geometric_factors * species_eff * dataset["energy_per_charge"]
+        )
         if species not in dataset:
-            logger.warning(
-                f"Species {species} not found in dataset. Filling with NaNS."
-            )
-            dataset[species] = np.full(dataset["esa_step"].data.shape, np.nan)
+            raise ValueError(f"Species {species} not found in dataset.")
         else:
             # Only replace the data with calculated intensity to keep the attributes
             dataset[species].data = (dataset[species] / denominator).data
@@ -491,12 +545,28 @@ def process_lo_species_intensity(
         species_attrs = cdf_attrs.get_variable_attributes("lo-species-attrs")
         unc_attrs = cdf_attrs.get_variable_attributes("lo-species-unc-attrs")
 
+    # add uncertainties to species list
+    species_list = species_list + [f"unc_{var}" for var in species_list]
     # update species attrs
     for species in species_list:
-        attrs = unc_attrs if "unc" in unc_attrs else species_attrs
+        attrs = unc_attrs if "unc" in species else species_attrs
         # Replace {species} and {direction} in attrs
         attrs = apply_replacements_to_attrs(attrs, {"species": species})
         dataset[species].attrs.update(attrs)
+
+    # Since the RGFO mode is implemented within a half-spin at a given esa step and
+    # spin sector and since the species data is summed over all spin sectors, the data
+    # during this half spin cannot be de-convolved. Thus, the intensity during the
+    # half_spin = RGFO_half_spin should be set to fill values.
+    half_spin_boundary = (
+        dataset.half_spin_per_esa_step.data
+        == dataset.rgfo_half_spin.data[:, np.newaxis]
+    )
+    # Add an extra dimension to match the species data shape (361, 128, 1)
+    half_spin_boundary = half_spin_boundary[:, :, np.newaxis]
+
+    for species in species_list:
+        dataset[species].data[half_spin_boundary] = np.nan
 
     return dataset
 
@@ -615,7 +685,6 @@ def process_lo_angular_intensity(
         dataset[species].values[
             :, b_inds[:, np.newaxis], spin_inds_2, position_index
         ] = species_data[:, b_inds[:, np.newaxis], spin_inds_1, position_index]
-
     cdf_attrs = ImapCdfAttributes()
     cdf_attrs.add_instrument_variable_attrs("codice", "l2-lo-angular")
     species_attrs = cdf_attrs.get_variable_attributes("lo-angular-attrs")
@@ -649,7 +718,6 @@ def process_lo_angular_intensity(
     dataset["spin_sector"].attrs = cdf_attrs.get_variable_attributes(
         "spin_sector", check_schema=False
     )
-
     return dataset
 
 
@@ -747,7 +815,11 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
 
     # Add these new coordinates
     new_coords = {
-        "energy_h": l1b_dataset["energy_h"],
+        "energy_h": xr.DataArray(
+            l1b_dataset["energy_h"].values,
+            dims=("energy_h",),
+            attrs=cdf_attrs.get_variable_attributes("energy_h", check_schema=False),
+        ),
         "energy_h_label": xr.DataArray(
             l1b_dataset["energy_h"].values.astype(str),
             dims=("energy_h",),
@@ -755,7 +827,11 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 "energy_h_label", check_schema=False
             ),
         ),
-        "energy_he3": l1b_dataset["energy_he3"],
+        "energy_he3": xr.DataArray(
+            l1b_dataset["energy_he3"].values,
+            dims=("energy_he3",),
+            attrs=cdf_attrs.get_variable_attributes("energy_he3", check_schema=False),
+        ),
         "energy_he3_label": xr.DataArray(
             l1b_dataset["energy_he3"].values.astype(str),
             dims=("energy_he3",),
@@ -763,7 +839,11 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 "energy_he3_label", check_schema=False
             ),
         ),
-        "energy_he4": l1b_dataset["energy_he4"],
+        "energy_he4": xr.DataArray(
+            l1b_dataset["energy_he4"].values,
+            dims=("energy_he4",),
+            attrs=cdf_attrs.get_variable_attributes("energy_he4", check_schema=False),
+        ),
         "energy_he4_label": xr.DataArray(
             l1b_dataset["energy_he4"].values.astype(str),
             dims=("energy_he4",),
@@ -771,7 +851,11 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 "energy_he4_label", check_schema=False
             ),
         ),
-        "energy_c": l1b_dataset["energy_c"],
+        "energy_c": xr.DataArray(
+            l1b_dataset["energy_c"].values,
+            dims=("energy_c",),
+            attrs=cdf_attrs.get_variable_attributes("energy_c", check_schema=False),
+        ),
         "energy_c_label": xr.DataArray(
             l1b_dataset["energy_c"].values.astype(str),
             dims=("energy_c",),
@@ -779,7 +863,11 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 "energy_c_label", check_schema=False
             ),
         ),
-        "energy_o": l1b_dataset["energy_o"],
+        "energy_o": xr.DataArray(
+            l1b_dataset["energy_o"].values,
+            dims=("energy_o",),
+            attrs=cdf_attrs.get_variable_attributes("energy_o", check_schema=False),
+        ),
         "energy_o_label": xr.DataArray(
             l1b_dataset["energy_o"].values.astype(str),
             dims=("energy_o",),
@@ -787,7 +875,13 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 "energy_o_label", check_schema=False
             ),
         ),
-        "energy_ne_mg_si": l1b_dataset["energy_ne_mg_si"],
+        "energy_ne_mg_si": xr.DataArray(
+            l1b_dataset["energy_ne_mg_si"].values,
+            dims=("energy_ne_mg_si",),
+            attrs=cdf_attrs.get_variable_attributes(
+                "energy_ne_mg_si", check_schema=False
+            ),
+        ),
         "energy_ne_mg_si_label": xr.DataArray(
             l1b_dataset["energy_ne_mg_si"].values.astype(str),
             dims=("energy_ne_mg_si",),
@@ -795,7 +889,11 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 "energy_ne_mg_si_label", check_schema=False
             ),
         ),
-        "energy_fe": l1b_dataset["energy_fe"],
+        "energy_fe": xr.DataArray(
+            l1b_dataset["energy_fe"].values,
+            dims=("energy_fe",),
+            attrs=cdf_attrs.get_variable_attributes("energy_fe", check_schema=False),
+        ),
         "energy_fe_label": xr.DataArray(
             l1b_dataset["energy_fe"].values.astype(str),
             dims=("energy_fe",),
@@ -803,7 +901,11 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 "energy_fe_label", check_schema=False
             ),
         ),
-        "energy_uh": l1b_dataset["energy_uh"],
+        "energy_uh": xr.DataArray(
+            l1b_dataset["energy_uh"].values,
+            dims=("energy_uh",),
+            attrs=cdf_attrs.get_variable_attributes("energy_uh", check_schema=False),
+        ),
         "energy_uh_label": xr.DataArray(
             l1b_dataset["energy_uh"].values.astype(str),
             dims=("energy_uh",),
@@ -811,7 +913,11 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 "energy_uh_label", check_schema=False
             ),
         ),
-        "energy_junk": l1b_dataset["energy_junk"],
+        "energy_junk": xr.DataArray(
+            l1b_dataset["energy_junk"].values,
+            dims=("energy_junk",),
+            attrs=cdf_attrs.get_variable_attributes("energy_junk", check_schema=False),
+        ),
         "energy_junk_label": xr.DataArray(
             l1b_dataset["energy_junk"].values.astype(str),
             dims=("energy_junk",),
@@ -824,7 +930,13 @@ def process_hi_omni(dependencies: ProcessingInputCollection) -> xr.Dataset:
             dims=("epoch",),
             attrs=cdf_attrs.get_variable_attributes("epoch", check_schema=False),
         ),
+        "epoch_delta_plus": l1b_dataset["epoch_delta_plus"],
+        "epoch_delta_minus": l1b_dataset["epoch_delta_minus"],
     }
+
+    l1b_dataset["epoch"].attrs["DELTA_MINUS_VAR"] = "epoch_delta_minus"
+    l1b_dataset["epoch"].attrs["DELTA_PLUS_VAR"] = "epoch_delta_plus"
+
     l1b_dataset = l1b_dataset.assign_coords(new_coords)
 
     return l1b_dataset
@@ -874,7 +986,11 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
                     "spin_sector_label", check_schema=False
                 ),
             ),
-            "energy_h": l1b_dataset["energy_h"],
+            "energy_h": xr.DataArray(
+                l1b_dataset["energy_h"].values,
+                dims=("energy_h",),
+                attrs=cdf_attrs.get_variable_attributes("energy_h", check_schema=False),
+            ),
             "energy_h_label": xr.DataArray(
                 l1b_dataset["energy_h"].values.astype(str),
                 dims=("energy_h",),
@@ -882,7 +998,13 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
                     "energy_h_label", check_schema=False
                 ),
             ),
-            "energy_he3he4": l1b_dataset["energy_he3he4"],
+            "energy_he3he4": xr.DataArray(
+                l1b_dataset["energy_he3he4"].values,
+                dims=("energy_he3he4",),
+                attrs=cdf_attrs.get_variable_attributes(
+                    "energy_he3he4", check_schema=False
+                ),
+            ),
             "energy_he3he4_label": xr.DataArray(
                 l1b_dataset["energy_he3he4"].values.astype(str),
                 dims=("energy_he3he4",),
@@ -890,7 +1012,13 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
                     "energy_he3he4_label", check_schema=False
                 ),
             ),
-            "energy_cno": l1b_dataset["energy_cno"],
+            "energy_cno": xr.DataArray(
+                l1b_dataset["energy_cno"].values,
+                dims=("energy_cno",),
+                attrs=cdf_attrs.get_variable_attributes(
+                    "energy_cno", check_schema=False
+                ),
+            ),
             "energy_cno_label": xr.DataArray(
                 l1b_dataset["energy_cno"].values.astype(str),
                 dims=("energy_cno",),
@@ -898,7 +1026,13 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
                     "energy_cno_label", check_schema=False
                 ),
             ),
-            "energy_fe": l1b_dataset["energy_fe"],
+            "energy_fe": xr.DataArray(
+                l1b_dataset["energy_fe"].values,
+                dims=("energy_fe",),
+                attrs=cdf_attrs.get_variable_attributes(
+                    "energy_fe", check_schema=False
+                ),
+            ),
             "energy_fe_label": xr.DataArray(
                 l1b_dataset["energy_fe"].values.astype(str),
                 dims=("energy_fe",),
@@ -907,6 +1041,8 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
                 ),
             ),
             "epoch": l1b_dataset["epoch"],
+            "epoch_delta_plus": l1b_dataset["epoch_delta_plus"],
+            "epoch_delta_minus": l1b_dataset["epoch_delta_minus"],
             "elevation_angle": xr.DataArray(
                 HI_L2_ELEVATION_ANGLE,
                 dims=("elevation_angle",),
@@ -924,6 +1060,9 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
         },
         attrs=cdf_attrs.get_global_attributes("imap_codice_l2_hi-sectored"),
     )
+
+    l1b_dataset["epoch"].attrs["DELTA_MINUS_VAR"] = "epoch_delta_minus"
+    l1b_dataset["epoch"].attrs["DELTA_PLUS_VAR"] = "epoch_delta_plus"
 
     efficiencies_file = dependencies.get_file_paths(
         descriptor="l2-hi-sectored-efficiency"
@@ -978,10 +1117,14 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
         )
 
         # Replace existing species data with omni-directional intensities
+        species_attrs = cdf_attrs.get_variable_attributes(species, check_schema=False)
+        # Replace {species} in attributes with actual species name
+        species_attrs = apply_replacements_to_attrs(species_attrs, {"species": species})
+
         l2_dataset[species] = xr.DataArray(
             sectored_intensities.data,
             dims=("epoch", f"energy_{species}", "spin_sector", "elevation_angle"),
-            attrs=cdf_attrs.get_variable_attributes(species, check_schema=False),
+            attrs=species_attrs,
         )
         # Calculate uncertainty if available
         species_uncertainty = f"unc_{species}"
@@ -989,12 +1132,18 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
             sectored_uncertainties = l1b_dataset[species_uncertainty] / (
                 geometric_factor_da * species_efficiencies * energy_passbands
             )
+            unc_species_attrs = cdf_attrs.get_variable_attributes(
+                species_uncertainty, check_schema=False
+            )
+            # Replace {species} in attributes with actual species name
+            unc_species_attrs = apply_replacements_to_attrs(
+                unc_species_attrs, {"species": species}
+            )
+
             l2_dataset[species_uncertainty] = xr.DataArray(
                 sectored_uncertainties.data,
                 dims=("epoch", f"energy_{species}", "spin_sector", "elevation_angle"),
-                attrs=cdf_attrs.get_variable_attributes(
-                    species_uncertainty, check_schema=False
-                ),
+                attrs=unc_species_attrs,
             )
 
     # Calculate spin angle
@@ -1006,9 +1155,17 @@ def process_hi_sectored(dependencies: ProcessingInputCollection) -> xr.Dataset:
     # Calculate spin angle by adding a base angle from L2_HI_SECTORED_ANGLE
     # for each SSD index and then adding multiple of 30 degrees for each elevation.
     # Then mod by 360 to keep it within 0-360 range.
-    elevation_angles = np.arange(len(l2_dataset["elevation_angle"].values)) * 30.0
-    spin_angle = (L2_HI_SECTORED_ANGLE[:, np.newaxis] + elevation_angles) % 360.0
+    # Determine number of bins from dataset dimensions
+    n_spin = l2_dataset.sizes["spin_sector"]
+    n_elev = l2_dataset.sizes["elevation_angle"]
 
+    # Elevation-dependent offset: 0, 30, 60, ... for each elevation bin
+    elevation_offsets = np.arange(n_elev, dtype=float).reshape(1, n_elev) * 30.0
+
+    # Base spin angle per spin sector, broadcast across elevation_angle
+    base_angles = np.asarray(L2_HI_SECTORED_ANGLE, dtype=float).reshape(n_spin, 1)
+
+    spin_angle = (base_angles + elevation_offsets) % 360.0
     # Add spin angle variable using the new elevation_angle dimension
     l2_dataset["spin_angle"] = (("spin_sector", "elevation_angle"), spin_angle)
     l2_dataset["spin_angle"].attrs = cdf_attrs.get_variable_attributes(
@@ -1154,7 +1311,18 @@ def process_lo_direct_events(dependencies: ProcessingInputCollection) -> xr.Data
         kev.astype(np.float32).reshape(l2_dataset["energy_step"].shape),
     )
     # Drop unused variables
-    vars_to_drop = ["spare", "sw_bias_gain_mode", "st_bias_gain_mode", "k_factor"]
+    vars_to_drop = [
+        "spare",
+        "sw_bias_gain_mode",
+        "st_bias_gain_mode",
+        "k_factor",
+        "rgfo_esa_step",
+        "rgfo_spin_sector",
+        "rgfo_half_spin",
+        "nso_esa_step",
+        "nso_spin_sector",
+        "nso_half_spin",
+    ]
     l2_dataset = l2_dataset.drop_vars(vars_to_drop)
     # Update variable attributes
     l2_dataset.attrs.update(
@@ -1273,7 +1441,17 @@ def process_hi_direct_events(dependencies: ProcessingInputCollection) -> xr.Data
         dims=l2_dataset["tof"].dims,
     ).astype(np.float32)
     # Drop unused variables
-    vars_to_drop = ["spare", "sw_bias_gain_mode", "st_bias_gain_mode"]
+    vars_to_drop = [
+        "spare",
+        "sw_bias_gain_mode",
+        "st_bias_gain_mode",
+        "rgfo_esa_step",
+        "rgfo_spin_sector",
+        "rgfo_half_spin",
+        "nso_esa_step",
+        "nso_spin_sector",
+        "nso_half_spin",
+    ]
     l2_dataset = l2_dataset.drop_vars(vars_to_drop)
     # Update variable attributes
     l2_dataset.attrs.update(
@@ -1347,11 +1525,11 @@ def process_codice_l2(
 
         geometric_factor_lookup = get_geometric_factor_lut(dependencies)
         efficiency_lookup = get_efficiency_lut(dependencies)
-        geometric_factors = compute_geometric_factors(
-            l2_dataset, geometric_factor_lookup
-        )
 
         if dataset_name == "imap_codice_l2_lo-sw-species":
+            geometric_factors = compute_geometric_factors(
+                l2_dataset, geometric_factor_lookup
+            )
             # Filter the efficiency lookup table for solar wind efficiencies
             efficiencies = efficiency_lookup[efficiency_lookup["product"] == "sw"]
             # Calculate the pickup ion sunward solar wind intensities using equation
@@ -1376,6 +1554,9 @@ def process_codice_l2(
                 cdf_attrs.get_global_attributes("imap_codice_l2_lo-sw-species")
             )
         elif dataset_name == "imap_codice_l2_lo-nsw-species":
+            geometric_factors = compute_geometric_factors(
+                l2_dataset, geometric_factor_lookup
+            )
             # Filter the efficiency lookup table for non-solar wind efficiencies
             efficiencies = efficiency_lookup[efficiency_lookup["product"] == "nsw"]
             # Calculate the non-sunward species intensities using equation
@@ -1391,6 +1572,9 @@ def process_codice_l2(
                 cdf_attrs.get_global_attributes("imap_codice_l2_lo-nsw-species")
             )
         elif dataset_name == "imap_codice_l2_lo-sw-angular":
+            geometric_factors = compute_geometric_factors(
+                l2_dataset, geometric_factor_lookup, angular_product=True
+            )
             efficiencies = efficiency_lookup[efficiency_lookup["product"] == "sw"]
             # Calculate the sunward solar wind angular intensities using equation
             # described in section 11.2.2 of algorithm document.
@@ -1405,6 +1589,9 @@ def process_codice_l2(
                 cdf_attrs.get_global_attributes("imap_codice_l2_lo-sw-angular")
             )
         if dataset_name == "imap_codice_l2_lo-nsw-angular":
+            geometric_factors = compute_geometric_factors(
+                l2_dataset, geometric_factor_lookup, angular_product=True
+            )
             # Calculate the non sunward angular intensities
             efficiencies = efficiency_lookup[efficiency_lookup["product"] == "nsw"]
             l2_dataset = process_lo_angular_intensity(
@@ -1417,14 +1604,6 @@ def process_codice_l2(
             l2_dataset.attrs.update(
                 cdf_attrs.get_global_attributes("imap_codice_l2_lo-nsw-angular")
             )
-        # Drop vars not needed in L2
-        l2_dataset = l2_dataset.drop_vars(
-            [
-                "acquisition_time_per_esa_step",
-                "rgfo_half_spin",
-                "half_spin_per_esa_step",
-            ]
-        )
 
     if dataset_name in [
         "imap_codice_l2_hi-counters-singles",
@@ -1474,6 +1653,19 @@ def process_codice_l2(
         # See section 11.1.2 of algorithm document
         l2_dataset = process_lo_direct_events(dependencies)
 
-    # logger.info(f"\nFinal data product:\n{l2_dataset}\n")
+    # make sure we drop vars not needed in l2 products
+    vars_to_drop = [
+        "acquisition_time_per_esa_step",
+        "rgfo_half_spin",
+        "half_spin_per_esa_step",
+        "rgfo_esa_step",
+        "rgfo_spin_sector",
+        "packet_version",
+    ]
+    for var in vars_to_drop:
+        if var in l2_dataset.data_vars:
+            l2_dataset = l2_dataset.drop_vars(var)
+
+    logger.info(f"\nFinal data product:\n{l2_dataset}\n")
 
     return l2_dataset

@@ -1,9 +1,11 @@
 """Creates xarray based on structure of queried DynamoDB."""
 
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 import numpy as np
 import xarray as xr
+from cdflib.epochs import CDFepoch
 
 from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
 from imap_processing.codice.constants import (
@@ -43,6 +45,47 @@ def create_xarray_from_records(records: list[dict]) -> xr.Dataset:  # noqa: PLR0
 
     epochs: dict[str, list[int]] = {inst: [] for inst in (one_epoch | multi_epoch)}
     by_inst: dict[str, list[dict]] = defaultdict(list)
+
+    # Get the start and end ttj2000ns.
+    date = records[0]["time_utc"]  # e.g. "2025-06-20T08:00:00Z"
+
+    # Parse as UTC
+    dt = datetime.fromisoformat(date)
+
+    # Start and end of that UTC day
+    start_dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(days=1)
+
+    start_ttj2000 = int(
+        CDFepoch.compute_tt2000(
+            [
+                start_dt.year,
+                start_dt.month,
+                start_dt.day,
+                start_dt.hour,
+                start_dt.minute,
+                start_dt.second,
+                0,
+                0,
+                0,  # ms, us, ns
+            ]
+        )
+    )
+    end_ttj2000 = int(
+        CDFepoch.compute_tt2000(
+            [
+                end_dt.year,
+                end_dt.month,
+                end_dt.day,
+                end_dt.hour,
+                end_dt.minute,
+                end_dt.second,
+                0,
+                0,
+                0,  # ms, us, ns
+            ]
+        )
+    )
 
     for record in records:
         inst = record.get("instrument")
@@ -162,21 +205,21 @@ def create_xarray_from_records(records: list[dict]) -> xr.Dataset:  # noqa: PLR0
         ),
     )
 
-    elevation = xr.DataArray(
+    polar = xr.DataArray(
         HI_IALIRT_ELEVATION_ANGLE,
-        name="codice_hi_elevation",
-        dims=["codice_hi_elevation"],
+        name="codice_hi_polar",
+        dims=["codice_hi_polar"],
         attrs=cdf_manager.get_variable_attributes(
-            "codice_hi_elevation", check_schema=False
+            "codice_hi_polar", check_schema=False
         ),
     )
 
-    elevation_labels = xr.DataArray(
-        [f"{float(v):.1f}deg" for v in elevation.values],
-        name="codice_hi_elevation_labels",
-        dims=["codice_hi_elevation"],
+    polar_labels = xr.DataArray(
+        [f"{float(v):.1f}deg" for v in polar.values],
+        name="codice_hi_polar_labels",
+        dims=["codice_hi_polar"],
         attrs=cdf_manager.get_variable_attributes(
-            "codice_hi_elevation_labels", check_schema=False
+            "codice_hi_polar_labels", check_schema=False
         ),
     )
 
@@ -221,8 +264,8 @@ def create_xarray_from_records(records: list[dict]) -> xr.Dataset:  # noqa: PLR0
         "codice_hi_energy_center": codice_hi_energy_centers,
         "codice_hi_energy_minus": codice_energy_minus,
         "codice_hi_energy_plus": codice_energy_plus,
-        "codice_hi_elevation": elevation,
-        "codice_hi_elevation_labels": elevation_labels,
+        "codice_hi_polar": polar,
+        "codice_hi_polar_labels": polar_labels,
         "codice_hi_spin_sector": spin_sector,
         "codice_hi_spin_sector_labels": spin_sector_labels,
         "swe_electron_energy": swe_electron_energy,
@@ -241,7 +284,7 @@ def create_xarray_from_records(records: list[dict]) -> xr.Dataset:  # noqa: PLR0
 
         shape = [dataset.dims[d] for d in dims]
 
-        data = np.full(shape, fill, dtype=dtype)
+        data: np.ndarray = np.full(shape, fill, dtype=dtype)
         dataset[key] = xr.DataArray(data, dims=dims, attrs=attrs)
 
     for i, record in enumerate(by_inst.get("mag", [])):
@@ -267,22 +310,34 @@ def create_xarray_from_records(records: list[dict]) -> xr.Dataset:  # noqa: PLR0
 
     for i, record in enumerate(by_inst.get("codice_lo", [])):
         for key in IALIRT_DIMS.keys():
-            if key.startswith("codice_lo_"):
-                dataset[key].data[i] = np.float32(record[key])
+            val = record.get(key)
+            if (
+                key.startswith("codice_lo_")
+                and key != "codice_lo_epoch"
+                and val is not None
+            ):
+                dataset[key].data[i] = np.float32(val)
 
     for i, record in enumerate(by_inst.get("hit", [])):
         for key in IALIRT_DIMS.keys():
-            if key.startswith("hit_") and key not in hit_restricted_fields:
-                dataset[key].data[i] = np.uint32(record[key])
+            val = record.get(key)
+            if (
+                key.startswith("hit_")
+                and key != "hit_epoch"
+                and val is not None
+                and key not in hit_restricted_fields
+            ):
+                dataset[key].data[i] = np.float32(val)
 
     for i, record in enumerate(by_inst.get("swapi", [])):
         for key in IALIRT_DIMS.keys():
-            if key.startswith("swapi_"):
-                dataset[key].data[i] = np.float32(record[key])
+            val = record.get(key)
+            if key.startswith("swapi_") and key != "swapi_epoch" and val is not None:
+                dataset[key].data[i] = np.float32(val)
 
     for i, record in enumerate(by_inst.get("swe", [])):
         dataset["swe_normalized_counts"].data[i, :] = np.asarray(
-            record["swe_normalized_counts"], dtype=np.uint32
+            record["swe_normalized_counts"], dtype=np.int64
         )
         dataset["swe_counterstreaming_electrons"].data[i] = np.uint8(
             record["swe_counterstreaming_electrons"]
@@ -292,5 +347,17 @@ def create_xarray_from_records(records: list[dict]) -> xr.Dataset:  # noqa: PLR0
         for key in IALIRT_DIMS.keys():
             if key.startswith("sc_"):
                 dataset[key].data[i, :] = np.asarray(record[key], dtype=np.float32)
+
+    # Trim data that does not fit within the UTC day.
+    for inst in epochs.keys():
+        if inst == "spacecraft":
+            dim = "ephemeris_epoch"
+        else:
+            dim = f"{inst}_epoch"
+
+        if dim in dataset.coords:
+            dataset = dataset.sel(
+                {dim: (dataset[dim] >= start_ttj2000) & (dataset[dim] < end_ttj2000)}
+            )
 
     return dataset

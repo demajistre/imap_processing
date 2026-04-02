@@ -14,7 +14,10 @@ from imap_processing.spice.time import (
     ttj2000ns_to_et,
 )
 from imap_processing.ultra.constants import UltraConstants
-from imap_processing.ultra.l1b.ultra_l1b_culling import get_de_rejection_mask
+from imap_processing.ultra.l1b.ultra_l1b_culling import (
+    get_de_rejection_mask,
+    get_energy_and_spin_dependent_rejection_mask,
+)
 from imap_processing.ultra.l1c.l1c_lookup_utils import (
     build_energy_bins,
     calculate_fwhm_spun_scattering,
@@ -85,22 +88,36 @@ def calculate_spacecraft_pset(
         logger.info(f"No data available for {name}")
         return None
 
+    ################ Reject events based on quality flags ################
     # Before we use the de_dataset to calculate the pointing set grid we need to filter.
-    rejected = get_de_rejection_mask(
+    de_rejected = get_de_rejection_mask(
         species_dataset["quality_scattering"].values,
         species_dataset["quality_outliers"].values,
         reject_scattering,
     )
-    species_dataset = species_dataset.isel(epoch=~rejected)
+    species_dataset = species_dataset.isel(epoch=~de_rejected)
+    # Check if spin_number is in the goodtimes dataset, if not then we can
+    #  reject all events for that spin without checking energy bin flags.
+    spin_rejected = ~np.isin(
+        species_dataset["spin"].values, goodtimes_dataset["spin_number"].values
+    )
+    species_dataset = species_dataset.isel(epoch=~spin_rejected)
 
+    intervals, _, energy_bin_geometric_means = build_energy_bins()
+
+    # Now check energy dependent flags.
+    energy_dependent_rejected = get_energy_and_spin_dependent_rejection_mask(
+        goodtimes_dataset,
+        species_dataset["energy_spacecraft"].values,
+        species_dataset["spin"].values,
+    )
+    species_dataset = species_dataset.isel(epoch=~energy_dependent_rejected)
     v_mag_dps_spacecraft = np.linalg.norm(
         species_dataset["velocity_dps_sc"].values, axis=1
     )
     vhat_dps_spacecraft = (
         species_dataset["velocity_dps_sc"].values / v_mag_dps_spacecraft[:, np.newaxis]
     )
-
-    intervals, _, energy_bin_geometric_means = build_energy_bins()
 
     # Get lookup table for FOR indices by spin phase step
     (
@@ -122,15 +139,22 @@ def calculate_spacecraft_pset(
             reject_scattering,
         )
     )
-    # Determine nside from the lookup table
-    nside = hp.npix2nside(for_indices_by_spin_phase.sizes["pixel"])
-    counts, latitude, longitude, n_pix = get_spacecraft_histogram(
+    counts, counts_n_pix = get_spacecraft_histogram(
         vhat_dps_spacecraft,
         species_dataset["energy_spacecraft"].values,
         intervals,
-        nside=nside,
+        nside=UltraConstants.L1C_COUNTS_NSIDE,
     )
+    counts_healpix = np.arange(counts_n_pix)
+    # Determine nside for non "counts" variables from the lookup table
+    n_pix = for_indices_by_spin_phase.sizes["pixel"]
+    nside = hp.npix2nside(n_pix)
     healpix = np.arange(n_pix)
+
+    # Calculate the corresponding longitude (az) latitude (el)
+    # center coordinates
+    longitude, latitude = hp.pix2ang(nside, healpix, lonlat=True)
+
     # Get the start and stop times of the pointing period
     repoint_id = species_dataset.attrs.get("Repointing", None)
     if repoint_id is None:
@@ -145,11 +169,11 @@ def calculate_spacecraft_pset(
         valid_spun_pixels,
         boundary_scale_factors,
         aux_dataset,
-        pointing_range_met,
-        n_energy_bins=len(energy_bin_geometric_means),
+        energy_bins=energy_bin_geometric_means,
         sensor_id=sensor_id,
         ancillary_files=ancillary_files,
         apply_bsf=apply_bsf,
+        goodtimes_dataset=goodtimes_dataset,
     )
     logger.info("Calculating spun efficiencies and geometric function.")
     # calculate efficiency and geometric function as a function of energy
@@ -159,6 +183,7 @@ def calculate_spacecraft_pset(
         theta_vals,
         phi_vals,
         n_pix,
+        sensor_id,
         ancillary_files,
         apply_bsf,
     )
@@ -208,6 +233,7 @@ def calculate_spacecraft_pset(
     pset_dict["background_rates"] = background_rates[np.newaxis, ...]
     pset_dict["exposure_factor"] = exposure_pointing[np.newaxis, ...]
     pset_dict["pixel_index"] = healpix
+    pset_dict["counts_pixel_index"] = counts_healpix
     pset_dict["energy_bin_delta"] = np.diff(intervals, axis=1).squeeze()[
         np.newaxis, ...
     ]

@@ -33,10 +33,12 @@ EXTERNAL_TEST_DATA = [
     ("imap_codice_l0_hi-sectored_20250814_v001.pkts", "codice/data/l1a_input/"),
     ("imap_codice_l0_hi-priority_20250814_v001.pkts", "codice/data/l1a_input/"),
     ("imap_codice_l0_hi-direct-events_20250814_v001.pkts", "codice/data/l1a_input/"),
-    ("imap_codice_hskp_20250814_v001.pkts", "codice/data/l1a_input/"),
+    ("imap_codice_l0_hskp_20250814_v001.pkts", "codice/data/l1a_input/"),
+    ("imap_codice_l0_raw_20260130_v001.pkts", "codice/data/l1a_input/"),
 
     # L1A LUT
-    ("imap_codice_l1a-sci-lut_20251007_v004.json", "codice/data/l1a_lut/"),
+    ("imap_codice_l1a-sci-lut_20251007_v005.json", "codice/data/l1a_lut/"),
+    ("imap_codice_l1a-sci-lut_20260129_v002.json", "codice/data/l1a_lut/"),
 
     # L1A validation data
     (f"imap_codice_l1a_hi-counters-aggregated_{VALIDATION_FILE_DATE}_{VALIDATION_FILE_VERSION}.cdf", "codice/data/l1a_validation"),
@@ -107,6 +109,7 @@ EXTERNAL_TEST_DATA = [
     ("imap_hi_l1b_90sensor-hk_20241105-repoint00099_v001.cdf", "hi/data/l1/"),
     ("imap_hi_l1a_90sensor-de_20241105-repoint00099_v001.cdf", "hi/data/l1/"),
     ("imap_hi_l1c_45sensor-pset_20250415_v999.cdf", "hi/data/l1/"),
+    ("imap_hi_l1b_45sensor-goodtimes_20250415_v999.cdf", "hi/data/l1/"),
 
     # I-ALiRT
     ("apid_478.bin", "ialirt/data/l0/"),
@@ -132,7 +135,7 @@ EXTERNAL_TEST_DATA = [
 
     # IDEX
     ("idex_l1a_validation_file.h5", "idex/test_data/"),
-    ("idex_l1b_validation_file.h5", "idex/test_data/"),
+    ("imap_idex_l1b_sci_20231218_v002.h5", "idex/test_data/"),
     ("imap_idex_l2a-calibration-curve-yield-params_20250101_v001.csv", "idex/test_data/"),
     ("imap_idex_l2a-calibration-curve-t-rise_20250101_v001.csv", "idex/test_data/"),
 
@@ -147,6 +150,12 @@ EXTERNAL_TEST_DATA = [
     # Ultra
     ("FM90_Startup_20230711T081655.CCSDS", "ultra/data/l0/"),
     ("IMAP-Ultra45_r1_L1_V0_shortened.csv", "ultra/data/l1/"),
+    ("extendedspin_test_data_repoint00047.csv", "ultra/data/l1/"),
+    ("status_test_data_repoint00047.csv", "ultra/data/l1/"),
+    ("voltage_culling_results_repoint00047.csv", "ultra/data/l1/"),
+    ("validate_high_energy_culling_results_repoint00047_v2.csv", "ultra/data/l1/"),
+    ("validate_stat_culling_results_repoint00047_v2.csv", "ultra/data/l1/"),
+    ("de_test_data_repoint00047.csv", "ultra/data/l1/"),
     ("FM45_UltraFM45Extra_TV_Tests_2024-01-22T0930_20240122T093008.CCSDS", "ultra/data/l0/"),
     ("ultra45_raw_sc_rawnrgevnt_19840122_00.csv", "ultra/data/l0/"),
     ("ultra45_raw_sc_enaphxtofhnrgimg_FM45_UltraFM45Extra_TV_Tests_2024-01-22T0930_20240122T093008.csv",

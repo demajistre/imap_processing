@@ -63,7 +63,6 @@ def binary_packet_path():
 
 
 @pytest.fixture(scope="session")
-@pytest.mark.external_test_data
 def postlaunch_packet_path():
     """Returns the paths to the binary packets."""
     directory = imap_module_directory / "tests" / "ialirt" / "data" / "l0"
@@ -506,7 +505,7 @@ def test_transform_to_frames(furnish_kernels, spice_test_data_path):
     """Test transform_to_frames over multiple spin phases."""
 
     kernels = [
-        "imap_science_100.tf",
+        "imap_science_120.tf",
         "imap_130.tf",
         "naif0012.tls",
         "de440s.bsp",
@@ -640,7 +639,7 @@ def test_process_packet(
 ):
     """Test the process_packet function."""
     kernels = [
-        "imap_science_100.tf",
+        "imap_science_120.tf",
         "imap_130.tf",
         "naif0012.tls",
         "de440s.bsp",

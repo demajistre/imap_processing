@@ -274,7 +274,7 @@ def l1b_de(
     # Initialize the L1B DE dataset
     l1b_de = initialize_l1b_de(l1a_de, attr_mgr_l1b, logical_source)
     # Get the pivot angle from the housekeeping dataset
-    pivot_angle = _get_nearest_pivot_angle(l1b_de["epoch"].values[0], l1b_nhk)
+    pivot_angle = get_pivot_angle_from_nhk(l1b_nhk)
     l1b_de["pivot_angle"] = xr.DataArray([pivot_angle], dims=["pivot_angle"])
 
     pointing_start_met, pointing_end_met = get_pointing_times(
@@ -428,7 +428,7 @@ def initialize_l1b_de(
         # attrs=attr_mgr.get_variable_attributes("esa_step"),
     )
     l1b_de["shcoarse"] = xr.DataArray(
-        np.repeat(l1a_de["shcoarse"].values, l1a_de["de_count"].values),
+        np.repeat(l1a_de["met"].values, l1a_de["de_count"].values),
         dims=["epoch"],
         # TODO: Add shcoarse to YAML file
         # attrs=attr_mgr.get_variable_attributes("shcoarse"),
@@ -482,7 +482,7 @@ def set_esa_mode(
         # Get the ESA mode for the pointing
         esa_mode = sweep_df["esa_mode"].values[0]
         # Repeat the ESA mode for each direct event in the pointing
-        esa_mode_array = np.repeat(esa_mode, len(l1b_science["epoch"]))
+        esa_mode_array: np.ndarray = np.repeat(esa_mode, len(l1b_science["epoch"]))
     else:
         raise ValueError("Multiple ESA modes found in sweep table for pointing.")
 
@@ -804,7 +804,7 @@ def get_spin_start_times(
     """
     # Get the actual spin start times from the spin data
     # Use the individual spin start times rather than calculating from ASC averages
-    spin_start_times = interpolate_spin_data(l1a_de["shcoarse"].values)[
+    spin_start_times = interpolate_spin_data(l1a_de["met"].values)[
         "spin_start_met"
     ].values
     spin_start_times = np.repeat(spin_start_times, l1a_de["de_count"].values)
@@ -1199,7 +1199,7 @@ def set_bad_or_goodtimes(
     combined_mask = time_mask & bin_mask
 
     # Get the time flags for each epoch's esa_step from matching rows
-    time_flags = np.zeros(len(epochs), dtype=int)
+    time_flags: np.ndarray = np.zeros(len(epochs), dtype=int)
     for epoch_idx in range(len(epochs)):
         matching_rows = np.where(combined_mask[epoch_idx])[0]
         if len(matching_rows) > 0:
@@ -1811,7 +1811,7 @@ def calculate_de_rates(
         )
 
     # exposure time shape: (num_asc, num_esa_steps)
-    exposure_time = np.zeros((num_asc, 7), dtype=float)
+    exposure_time: np.ndarray = np.zeros((num_asc, 7), dtype=float)
     # exposure_time_6deg = 4 * avg_spin_per_asc / 60
     # 4 sweeps per ASC (28 / 7) in 60 bins
     asc_avg_spin_durations = 4 * l1b_de["avg_spin_durations"].data[unique_idx] / 60
@@ -1922,14 +1922,15 @@ def calculate_de_rates(
     return ds
 
 
-def _get_nearest_pivot_angle(epoch: int, ds_nhk: xr.Dataset) -> float:
+def get_pivot_angle_from_nhk(ds_nhk: xr.Dataset) -> float:
     """
-    Get the nearest pivot angle for the given epoch from the NHK dataset.
+    Get the middle pivot angle from the NHK dataset.
+
+    The pivot platform moves at the beginning of each pointing period, so we
+    don't want to be near one of the start/end times, so just grab the middle value.
 
     Parameters
     ----------
-    epoch : int
-        The epoch in TTJ2000ns format.
     ds_nhk : xr.Dataset
         The NHK dataset containing pivot angle information.
 
@@ -1938,7 +1939,8 @@ def _get_nearest_pivot_angle(epoch: int, ds_nhk: xr.Dataset) -> float:
     pivot_angle : float
         The nearest pivot angle for the given epoch.
     """
-    return ds_nhk["pcc_cumulative_cnt_pri"].sel(epoch=epoch, method="nearest").item()
+    nitems = len(ds_nhk["pcc_cumulative_cnt_pri"])
+    return ds_nhk["pcc_cumulative_cnt_pri"].isel(epoch=nitems // 2).item()
 
 
 def _get_esa_level_indices(epochs: np.ndarray, anc_dependencies: list) -> np.ndarray:
@@ -2014,7 +2016,7 @@ def _get_esa_level_indices(epochs: np.ndarray, anc_dependencies: list) -> np.nda
     #       Can we just take the last 7 entries of the sweep table for that
     #       date and use those values instead of this extra work with the
     #       separate LUT ancillary file?
-    energy_step_mapping = np.zeros(7, dtype=int)
+    energy_step_mapping: np.ndarray = np.zeros(7, dtype=int)
     # Loop through the LUT entries and populate the mapping
     for _, row in lut_entries.iterrows():
         # Original ESA step index is 1-based, convert to 0-based
@@ -2170,7 +2172,7 @@ def calculate_star_sensor_profile_for_group(
     count_array = valid_bin_mask.sum(axis=0).astype(np.int32)
 
     # Compute average amplitude per bin
-    avg_amplitude = np.full(720, np.nan, dtype=np.float64)
+    avg_amplitude: np.ndarray = np.full(720, np.nan, dtype=np.float64)
     mask = count_array > 0
     avg_amplitude[mask] = sum_array[mask] / count_array[mask]
 
@@ -2259,15 +2261,15 @@ def calculate_star_sensor_profiles_by_group(
         logger.debug(f"Last group contains {last_group_size} records (partial group)")
 
     # Assign group labels to the dataset for xarray groupby operations
-    group_labels = np.repeat(np.arange(n_groups), group_size)[:n_valid]
+    group_labels: np.ndarray = np.repeat(np.arange(n_groups), group_size)[:n_valid]
     l1a_star = l1a_star.assign_coords(group=("epoch", group_labels))
 
     # Extract first MET for each group using xarray groupby
     group_mets = l1a_star["shcoarse"].groupby("group").first().values.astype(np.int64)
 
     # Initialize output arrays
-    avg_amplitudes = np.zeros((n_groups, 720), dtype=np.float64)
-    counts_per_bin = np.zeros((n_groups, 720), dtype=np.int32)
+    avg_amplitudes: np.ndarray = np.zeros((n_groups, 720), dtype=np.float64)
+    counts_per_bin: np.ndarray = np.zeros((n_groups, 720), dtype=np.int32)
 
     # Process each group using xarray groupby
     for group_label, group_data in l1a_star.groupby("group"):

@@ -5,14 +5,19 @@ import pytest
 import xarray as xr
 
 from imap_processing.glows.l1b.glows_l1b import glows_l1b
-from imap_processing.glows.l1b.glows_l1b_data import HistogramL1B
-from imap_processing.glows.l2.glows_l2 import (
-    generate_l2,
-    glows_l2,
-    return_good_times,
+from imap_processing.glows.l1b.glows_l1b_data import (
+    HistogramL1B,
+    PipelineSettings,
 )
-from imap_processing.glows.l2.glows_l2_data import DailyLightcurve
-from imap_processing.tests.glows.conftest import mock_update_spice_parameters
+from imap_processing.glows.l2.glows_l2 import (
+    glows_l2,
+)
+from imap_processing.glows.l2.glows_l2_data import DailyLightcurve, HistogramL2
+from imap_processing.glows.utils.constants import GlowsConstants
+from imap_processing.spice.time import et_to_datetime64, ttj2000ns_to_et
+from imap_processing.tests.glows.conftest import (
+    mock_update_spice_parameters,
+)
 
 
 @pytest.fixture
@@ -22,10 +27,10 @@ def l1b_hists():
     hist = xr.DataArray(
         np.ones((4, 5)), dims=["epoch", "bins"], coords={"epoch": epoch, "bins": bins}
     )
-    hist[1, 0] = -1
-    hist[2, 0] = -1
-    hist[1, 1] = -1
-    hist[2, 3] = -1
+    hist[1, 0] = GlowsConstants.HISTOGRAM_FILLVAL
+    hist[2, 0] = GlowsConstants.HISTOGRAM_FILLVAL
+    hist[1, 1] = GlowsConstants.HISTOGRAM_FILLVAL
+    hist[2, 3] = GlowsConstants.HISTOGRAM_FILLVAL
 
     input = xr.Dataset(coords={"epoch": epoch, "bins": bins})
     input["histogram"] = hist
@@ -33,13 +38,23 @@ def l1b_hists():
     return input
 
 
+@patch.object(HistogramL2, "compute_position_angle", return_value=42.0)
+@patch.object(
+    HistogramL1B,
+    "flag_uv_and_excluded",
+    return_value=(np.zeros(3600, dtype=bool), np.zeros(3600, dtype=bool)),
+)
 @patch.object(HistogramL1B, "update_spice_parameters", autospec=True)
 def test_glows_l2(
     mock_spice_function,
+    mock_flag_uv_and_excluded,
+    mock_compute_position_angle,
     l1a_dataset,
     mock_ancillary_exclusions,
     mock_pipeline_settings,
     mock_conversion_table_dict,
+    mock_ecliptic_bin_centers,
+    caplog,
 ):
     mock_spice_function.side_effect = mock_update_spice_parameters
 
@@ -52,33 +67,48 @@ def test_glows_l2(
         mock_pipeline_settings,
         mock_conversion_table_dict,
     )
-    l2 = glows_l2(l1b_hist_dataset)[0]
-    assert l2.attrs["Logical_source"] == "imap_glows_l2_hist"
 
+    # Test case 1: L1B dataset has good times
+    l2 = glows_l2(l1b_hist_dataset, mock_pipeline_settings, None)[0]
+    assert l2.attrs["Logical_source"] == "imap_glows_l2_hist"
     assert np.allclose(l2["filter_temperature_average"].values, [57.6], rtol=0.1)
 
+    # Test case 2: L1B dataset has no good times (all flags 0)
+    l1b_hist_dataset_no_good_times = l1b_hist_dataset.copy(deep=True)
+    l1b_hist_dataset_no_good_times["flags"].values = np.zeros(
+        l1b_hist_dataset_no_good_times.flags.shape
+    )
+    caplog.set_level("WARNING")
+    result = glows_l2(l1b_hist_dataset_no_good_times, mock_pipeline_settings, None)
+    assert result == []
+    assert any(record.levelname == "WARNING" for record in caplog.records)
 
-def test_filter_good_times():
-    active_flags = np.ones((17,))
-    active_flags[16] = 0
-    test_flags = np.ones((4, 17))
-    test_flags[1, 0] = 0
-    test_flags[3, 16] = 0
-    flags = xr.DataArray(test_flags, dims=["epoch", "flags"])
-
-    good_times = return_good_times(flags, active_flags)
-    expected_good_times = [0, 2, 3]
-
-    assert np.array_equal(good_times, expected_good_times)
+    # Test case 3: Dataset has zero exposure and flux values
+    l1b_hist_dataset_zero_values = l1b_hist_dataset.copy(deep=True)
+    l1b_hist_dataset_zero_values["spin_period_average"].data[:] = 0
+    l1b_hist_dataset_zero_values["number_of_spins_per_block"].data[:] = 0
+    caplog.set_level("WARNING")
+    result = glows_l2(l1b_hist_dataset_zero_values, mock_pipeline_settings, None)
+    assert result == []
+    assert any(record.levelname == "WARNING" for record in caplog.records)
 
 
+@patch.object(HistogramL2, "compute_position_angle", return_value=42.0)
+@patch.object(
+    HistogramL1B,
+    "flag_uv_and_excluded",
+    return_value=(np.zeros(3600, dtype=bool), np.zeros(3600, dtype=bool)),
+)
 @patch.object(HistogramL1B, "update_spice_parameters", autospec=True)
 def test_generate_l2(
     mock_spice_function,
+    mock_flag_uv_and_excluded,
+    mock_compute_position_angle,
     l1a_dataset,
     mock_ancillary_exclusions,
     mock_pipeline_settings,
     mock_conversion_table_dict,
+    mock_ecliptic_bin_centers,
 ):
     mock_spice_function.side_effect = mock_update_spice_parameters
 
@@ -91,7 +121,13 @@ def test_generate_l2(
         mock_pipeline_settings,
         mock_conversion_table_dict,
     )
-    l2 = generate_l2(l1b_hist_dataset)
+    day = et_to_datetime64(ttj2000ns_to_et(l1b_hist_dataset["epoch"].data[0]))
+    pipeline_settings = PipelineSettings(
+        mock_pipeline_settings.sel(epoch=day, method="nearest")
+    )
+
+    # Test case 1: L1B dataset has good times
+    l2 = HistogramL2(l1b_hist_dataset, pipeline_settings)
 
     expected_values = {
         "filter_temperature_average": [57.59],
@@ -117,14 +153,11 @@ def test_generate_l2(
         l2.hv_voltage_std_dev, expected_values["hv_voltage_std_dev"], 0.01
     )
 
-
-def test_exposure_times(l1b_hists):
-    exposure_time = xr.DataArray([10, 10, 20, 10])
-    expected_times = np.array([20, 40, 50, 30, 50])
-
-    times = DailyLightcurve.calculate_exposure_times(l1b_hists, exposure_time)
-
-    assert np.array_equal(times, expected_times)
+    # Test case 2: L1B dataset has no good times (all flags 0)
+    l1b_hist_dataset["flags"].values = np.zeros(l1b_hist_dataset.flags.shape)
+    ds = HistogramL2(l1b_hist_dataset, pipeline_settings)
+    expected_number_of_good_l1b_inputs = 0
+    assert ds.number_of_good_l1b_inputs == expected_number_of_good_l1b_inputs
 
 
 def test_bin_exclusions(l1b_hists):

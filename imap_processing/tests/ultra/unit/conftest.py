@@ -8,6 +8,7 @@ import pytest
 import xarray as xr
 
 from imap_processing import imap_module_directory
+from imap_processing.ultra.constants import UltraConstants
 from imap_processing.ultra.l0.decom_ultra import (
     process_ultra_cmd_echo,
     process_ultra_energy_rates,
@@ -27,6 +28,7 @@ from imap_processing.ultra.l0.ultra_utils import (
     ULTRA_EXTOF_HIGH_ANGULAR,
     ULTRA_EXTOF_HIGH_ENERGY,
     ULTRA_EXTOF_HIGH_TIME,
+    ULTRA_HK,
     ULTRA_MACROS_CHECKSUM,
     ULTRA_PHXTOF_HIGH_ANGULAR,
     ULTRA_PHXTOF_HIGH_ENERGY,
@@ -38,6 +40,11 @@ from imap_processing.ultra.l0.ultra_utils import (
     ULTRA_RATES,
 )
 from imap_processing.ultra.l1a.ultra_l1a import ultra_l1a
+from imap_processing.ultra.l1b.ultra_l1b_culling import (
+    get_binned_energy_ranges,
+    get_energy_range_flags,
+)
+from imap_processing.ultra.l1c.l1c_lookup_utils import build_energy_bins
 from imap_processing.utils import packet_file_to_datasets
 
 
@@ -439,6 +446,13 @@ def aux_dataset(ccsds_path_theta_0):
 
 
 @pytest.fixture
+def status_dataset(ccsds_path_theta_0):
+    """L1A test data"""
+    test_data = ultra_l1a(ccsds_path_theta_0, apid_input=ULTRA_HK.apid[3])
+    return test_data[0]
+
+
+@pytest.fixture
 def faux_aux_dataset():
     """Fixture to compute and return aux test data."""
 
@@ -474,6 +488,8 @@ def ancillary_files():
     path = imap_module_directory / "tests" / "ultra" / "data" / "l1"
     return {
         "l1b-45sensor-logistic-interpolation": path
+        / "imap_ultra_l1b-45sensor-logistic-interpolation_20250101_v000.csv",
+        "l1b-90sensor-logistic-interpolation": path
         / "imap_ultra_l1b-45sensor-logistic-interpolation_20250101_v000.csv",
         "l1b-sensor-gf-noblades": path
         / "imap_ultra_l1b-sensor-gf-noblades_20250101_v000.csv",
@@ -631,3 +647,41 @@ def mock_helio_pointing_lookups():
         mock_lookup.return_value = ds
 
         yield mock_lookup
+
+
+@pytest.fixture
+def mock_goodtimes_dataset():
+    """Create a mock goodtimes dataset."""
+    # Set up bit flags
+    intervals, _, _ = build_energy_bins()
+    energy_ranges = get_binned_energy_ranges(intervals)
+    energy_flags = get_energy_range_flags(energy_ranges)
+
+    energy_flags_padded = np.zeros(UltraConstants.MAX_ENERGY_RANGES, dtype=np.uint16)
+    energy_flags_padded[: len(energy_flags)] = energy_flags
+
+    energy_ranges_padded = np.full(
+        UltraConstants.MAX_ENERGY_RANGE_EDGES, -1.0e31, dtype=np.float32
+    )
+    energy_ranges_padded[: len(energy_ranges)] = energy_ranges
+
+    nspins = 100
+    flags = 2 ** np.arange(9)
+    quality = np.zeros(nspins, dtype=np.uint16)
+    quality[0] = flags[0]  # Set the first flag for the first spin
+    quality[1] = flags[1]  # Set the second flag for the second
+    quality[2] = flags[2]  # Set the third flag for the third spin
+    return xr.Dataset(
+        {
+            "spin_number": ("epoch", np.zeros(nspins)),
+            "energy_range_flags": ("energy_flags", energy_flags_padded),
+            "quality_low_voltage": ("spin_number", quality),
+            "quality_high_energy": ("spin_number", np.zeros(nspins, dtype=np.uint16)),
+            "quality_statistics": ("spin_number", np.zeros(nspins, dtype=np.uint16)),
+            "energy_range_edges": ("energy_ranges", energy_ranges_padded),
+            "spin_period": (
+                "spin_number",
+                np.full(nspins, 15),
+            ),  # nominal spin period of 15 seconds
+        }
+    )

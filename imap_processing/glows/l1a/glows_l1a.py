@@ -163,7 +163,7 @@ def generate_de_dataset(
     # TODO: Block header per second, or global attribute?
 
     # Store timestamps for each DirectEventL1a object.
-    time_data = np.zeros(len(de_l1a_list), dtype=np.int64)
+    time_data: np.ndarray = np.zeros(len(de_l1a_list), dtype=np.int64)
 
     # Each DirectEventL1A class covers 1 second of direct events data
     direct_events = np.zeros((len(de_l1a_list), len(de_l1a_list[0].direct_events), 4))
@@ -171,7 +171,6 @@ def generate_de_dataset(
 
     # First variable is the output data type, second is the list of values
     support_data: dict = {
-        # "flight_software_version": [],
         "seq_count_in_pkts_file": [np.uint16, []],
         "number_of_de_packets": [np.uint32, []],
     }
@@ -325,11 +324,16 @@ def generate_histogram_dataset(
     output : xarray.Dataset
         Dataset containing the GLOWS L1A histogram CDF output.
     """
+    # Filter out empty histogram objects (those with no bins).
+    hist_l1a_list = [
+        hist for hist in hist_l1a_list if hist.number_of_bins_per_histogram > 0
+    ]
+
     # Store timestamps for each HistogramL1A object.
-    time_data = np.zeros(len(hist_l1a_list), dtype=np.int64)
+    time_data: np.ndarray = np.zeros(len(hist_l1a_list), dtype=np.int64)
     # Data in lists, for each of the 25 time varying datapoints in HistogramL1A
 
-    hist_data = np.full(
+    hist_data: np.ndarray = np.full(
         (len(hist_l1a_list), GlowsConstants.STANDARD_BIN_COUNT),
         GlowsConstants.HISTOGRAM_FILLVAL,
         dtype=np.uint16,
@@ -337,7 +341,6 @@ def generate_histogram_dataset(
 
     # First variable is the output data type, second is the list of values
     support_data: dict = {
-        "flight_software_version": [np.uint32, []],
         "seq_count_in_pkts_file": [np.uint16, []],
         "first_spin_id": [np.uint32, []],
         "last_spin_id": [np.uint32, []],
@@ -427,6 +430,11 @@ def generate_histogram_dataset(
     )
 
     output["histogram"] = hist
+
+    # These attributes are the same for each record, so we don't
+    # need to store them per epoch like most of the other fields
+    # Instead, we store them as global attributes
+    output.attrs["flight_software_version"] = hist_l1a_list[0].flight_software_version
 
     for key, value in support_data.items():
         output[key] = xr.DataArray(

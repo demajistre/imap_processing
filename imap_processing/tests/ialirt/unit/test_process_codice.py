@@ -27,7 +27,6 @@ from imap_processing.codice.codice_l2 import (
 )
 from imap_processing.codice.decompress import decompress
 from imap_processing.ialirt.l0.process_codice import (
-    COD_HI_COUNTER,
     COD_LO_COUNTER,
     concatenate_bytes,
     convert_to_intensities,
@@ -43,6 +42,27 @@ from imap_processing.tests.codice.conftest import (
 from imap_processing.utils import packet_file_to_datasets
 
 pytestmark = pytest.mark.external_test_data
+
+OLD_IAL_BIT_STRUCTURE = {
+    "SHCOARSE": 32,
+    "PACKET_VERSION": 16,
+    "SPIN_PERIOD": 16,
+    "ACQ_START_SECONDS": 32,
+    "ACQ_START_SUBSECONDS": 20,
+    "SPARE_00": 8,
+    "ST_BIAS_GAIN_MODE": 2,
+    "SW_BIAS_GAIN_MODE": 2,
+    "TABLE_ID": 32,
+    "PLAN_ID": 16,
+    "PLAN_STEP": 4,
+    "VIEW_ID": 4,
+    "RGFO_HALF_SPIN": 6,
+    "NSO_HALF_SPIN": 6,
+    "SPARE_01": 1,
+    "SUSPECT": 1,
+    "COMPRESSION": 3,
+    "BYTE_COUNT": 23,
+}
 
 
 @pytest.fixture(scope="session")
@@ -352,7 +372,7 @@ def l1a_lut_path():
         / "codice"
         / "data"
         / "l1a_lut"
-        / "imap_codice_l1a-sci-lut_20251007_v004.json"
+        / "imap_codice_l1a-sci-lut_20251007_v005.json"
     )
 
     return lut_path
@@ -381,7 +401,7 @@ def l2_processing_dependencies():
         / "codice"
         / "data"
         / "l2_lut"
-        / "imap_codice_l2-lo-efficiency_20251008_v001.csv"
+        / "imap_codice_l2-lo-efficiency_20251212_v003.csv"
     )
     gf_path = (
         imap_module_directory
@@ -389,7 +409,7 @@ def l2_processing_dependencies():
         / "codice"
         / "data"
         / "l2_lut"
-        / "imap_codice_l2-lo-gfactor_20251008_v001.csv"
+        / "imap_codice_l2-lo-gfactor_20251212_v003.csv"
     )
 
     return eff_path, gf_path
@@ -421,6 +441,10 @@ def test_create_xarray_dataset_basic(l1a_lut_path):
 
 
 @pytest.mark.external_test_data
+@patch(
+    "imap_processing.codice.constants.IAL_BIT_STRUCTURE",
+    OLD_IAL_BIT_STRUCTURE,
+)
 def test_group_and_decompress_ialirt_cod_lo(
     cod_lo_test_dataset, cod_lo_decom_test_file, l1a_lut_path, cod_lo_l1a_test_data
 ):
@@ -507,25 +531,30 @@ def test_group_and_decompress_ialirt_cod_lo(
 
 
 @pytest.mark.external_test_data
+@patch(
+    "imap_processing.codice.constants.IAL_BIT_STRUCTURE",
+    OLD_IAL_BIT_STRUCTURE,
+)
 def test_group_and_decompress_ialirt_cod_hi(
     cod_hi_test_dataset, cod_hi_decom_test_file, l1a_lut_path, cod_hi_l1a_test_data
 ):
     "Test that I-ALiRT CoDICE-Hi data can be grouped and decompressed properly."
 
+    codice_hi_counter = 197
     grouped_cod_hi_data = find_groups(
-        cod_hi_test_dataset, (0, COD_HI_COUNTER), "cod_hi_counter", "cod_hi_acq"
+        cod_hi_test_dataset, (0, codice_hi_counter), "cod_hi_counter", "cod_hi_acq"
     )
 
     # Verify that we grouped the values properly.
     counter_values = cod_hi_test_dataset["cod_hi_counter"].data
     valid_values = counter_values[counter_values != 255]
-    resets = np.where(valid_values == COD_HI_COUNTER)
+    resets = np.where(valid_values == codice_hi_counter)
 
     count = increment = 0
     for reset in resets[0]:
         group = valid_values[increment : reset + 1]
         np.testing.assert_array_equal(
-            group, np.arange(0, COD_HI_COUNTER + 1, dtype=np.uint8)
+            group, np.arange(0, codice_hi_counter + 1, dtype=np.uint8)
         )
         increment = reset + 1
         count = count + 1
@@ -621,23 +650,18 @@ def test_l2_ialirt_cod_lo(
     efficiency_lookup = get_efficiency_lut(None, eff_path)
     efficiencies = efficiency_lookup[efficiency_lookup["product"] == "sw"]
 
-    # Fix to the test data coordinate name.
-    cod_lo_l1b_test_data["energy_table"] = cod_lo_l1b_test_data["energy_table"].rename(
-        {"energy_table": "esa_step"}
+    # Temporarily store energy_per_charge values from energy_table variable.
+    energy_per_charge_values = cod_lo_l1b_test_data["energy_table"].values
+
+    # L1B validation data is missing esa_step coordinate. Create esa_step coordinate.
+    # Also, all variables in l1b validation data is using energy_table as coordinate.
+    # Update both to match the processing code expectations with rename().
+    cod_lo_l1b_test_data = cod_lo_l1b_test_data.rename({"energy_table": "esa_step"})
+    # Now, create variable in data_vars with name energy_per_charge and values from
+    # energy_table variable.
+    cod_lo_l1b_test_data["energy_per_charge"] = xr.DataArray(
+        energy_per_charge_values, dims=["esa_step"]
     )
-    for species in constants.LO_IALIRT_VARIABLE_NAMES:
-        if "energy_table" in cod_lo_l1b_test_data[species].dims:
-            cod_lo_l1b_test_data[species] = cod_lo_l1b_test_data[species].rename(
-                {"energy_table": "esa_step"}
-            )
-        unc_var = f"unc_{species}"
-        if (
-            unc_var in cod_lo_l1b_test_data
-            and "energy_table" in cod_lo_l1b_test_data[unc_var].dims
-        ):
-            cod_lo_l1b_test_data[unc_var] = cod_lo_l1b_test_data[unc_var].rename(
-                {"energy_table": "esa_step"}
-            )
 
     intensity = process_lo_species_intensity(
         cod_lo_l1b_test_data,
@@ -652,7 +676,7 @@ def test_l2_ialirt_cod_lo(
     for species in constants.LO_IALIRT_VARIABLE_NAMES:
         pseudo_density = (
             intensity[species]
-            * np.sqrt(cod_lo_l1b_test_data["energy_table"])
+            * np.sqrt(cod_lo_l1b_test_data["energy_per_charge"])
             * np.sqrt(constants.LO_IALIRT_M_OVER_Q[species])
         )  # (epoch, esa_step, spin_sector)
 
@@ -735,6 +759,10 @@ def test_l2_ialirt_cod_lo(
 
 
 @pytest.mark.external_test_data
+@patch(
+    "imap_processing.codice.constants.IAL_BIT_STRUCTURE",
+    OLD_IAL_BIT_STRUCTURE,
+)
 def test_process_codice_lo(
     cod_lo_test_dataset,
     l1a_lut_path,
@@ -776,6 +804,11 @@ def test_process_codice_lo(
 
 
 @pytest.mark.external_test_data
+@patch("imap_processing.ialirt.l0.process_codice.COD_HI_COUNTER", 197)
+@patch(
+    "imap_processing.codice.constants.IAL_BIT_STRUCTURE",
+    OLD_IAL_BIT_STRUCTURE,
+)
 def test_process_codice_hi(
     cod_hi_test_dataset, l1a_lut_path, l2_lut_path, cod_hi_l2_test_data
 ):

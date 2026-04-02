@@ -1,5 +1,6 @@
 "Tests pointing sets"
 
+import logging
 from unittest import mock
 
 import astropy_healpix.healpy as hp
@@ -10,6 +11,7 @@ import xarray as xr
 from scipy import interpolate
 
 from imap_processing import imap_module_directory
+from imap_processing.ultra.constants import UltraConstants
 from imap_processing.ultra.l1c import ultra_l1c_pset_bins
 from imap_processing.ultra.l1c.spacecraft_pset import (
     calculate_fwhm_spun_scattering,
@@ -116,13 +118,9 @@ def test_get_spacecraft_histogram(test_data):
     energy_bin_edges, _, _ = build_energy_bins()
     subset_energy_bin_edges = energy_bin_edges[:3]
 
-    hist, latitude, longitude, n_pix = get_spacecraft_histogram(
-        v, energy, subset_energy_bin_edges, nside=1
-    )
+    hist, n_pix = get_spacecraft_histogram(v, energy, subset_energy_bin_edges, nside=1)
     assert hist.shape == (len(subset_energy_bin_edges), hp.nside2npix(1))
     assert n_pix == hp.nside2npix(1)
-    assert latitude.shape == (n_pix,)
-    assert longitude.shape == (n_pix,)
 
     # Spot check that 2 counts are in the second energy bin
     assert np.sum(hist[2, :]) == 2
@@ -133,14 +131,10 @@ def test_get_spacecraft_histogram(test_data):
         (2.5, 4.137),
         (3.385, 5.057),
     ]
-    hist, latitude, longitude, n_pix = get_spacecraft_histogram(
-        v, energy, overlapping_bins, nside=1
-    )
+    hist, n_pix = get_spacecraft_histogram(v, energy, overlapping_bins, nside=1)
     # Spot check that 3 counts are in the third energy bin
     assert np.sum(hist[2, :]) == 3
     assert n_pix == hp.nside2npix(1)
-    assert latitude.shape == (n_pix,)
-    assert longitude.shape == (n_pix,)
 
 
 def mock_imap_state(time, ref_frame):
@@ -374,6 +368,7 @@ def test_get_eff_and_gf(imap_ena_sim_metakernel, ancillary_files, spun_index_dat
         mock_theta,
         mock_phi,
         npix=pix,
+        sensor_id=45,
         ancillary_files=ancillary_files,
         apply_bsf=False,
     )
@@ -395,12 +390,14 @@ def test_get_spacecraft_exposure_times(
     ancillary_files,
     use_fake_spin_data_for_time,
     aux_dataset,
+    mock_goodtimes_dataset,
+    caplog,
 ):
     """Test get_spacecraft_exposure_times function."""
     data_start_time = 445015665.0
     data_end_time = 453070000.0
     use_fake_spin_data_for_time(data_start_time, data_end_time)
-    steps = 500  # reduced for testing
+    steps = 200  # reduced for testing
 
     pix = 786
     mock_theta = np.random.uniform(-60, 60, (steps, pix))
@@ -417,20 +414,36 @@ def test_get_spacecraft_exposure_times(
         )
     )
     boundary_sf = xr.DataArray(np.ones((steps, pix)), dims=("spin_phase_step", "pixel"))
-    exposure_pointing, deadtimes = get_spacecraft_exposure_times(
+    caplog.set_level(logging.INFO)
+    (
+        exposure_pointing,
+        deadtimes,
+    ) = get_spacecraft_exposure_times(
         rates_dataset,
         pixels_below_threshold,
         boundary_sf,
         aux_dataset,
-        (
-            data_start_time,
-            data_start_time,
-        ),
-        46,  # number of energy bins
-        pix,
+        build_energy_bins()[2],
+        goodtimes_dataset=mock_goodtimes_dataset,
     )
     np.testing.assert_array_equal(exposure_pointing.shape, (46, pix))
     np.testing.assert_array_equal(deadtimes.shape, (steps,))
+
+    # Check that the number of good spins per energy bin is logged correctly
+    # The first 3 energy bins were not used in the goodtimes culling and therefore
+    # should have all 100 spins.
+    # Energy range 1,2,3 (which maps to the next UltraConstants.N_CULL_EBINS * 3 bins)
+    # should have 99 spins because there was a flag set to true for one spin
+    # in the mock_goodtimes_dataset. The rest of the energy bins should have 100 spins
+    # because the goodtimes dataset did not flag any spins for those energy bins.
+    expected_good_spins = np.full(46, 100.0)
+    expected_good_spins[
+        UltraConstants.BASE_CULL_EBIN : UltraConstants.N_CULL_EBINS * 3
+        + UltraConstants.BASE_CULL_EBIN
+    ] = 99.0
+    # The goodtimes dataset has flags set to True for energy bin 0-3 and for the
+    # first three spins.
+    assert f"Found {expected_good_spins.tolist()} valid spins" in caplog.text
 
 
 def test_get_spacecraft_background_rates(

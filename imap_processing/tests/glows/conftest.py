@@ -13,6 +13,7 @@ from imap_processing.glows.l1b.glows_l1b_data import (
     AncillaryParameters,
 )
 from imap_processing.glows.l2.glows_l2 import glows_l2
+from imap_processing.glows.l2.glows_l2_data import DailyLightcurve
 
 
 @pytest.fixture
@@ -65,8 +66,8 @@ def l1b_hist_dataset(
 
 
 @pytest.fixture
-def l2_hist_dataset(l1b_datasets):
-    return glows_l2(l1b_datasets)
+def l2_hist_dataset(l1b_hist_dataset, mock_pipeline_settings):
+    return glows_l2(l1b_hist_dataset, mock_pipeline_settings)
 
 
 @pytest.fixture
@@ -81,13 +82,21 @@ def mock_ancillary_exclusions():
     # Create datasets with epoch dimension and some mock data
     mock_excluded_regions = xr.Dataset(
         {
+            # degrees in [0, 360)
             "ecliptic_longitude_deg": (
-                ["epoch", "region"],
-                np.random.rand(len(epoch_range), 5),
+                ["epoch", "source"],
+                np.tile(
+                    np.array([202.0812, 120.0, 250.0], dtype=np.float64),
+                    (len(epoch_range), 1),
+                ),
             ),
+            # degrees in [-90, 90]
             "ecliptic_latitude_deg": (
-                ["epoch", "region"],
-                np.random.rand(len(epoch_range), 5),
+                ["epoch", "source"],
+                np.tile(
+                    np.array([18.4119, 0.0, 35.0], dtype=np.float64),
+                    (len(epoch_range), 1),
+                ),
             ),
         },
         coords={"epoch": epoch_range},
@@ -99,31 +108,43 @@ def mock_ancillary_exclusions():
                 ["epoch", "source"],
                 [["star1", "star2", "star3"]] * len(epoch_range),
             ),
+            # degrees in [0, 360)
             "ecliptic_longitude_deg": (
                 ["epoch", "source"],
-                np.random.rand(len(epoch_range), 3),
+                np.tile(
+                    np.array([202.0812, 120.0, 250.0], dtype=np.float64),
+                    (len(epoch_range), 1),
+                ),
             ),
+            # degrees in [-90, 90]
             "ecliptic_latitude_deg": (
                 ["epoch", "source"],
-                np.random.rand(len(epoch_range), 3),
+                np.tile(
+                    np.array([18.4119, 0.0, 35.0], dtype=np.float64),
+                    (len(epoch_range), 1),
+                ),
             ),
+            # masking radius in degrees
             "angular_radius_for_masking": (
                 ["epoch", "source"],
-                np.random.rand(len(epoch_range), 3),
+                np.tile(
+                    np.array([2.0, 0.0, 0.0], dtype=np.float64), (len(epoch_range), 1)
+                ),
             ),
         },
         coords={"epoch": epoch_range},
     )
 
+    # Mask array based on data in imap_glows_suspected-transients_20250923_v002.dat.
     mock_suspected_transients = xr.Dataset(
         {
             "l1b_unique_block_identifier": (
                 ["epoch", "time_block"],
-                [["block1", "block2"]] * len(epoch_range),
+                [["2026-01-01T15:00:00", "2026-01-01T15:01:00"]] * len(epoch_range),
             ),
             "histogram_mask_array": (
                 ["epoch", "time_block"],
-                [["mask1", "mask2"]] * len(epoch_range),
+                [["0" * 3600, "0" * 600 + "1" * 100 + "0" * 2900]] * len(epoch_range),
             ),
         },
         coords={"epoch": epoch_range},
@@ -133,11 +154,11 @@ def mock_ancillary_exclusions():
         {
             "l1b_unique_block_identifier": (
                 ["epoch", "time_block"],
-                [["block1", "block2"]] * len(epoch_range),
+                [["2026-01-01T15:00:00", "2026-01-01T15:01:00"]] * len(epoch_range),
             ),
             "histogram_mask_array": (
                 ["epoch", "time_block"],
-                [["mask1", "mask2"]] * len(epoch_range),
+                [["0" * 100 + "1" * 10 + "0" * 3490, "0" * 3600]] * len(epoch_range),
             ),
         },
         coords={"epoch": epoch_range},
@@ -256,6 +277,23 @@ def mock_pipeline_settings():
     )
 
     return mock_pipeline_dataset
+
+
+@pytest.fixture
+def mock_ecliptic_bin_centers(monkeypatch):
+    """Mock ecliptic coordinates for bin centers."""
+
+    def _mock_compute_coords(
+        _data_start_time_et: float, spin_angle: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n_bins = len(spin_angle)
+        return np.zeros(n_bins, dtype=float), np.zeros(n_bins, dtype=float)
+
+    monkeypatch.setattr(
+        DailyLightcurve,
+        "compute_ecliptic_coords_of_bin_centers",
+        staticmethod(_mock_compute_coords),
+    )
 
 
 def mock_update_spice_parameters(self, *args, **kwargs):

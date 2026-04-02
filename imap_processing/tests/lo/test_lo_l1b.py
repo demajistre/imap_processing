@@ -23,6 +23,7 @@ from imap_processing.lo.l1b.lo_l1b import (
     create_datasets,
     filter_valid_star_records,
     get_avg_spin_durations_per_cycle,
+    get_pivot_angle_from_nhk,
     get_sampling_cadence_from_nhk,
     get_spin_start_times,
     identify_species,
@@ -517,15 +518,15 @@ def test_get_spin_start_times(mock_interpolate_spin_data):
 
     l1a_de = xr.Dataset(
         {
-            "shcoarse": ("epoch", [15, 35]),
+            "met": ("epoch", [15, 35]),
             "de_count": ("epoch", [2, 3]),
             "de_time": ("direct_event", [0, 1000, 2000, 3000, 4000]),
         },
         coords={"epoch": [0, 1], "direct_event": [0, 1, 2, 3, 4]},
     )
 
-    # Expected: shcoarse 15 should match spin at index 0 (10 < 15 < 20)
-    # shcoarse 35 should match spin at index 2 (30 < 35 < 40)
+    # Expected: met 15 should match spin at index 0 (10 < 15 < 20)
+    # met 35 should match spin at index 2 (30 < 35 < 40)
     # Repeated by de_count: [2, 3] -> [index0, index0, index2, index2, index2]
     spin_start_times_expected = np.array(
         [10.5, 10.5, 30.1, 30.1, 30.1]  # 10 + 0.5e6*1e-6  # 30 + 0.1e6*1e-6
@@ -556,7 +557,7 @@ def test_set_event_met(mock_interpolate_spin_data):
     l1b_de = xr.Dataset()
     l1a_de = xr.Dataset(
         {
-            "shcoarse": ("epoch", [15, 35]),
+            "met": ("epoch", [15, 35]),
             "de_count": ("epoch", [2, 3]),
             "de_time": ("direct_event", [0, 1000, 2000, 3000, 4000]),
         },
@@ -566,7 +567,7 @@ def test_set_event_met(mock_interpolate_spin_data):
         },
     )
 
-    # shcoarse 15 -> spin_start 10, shcoarse 35 -> spin_start 30
+    # met 15 -> spin_start 10, met 35 -> spin_start 30
     # event_met = spin_start + de_time * DE_CLOCK_TICK_S
     expected_event_met = np.array(
         [
@@ -718,7 +719,7 @@ def test_convert_tofs_to_eu(attr_mgr_l1b, attr_mgr_l1a):
     tof0_expected = np.array([1.394394, 0.889272])
     tof1_expected = np.array([0.931059, tof_fill_l1b])
     tof2_expected = np.array([2.870557, 1.372876])
-    tof3_expected = np.array([3.88245, 1.818162])
+    tof3_expected = np.array([3.89606, 1.83878])
 
     # Act
     l1b_de = convert_tofs_to_eu(l1a_de, l1b_de, attr_mgr_l1a, attr_mgr_l1b)
@@ -2156,3 +2157,22 @@ class TestL1bStar:
         assert (
             l1b_star_ds.coords["epoch"].values[2] == met_to_ttj2000ns([128 * 15.0])[0]
         )
+
+
+def test_get_pivot_angle_from_nhk():
+    """Test get_pivot_angle_from_nhk function."""
+    # Arrange - Create a mock NHK dataset with pivot angle information
+    l1b_nhk = xr.Dataset(
+        {
+            # Previous 90 degrees at the beginning, then shifted to 75 degrees
+            "pcc_cumulative_cnt_pri": ("epoch", [90, 90, 75, 75, 75, 75, 75]),
+        },
+        coords={"epoch": [0, 1, 2, 3, 4, 5, 6]},
+    )
+    expected_pivot_angle = 75
+
+    # Act
+    pivot_angle = get_pivot_angle_from_nhk(l1b_nhk)
+
+    # Assert
+    assert pivot_angle == expected_pivot_angle

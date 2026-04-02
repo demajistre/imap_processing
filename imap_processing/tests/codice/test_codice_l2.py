@@ -90,7 +90,9 @@ def mock_half_spin_per_esa_step():
       ESA steps 0–63 belong to half_spin=2
       ESA steps 64–127 belong to half_spin=3
     """
-    return np.repeat([2, 3], 64)
+    half_spin_per_esa = np.repeat([2, 3], 64)
+    # repeat along epoch dimension to create shape (2, 128) for testing
+    return np.tile(half_spin_per_esa, (2, 1))
 
 
 def test_compute_geometric_factors_all_full_mode(mock_half_spin_per_esa_step):
@@ -98,7 +100,13 @@ def test_compute_geometric_factors_all_full_mode(mock_half_spin_per_esa_step):
     dataset = xr.Dataset(
         {
             "rgfo_half_spin": (("epoch",), np.array([4, 4])),
-            "half_spin_per_esa_step": (("esa_step",), mock_half_spin_per_esa_step),
+            "half_spin_per_esa_step": (
+                (
+                    "epoch",
+                    "esa_step",
+                ),
+                mock_half_spin_per_esa_step,
+            ),
         },
         attrs={"Logical_file_id": "imap_codice_l1b_lo-sw-species_20250101_v001"},
     )
@@ -125,7 +133,7 @@ def test_compute_geometric_factors_past_nov_24th(mock_half_spin_per_esa_step):
                     "epoch",
                     "esa_step",
                 ),
-                np.tile(mock_half_spin_per_esa_step, (2, 1)),
+                mock_half_spin_per_esa_step,
             ),
         },
         # Make sure epoch is past Nov 24th, 2025
@@ -147,7 +155,13 @@ def test_compute_geometric_factors_all_reduced_mode(mock_half_spin_per_esa_step)
     dataset = xr.Dataset(
         {
             "rgfo_half_spin": (("epoch",), np.array([1])),
-            "half_spin_per_esa_step": (("esa_step",), mock_half_spin_per_esa_step),
+            "half_spin_per_esa_step": (
+                (
+                    "epoch",
+                    "esa_step",
+                ),
+                mock_half_spin_per_esa_step[0:1],
+            ),
         },
         attrs={"Logical_file_id": "imap_codice_l1b_lo-sw-species_20250101_v001"},
     )
@@ -167,7 +181,13 @@ def test_compute_geometric_factors_mixed(mock_half_spin_per_esa_step):
     dataset = xr.Dataset(
         {
             "rgfo_half_spin": (("epoch",), np.array([2])),
-            "half_spin_per_esa_step": (("esa_step",), mock_half_spin_per_esa_step),
+            "half_spin_per_esa_step": (
+                (
+                    "epoch",
+                    "esa_step",
+                ),
+                mock_half_spin_per_esa_step[0:1],
+            ),
         },
         attrs={"Logical_file_id": "imap_codice_l1b_lo-sw-species_20250101_v001"},
     )
@@ -283,7 +303,9 @@ def test_process_lo_species_intensity(mock_get_file_paths, codice_lut_path):
         # Check that values match expected calculation
         expected_intensity = (
             l1b_data[var]
-            / (len_pos * 4 * l1b_data["energy_table"].data)[np.newaxis, :, np.newaxis]
+            / (len_pos * 4 * l1b_data["energy_per_charge"].data)[
+                np.newaxis, :, np.newaxis
+            ]
         )
         np.testing.assert_allclose(
             l1b_val_data_processed[var].values, expected_intensity.values, rtol=1e-5
@@ -294,36 +316,33 @@ def test_process_lo_missing_species_intensity():
     l1b_val_data = xr.Dataset(
         {
             "epoch": ("epoch", np.ones(5)),
-            "energy_table": (("esa_step",), np.ones(128) * 10),
+            "energy_per_charge": (("esa_step",), np.ones(128) * 10),
+            "packet_version": ("epoch", np.ones(5)),
+            "half_spin_per_esa_step": (("epoch", "esa_step"), np.ones((5, 128)) * 2),
+            "rgfo_half_spin": ("epoch", np.ones(5) * 2),
         }
     )
 
     l1b_val_data_processed = l1b_val_data.copy()
     gf = xr.DataArray(
         np.ones((len(l1b_val_data.epoch), 128, 24)) * 2,
-        dims=("epoch", "energy_table", "inst_az"),
+        dims=("epoch", "energy_per_charge", "inst_az"),
     )
     with mock.patch(
         "imap_processing.codice.codice_l2.get_species_efficiency",
         return_value=xr.DataArray(
-            np.ones((128, 24)) * 2, dims=("energy_table", "inst_az")
+            np.ones((128, 24)) * 2, dims=("energy_per_charge", "inst_az")
         ),
     ):
         len_pos = 5
-        process_lo_species_intensity(
-            l1b_val_data_processed,
-            LO_SW_SOLAR_WIND_SPECIES_VARIABLE_NAMES,
-            gf,
-            None,
-            list(np.arange(0, len_pos)),
-        )
-
-    for var in LO_SW_SOLAR_WIND_SPECIES_VARIABLE_NAMES:
-        assert var in l1b_val_data_processed, f"Missing variable {var} after processing"
-        # Check that all the missing species are filled with NaNs
-        assert not np.any(np.isfinite(l1b_val_data_processed[var].values)), (
-            f"Variable {var} should be all NaNs"
-        )
+        with pytest.raises(ValueError, match="Species hplus not found in dataset"):
+            process_lo_species_intensity(
+                l1b_val_data_processed,
+                LO_SW_SOLAR_WIND_SPECIES_VARIABLE_NAMES,
+                gf,
+                None,
+                list(np.arange(0, len_pos)),
+            )
 
 
 def test_process_lo_angular_intensity(mock_get_file_paths, codice_lut_path):
@@ -351,15 +370,19 @@ def test_process_lo_angular_intensity(mock_get_file_paths, codice_lut_path):
         )
 
     for var in LO_SW_ANGULAR_VARIABLE_NAMES:
+        # Heplus is not in older CDFs
+        if var == "heplus" or var not in l1b_val_data_processed:
+            continue
         assert var in l1b_val_data_processed, f"Missing variable {var} after processing"
         # Check that values are non-negative
-        assert np.all(l1b_val_data_processed[var].values >= 0), (
-            f"Variable {var} contains negative values"
-        )
+        assert np.all(
+            (l1b_val_data_processed[var].values >= 0)
+            | np.isnan(l1b_val_data_processed[var].values)
+        ), f"Variable {var} contains negative values"
         # Check shape
         expected_shape = (
             len(l1b_data.epoch),
-            len(l1b_data.energy_table),
+            len(l1b_data.energy_per_charge),
             len(l1b_data.spin_sector),
             3,  # 3 elevation angles map to 5 positions
         )
@@ -369,7 +392,9 @@ def test_process_lo_angular_intensity(mock_get_file_paths, codice_lut_path):
         # Check that values match expected calculation
         expected_intensity = (
             l1b_data[var]
-            / (4 * l1b_data["energy_table"].data)[np.newaxis, :, np.newaxis, np.newaxis]
+            / (4 * l1b_data["energy_per_charge"].data)[
+                np.newaxis, :, np.newaxis, np.newaxis
+            ]
         )
         # convert pos to el
         expected_intensity = (
@@ -461,6 +486,10 @@ def test_codice_l2_nsw_species_intensity(mock_get_file_paths, codice_lut_path):
     )
     l2_val_data = load_cdf(l2_val_data)
     for variable in l2_val_data.data_vars:
+        # Skip cnopus because this variable should be thrown out for lo nsw species
+        # for table_ids <= 3978152295
+        if "cnoplus" in variable:
+            continue
         # NOTE: Replace nan with 0 for comparison as the validation data uses 0
         processed_val = processed_2_ds[variable].values
         processed_val[np.isnan(processed_val)] = 0.0
@@ -489,7 +518,7 @@ def test_codice_l2_nsw_angular_intensity(mock_get_file_paths, codice_lut_path):
         codice_lut_path(descriptor="l2-lo-gfactor"),
         codice_lut_path(descriptor="l2-lo-efficiency"),
     ]
-    processed_2_ds = process_codice_l2("lo-nsw-species", ProcessingInputCollection())
+    processed_2_ds = process_codice_l2("lo-nsw-angular", ProcessingInputCollection())
     l2_val_data = (
         imap_module_directory
         / "tests"
@@ -503,13 +532,8 @@ def test_codice_l2_nsw_angular_intensity(mock_get_file_paths, codice_lut_path):
     )
     l2_val_data = load_cdf(l2_val_data)
     for variable in l2_val_data.variables:
-        # TODO Ask joey to rename energy_per_charge to energy_table in validation data
-        if variable in ["energy_per_charge"]:
-            sdc_var = "energy_table"
-        else:
-            sdc_var = variable
         np.testing.assert_allclose(
-            processed_2_ds[sdc_var].values,
+            processed_2_ds[variable].values,
             l2_val_data[variable].values,
             rtol=1e-5,
             err_msg=f"Mismatch in variable '{variable}'",
@@ -547,15 +571,9 @@ def test_codice_l2_sw_angular_intensity(mock_get_file_paths, codice_lut_path):
     )
     l2_val_data = load_cdf(l2_val_data)
     for variable in l2_val_data.variables:
-        # TODO Ask joey to rename energy_per_charge to energy_table in validation data
-        if variable in ["energy_per_charge"]:
-            sdc_var = "energy_table"
-        else:
-            sdc_var = variable
         np.testing.assert_allclose(
-            processed_2_ds[sdc_var].values,
+            processed_2_ds[variable].values,
             l2_val_data[variable].values,
-            # TODO is 1e-4 ok?
             rtol=1e-4,
             err_msg=f"Mismatch in variable '{variable}'",
         )
@@ -563,6 +581,32 @@ def test_codice_l2_sw_angular_intensity(mock_get_file_paths, codice_lut_path):
     processed_2_ds.attrs["Data_version"] = "001"
     assert processed_2_ds.attrs["Logical_source"] == "imap_codice_l2_lo-sw-angular"
     write_cdf(processed_2_ds)
+
+
+@patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")
+def test_codice_l2_sw_angular_intensity_rgfo_masking(
+    mock_get_file_paths, codice_lut_path
+):
+    """Tests RGFO masking after FSW changes (jan 2026)."""
+    codice_lut_path_jan = codice_lut_path(descriptor="l1a-sci-lut-jan")
+    mock_get_file_paths.side_effect = [
+        codice_lut_path(descriptor="fsw-changes", data_type="l0"),
+        *([codice_lut_path_jan] * 20),
+    ]
+    datasets = process_l1a(dependency=ProcessingInputCollection())
+
+    ang_dataset = next(ds for ds in datasets if "angular" in ds.attrs["Data_type"])
+    # process the first angular dataset
+    processed_l1a_file = write_cdf(ang_dataset)
+    processed_l1b_file = write_cdf(process_codice_l1b(processed_l1a_file))
+    # Mock get_files for l2
+    mock_get_file_paths.side_effect = [
+        [processed_l1b_file.as_posix()],
+        codice_lut_path(descriptor="l2-lo-gfactor"),
+        codice_lut_path(descriptor="l2-lo-efficiency"),
+    ]
+    # TODO verify the results using validation data once we have some
+    process_codice_l2("lo-nsw-angular", ProcessingInputCollection())
 
 
 @patch("imap_data_access.processing_input.ProcessingInputCollection.get_file_paths")

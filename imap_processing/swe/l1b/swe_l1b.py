@@ -166,18 +166,23 @@ def read_in_flight_cal_data(in_flight_cal_files: list) -> pd.DataFrame:
         "cem6",
         "cem7",
     ]
-    in_flight_cal_df = pd.concat(
-        [
-            pd.read_csv(file_path, header=0, names=column_names)
-            for file_path in in_flight_cal_files
-        ]
+    in_flight_cal_df = (
+        pd.concat(
+            [
+                pd.read_csv(file_path, header=0, names=column_names)
+                for file_path in in_flight_cal_files
+            ],
+            ignore_index=True,
+        )
+        # Remove rows without MET
+        .dropna(subset=["met_time"])
+        # Sort once so "keep=last" is meaningful
+        .sort_values("met_time")
+        # Drop duplicate METs, keeping most recent entry
+        .drop_duplicates(subset=["met_time"], keep="last")
+        # Clean index
+        .reset_index(drop=True)
     )
-    # Drop duplicates and keep only last occurrence
-    in_flight_cal_df = in_flight_cal_df.drop_duplicates(
-        subset=["met_time"], keep="last"
-    )
-    # Sort by 'met_time' column
-    in_flight_cal_df = in_flight_cal_df.sort_values(by="met_time")
     return in_flight_cal_df
 
 
@@ -380,7 +385,9 @@ def get_esa_energy_pattern(esa_lut_file: Path, esa_table_num: int = 0) -> npt.ND
 
     # Now define variable to store pattern for the first two columns
     # because that pattern is repeated in the rest of the columns.
-    first_two_columns = np.zeros((swe_constants.N_ESA_STEPS, 2), dtype=np.float64)
+    first_two_columns: np.ndarray = np.zeros(
+        (swe_constants.N_ESA_STEPS, 2), dtype=np.float64
+    )
     # Get row indices of all four quarter cycles. Then minus 1 to get
     # the row indices in 0-23 instead of 1-24.
     cycle_row_indices = esa_table_df["v_index"].values - 1
@@ -438,7 +445,7 @@ def get_checker_board_pattern(
 
     # Now define variable to store pattern for the first two columns
     # because that pattern is repeated in the rest of the columns.
-    first_two_columns = np.zeros((24, 2), dtype=np.int64)
+    first_two_columns: np.ndarray = np.zeros((24, 2), dtype=np.int64)
     # Get row indices of all four quarter cycles. Then minus 1 to get
     # the row indices in 0-23 instead of 1-24.
     cycle_row_indices = esa_table_df["v_index"].values - 1
@@ -470,7 +477,7 @@ def get_checker_board_pattern(
 
     # Generate increment offsets: [0, 0, 12, 12, ..., 168, 168] -
     # shape: (30,)
-    column_offsets = np.repeat(np.arange(15) * 12, 2)
+    column_offsets: np.ndarray = np.repeat(np.arange(15) * 12, 2)
     increment_by = np.tile(column_offsets, (24, 1))
 
     # Final checkerboard pattern with index offsets applied

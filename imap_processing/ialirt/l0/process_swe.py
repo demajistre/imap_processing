@@ -104,7 +104,7 @@ def prepare_raw_counts(grouped: xr.Dataset, cem_number: int = N_CEMS) -> NDArray
         - 7 corresponds to the 7 CEM detectors.
         - 30 corresponds to the 30 phi bins.
     """
-    raw_counts = np.zeros((8, cem_number, 30), dtype=np.uint8)
+    raw_counts: np.ndarray = np.zeros((8, cem_number, 30), dtype=np.uint8)
 
     # Compute phi values and their corresponding bins
     # Example: energy steps 0-1 have the same phi;
@@ -533,15 +533,10 @@ def process_swe(accumulated_data: xr.Dataset, in_flight_cal_files: list) -> list
         ) // 2
 
         # Interpolate to the appropriate calibration factor
+        idx = np.searchsorted(cal_met, group_time_first_half_mid, side="right") - 1
+
         interp_cal_first_half = np.array(
-            [
-                np.interp(
-                    int(group_time_first_half_mid),
-                    cal_met,
-                    in_flight_cal_df[cem].to_numpy(),
-                )
-                for cem in cal_cols
-            ],
+            [in_flight_cal_df[cem].iloc[idx] for cem in cal_cols],
             dtype=np.float64,
         )
         # Find the middle timestamp of the second group
@@ -551,16 +546,10 @@ def process_swe(accumulated_data: xr.Dataset, in_flight_cal_files: list) -> list
         group_time_second_half_mid = (
             group_time_second_half[0] + group_time_second_half[-1]
         ) // 2
-        # Interpolate to the appropriate calibration factor
+        idx = np.searchsorted(cal_met, group_time_second_half_mid, side="right") - 1
+
         interp_cal_second_half = np.array(
-            [
-                np.interp(
-                    int(group_time_second_half_mid),
-                    cal_met,
-                    in_flight_cal_df[cem].to_numpy(),
-                )
-                for cem in cal_cols
-            ],
+            [in_flight_cal_df[cem].iloc[idx] for cem in cal_cols],
             dtype=np.float64,
         )
 
@@ -577,7 +566,7 @@ def process_swe(accumulated_data: xr.Dataset, in_flight_cal_files: list) -> list
         bde_first_search = azimuthal_check_counterstreaming(
             summed_first_half_cem, summed_second_half_cem
         )
-        # Sum over azimuth.
+        # Sum over azimuth
         summed_first_half_az = np.sum(normalized_first_half, axis=2)
         summed_second_half_az = np.sum(normalized_second_half, axis=2)
         bde_second_search = polar_check_counterstreaming(

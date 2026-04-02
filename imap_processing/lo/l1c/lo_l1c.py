@@ -31,7 +31,9 @@ N_OFF_ANGLE_BINS = 40
 # 1 time, 7 energy steps, 3600 spin angle bins, and 40 off angle bins
 PSET_SHAPE = (1, N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS)
 PSET_DIMS = ["epoch", "esa_energy_step", "spin_angle", "off_angle"]
-ESA_ENERGY_STEPS = np.arange(N_ESA_ENERGY_STEPS) + 1  # 1 to 7 inclusive
+ESA_ENERGY_STEPS: np.ndarray = (
+    np.arange(N_ESA_ENERGY_STEPS) + 1  # 1 to 7 inclusive
+)
 SPIN_ANGLE_BIN_EDGES = np.linspace(0, 360, N_SPIN_ANGLE_BINS + 1)
 SPIN_ANGLE_BIN_CENTERS = (SPIN_ANGLE_BIN_EDGES[:-1] + SPIN_ANGLE_BIN_EDGES[1:]) / 2
 OFF_ANGLE_BIN_EDGES = np.linspace(-2, 2, N_OFF_ANGLE_BINS + 1)
@@ -87,11 +89,22 @@ def lo_l1c(sci_dependencies: dict, anc_dependencies: list) -> list[xr.Dataset]:
         logical_source = "imap_lo_l1c_pset"
         l1b_de = sci_dependencies["imap_lo_l1b_de"]
         l1b_goodtimes_only = filter_goodtimes(l1b_de, anc_dependencies)
-        # TODO: Need to handle case where no good times are found
-        # Set the pointing start and end times based on the first epoch
-        pointing_start_met, pointing_end_met = get_pointing_times(
-            ttj2000ns_to_met(l1b_goodtimes_only["epoch"][0].item())
-        )
+
+        # Handle case where no good times are found after filtering,
+        # which would lead to an empty dataset
+        if len(l1b_goodtimes_only["epoch"]) == 0:
+            logging.warning(
+                "No good times found in L1B DE dataset after filtering. "
+                "Creating empty PSET dataset with zero counts and exposure time."
+            )
+            # Set dummy pointing start and end METs
+            pointing_start_met = 0.0
+            pointing_end_met = 0.0
+        else:
+            # Set the pointing start and end times based on the first epoch
+            pointing_start_met, pointing_end_met = get_pointing_times(
+                float(ttj2000ns_to_met(l1b_goodtimes_only["epoch"][0].item()).item())
+            )
 
         pset = xr.Dataset(
             coords={"epoch": np.array([met_to_ttj2000ns(pointing_start_met)])},
@@ -132,13 +145,19 @@ def lo_l1c(sci_dependencies: dict, anc_dependencies: list) -> list[xr.Dataset]:
         )
 
         # Get the start and end spin numbers based on the pointing start and end MET
+        if 0 == pointing_start_met:
+            start_spin_number = 0
+            end_spin_number = 0
+        else:
+            start_spin_number = get_spin_number(pset["pointing_start_met"].item())
+            end_spin_number = get_spin_number(pset["pointing_end_met"].item())
         pset["start_spin_number"] = xr.DataArray(
-            [get_spin_number(pset["pointing_start_met"].item())],
+            [start_spin_number],
             dims="epoch",
             attrs=attr_mgr.get_variable_attributes("start_spin_number"),
         )
         pset["end_spin_number"] = xr.DataArray(
-            [get_spin_number(pset["pointing_end_met"].item())],
+            [end_spin_number],
             dims="epoch",
             attrs=attr_mgr.get_variable_attributes("end_spin_number"),
         )
@@ -228,7 +247,7 @@ def filter_goodtimes(l1b_de: xr.Dataset, anc_dependencies: list) -> xr.Dataset:
     l1b_de : xarray.Dataset
         Filtered L1B Direct Event dataset.
     """
-    # the goodtimes are currently the only ancillary file needed for L1C processing
+    # The goodtimes are one of several ancillary files needed for L1C processing
     goodtimes_table_df = lo_ancillary.read_ancillary_file(
         next(str(s) for s in anc_dependencies if "good-times" in str(s))
     )
@@ -672,7 +691,7 @@ def create_goodtimes_fraction(
     total_pointing_duration = pointing_end_met - pointing_start_met
 
     # Initialize as all zeros (no good time)
-    goodtimes_fraction = np.zeros(
+    goodtimes_fraction: np.ndarray = np.zeros(
         (N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS), dtype=np.float32
     )
 
@@ -776,6 +795,17 @@ def calculate_exposure_times(
     """
     # Calculate total pointing duration in seconds
     total_pointing_duration = pointing_end_met - pointing_start_met
+
+    if total_pointing_duration <= 0:
+        logging.warning(
+            "Pointing duration is zero or negative. Exposure times will be zero."
+        )
+        # Return zero exposure times with correct shape and dimensions
+        zero_exposure: np.ndarray = np.zeros(PSET_SHAPE, dtype=np.float32)
+        return xr.DataArray(
+            data=zero_exposure,
+            dims=PSET_DIMS,
+        )
 
     # Get representative spins from the pointing period
     representative_spins = get_representative_spin_times(
@@ -1039,14 +1069,17 @@ def set_background_rates(
     if species not in {FilterType.HYDROGEN, FilterType.OXYGEN}:
         raise ValueError(f"Species must be 'h' or 'o', but got {species.value}.")
 
-    bg_rates = np.zeros(
-        (N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS), dtype=np.float16
+    bg_rates: np.ndarray = np.zeros(
+        (N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS),
+        dtype=np.float16,
     )
-    bg_stat_uncert = np.zeros(
-        (N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS), dtype=np.float16
+    bg_stat_uncert: np.ndarray = np.zeros(
+        (N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS),
+        dtype=np.float16,
     )
-    bg_sys_err = np.zeros(
-        (N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS), dtype=np.float16
+    bg_sys_err: np.ndarray = np.zeros(
+        (N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS),
+        dtype=np.float16,
     )
 
     # read in the background rates from ancillary file
@@ -1063,8 +1096,8 @@ def set_background_rates(
     # TODO: This assumes that the backgrounds will never change mid-pointing.
     #    Is that a safe assumption?
     pointing_bg_df = background_df[
-        (background_df["GoodTime_start"] <= pointing_start_met)
-        & (background_df["GoodTime_end"] >= pointing_end_met)
+        (background_df["GoodTime_start"] < pointing_end_met)
+        & (background_df["GoodTime_end"] > pointing_start_met)
     ]
 
     # convert the bin start and end resolution from 6 degrees to 0.1 degrees
@@ -1138,6 +1171,24 @@ def set_pointing_directions(
     hae_latitude : xr.DataArray
         The HAE latitude for each spin and off angle bin.
     """
+    # Handle case where epoch is empty
+    if epoch == met_to_ttj2000ns(0):
+        return xr.DataArray(
+            data=np.zeros(
+                (1, len(SPIN_ANGLE_BIN_CENTERS), len(OFF_ANGLE_BIN_CENTERS)),
+                dtype=np.float64,
+            ),
+            dims=["epoch", "spin_angle", "off_angle"],
+            attrs=attr_mgr.get_variable_attributes("hae_longitude"),
+        ), xr.DataArray(
+            data=np.zeros(
+                (1, len(SPIN_ANGLE_BIN_CENTERS), len(OFF_ANGLE_BIN_CENTERS)),
+                dtype=np.float64,
+            ),
+            dims=["epoch", "spin_angle", "off_angle"],
+            attrs=attr_mgr.get_variable_attributes("hae_latitude"),
+        )
+
     et = ttj2000ns_to_et(epoch)
     # create a meshgrid of spin and off angles using the bin centers
     spin, off = np.meshgrid(

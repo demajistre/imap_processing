@@ -1,14 +1,32 @@
 """Test processEphemeris functions."""
 
-from datetime import datetime
+from datetime import datetime, time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 
+from imap_processing import imap_module_directory
 from imap_processing.ialirt.generate_coverage import (
+    create_schedule_mask,
     format_coverage_summary,
     generate_coverage,
+    parse_uksa_schedule_xlsx,
 )
+
+
+@pytest.fixture(scope="session")
+def schedule_path():
+    """Returns the xtce auxiliary directory."""
+    return (
+        imap_module_directory
+        / "tests"
+        / "ialirt"
+        / "data"
+        / "l0"
+        / "UKS-DSST-GES-PLN-001 IMAP GHY-6 Availability Analysis v01.xlsx"
+    )
 
 
 @pytest.mark.external_kernel
@@ -109,3 +127,89 @@ def test_dsn(furnish_kernels):
 
         assert "I-ALiRT Coverage Summary" in output["summary"]
         assert 40.6 == output["total_coverage_percent"]
+
+
+@patch("imap_processing.ialirt.generate_coverage.et_to_utc")
+def test_create_schedule_mask(mock_et_to_utc):
+    """
+    Test create_schedule_mask.
+    """
+
+    mock_et_to_utc.return_value = np.array(
+        [
+            "2026-09-22T11:30:00.000",
+            "2026-09-22T11:35:00.000",
+            "2026-09-22T11:40:00.000",
+            "2026-09-22T11:45:00.000",
+            "2026-09-22T11:50:00.000",
+            "2026-09-22T11:55:00.000",
+            "2026-09-22T12:00:00.000",
+            "2026-09-22T12:05:00.000",
+            "2026-09-22T12:10:00.000",
+            "2026-09-22T12:15:00.000",
+            "2026-09-22T12:20:00.000",
+            "2026-09-22T12:25:00.000",
+            "2026-09-22T12:30:00.000",
+        ]
+    )
+
+    time_range = np.arange(13)
+
+    station = SimpleNamespace(
+        schedule_start=time(12, 0),
+        schedule_end=None,
+    )
+
+    mask = create_schedule_mask(station, time_range)
+
+    expected = np.array(
+        [
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+        ],
+        dtype=bool,
+    )
+
+    np.testing.assert_array_equal(mask, expected)
+
+
+def test_parse_uksa_schedule_xlsx(schedule_path):
+    "Test parse_uksa_schedule_xlsx."
+
+    uksa_contacts = parse_uksa_schedule_xlsx(schedule_path)
+
+    # Verify that setup time and teardown time are properly accounted for.
+    assert uksa_contacts[1] == ("2026-01-29T14:40:00.000", "2026-01-29T16:54:26.000")
+    assert uksa_contacts[2] == ("2026-01-30T08:54:52.000", "2026-01-30T12:54:00.000")
+
+
+@pytest.mark.external_kernel
+def test_incorporate_uksa_coverage(schedule_path, furnish_kernels):
+    "Test to parse UKSA schedule."
+    kernels = [
+        "naif0012.tls",
+        "pck00011.tpc",
+        "de440s.bsp",
+        "imap_spk_demo.bsp",
+    ]
+
+    uksa_contacts = parse_uksa_schedule_xlsx(schedule_path)
+
+    with furnish_kernels(kernels):
+        coverage_dict, outage_dict = generate_coverage(
+            "2026-01-29T00:00:00Z", uksa=uksa_contacts
+        )
+
+    assert coverage_dict["UKSA"][0] == "2026-01-29T14:45:00.000"
+    assert coverage_dict["UKSA"][-1] == "2026-01-29T16:50:00.000"

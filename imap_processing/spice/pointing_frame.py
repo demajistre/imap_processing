@@ -23,7 +23,7 @@ from imap_processing.spice.time import (
 
 logger = logging.getLogger(__name__)
 
-POINTING_SEGMENT_DTYPE = np.dtype(
+POINTING_SEGMENT_DTYPE: np.dtype = np.dtype(
     [
         # sclk ticks are a double precision number of SCLK ticks since the
         # start of the mission (e.g. MET_seconds / TICK_DURATION)
@@ -208,7 +208,7 @@ def calculate_pointing_attitude_segments(
     - Latest NAIF leapseconds kernel (naif0012.tls)
     - The latest IMAP sclk (imap_sclk_NNNN.tsc)
     - The latest IMAP frame kernel (imap_###.tf)
-    - IMAP DPS frame kernel (imap_science_100.tf)
+    - IMAP DPS frame kernel (imap_science_120.tf)
     - IMAP historical attitude kernel from which the pointing frame kernel will
     be generated.
     """

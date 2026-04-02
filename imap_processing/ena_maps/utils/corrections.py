@@ -273,7 +273,7 @@ class PowerLawFluxCorrector:
             of input.
         """
         n_levels = observed_fluxes.shape[0]
-        energy_levels = np.arange(n_levels) + 1
+        energy_levels: np.ndarray = np.arange(n_levels) + 1
 
         # Initial power-law estimate from observed fluxes
         gamma_initial, _ = self.estimate_power_law_slope(observed_fluxes, energies)
@@ -468,11 +468,23 @@ def add_spacecraft_velocity_to_pset(
             f"add_spacecraft_velocity_to_pset does not support PSETs with "
             f"Logical_source: {pset.attrs['Logical_source']}"
         )
-    et = ttj2000ns_to_et(pset["epoch"].values[0] + pointing_duration_ns / 2)
 
-    # Get spacecraft state in HAE frame
-    sc_state = geometry.imap_state(et, ref_frame=geometry.SpiceFrame.IMAP_HAE)
-    sc_velocity_vector = sc_state[3:6]
+    # Handle case where pointing duration is zero or negative to avoid invalid
+    # ephemeris time (this is used, for example, for empty psets due to
+    # goodtimes filtering)
+    if pointing_duration_ns <= 0:
+        logger.warning(
+            "Pointing duration is zero or negative. "
+            "Setting spacecraft velocity to zero."
+        )
+        sc_velocity_vector = np.zeros(3)  # Zero velocity vector
+    else:
+        # Compute ephemeris time (J2000 seconds) of PSET midpoint
+        et = ttj2000ns_to_et(pset["epoch"].values[0] + pointing_duration_ns / 2)
+
+        # Get spacecraft state in HAE frame
+        sc_state = geometry.imap_state(et, ref_frame=geometry.SpiceFrame.IMAP_HAE)
+        sc_velocity_vector = sc_state[3:6]
 
     # Store spacecraft velocity as DataArray
     pset["sc_velocity"] = xr.DataArray(
@@ -775,6 +787,7 @@ def interpolate_map_flux_to_helio_frame(
     esa_energies: xr.DataArray,
     helio_energies: xr.DataArray,
     vars_to_interpolate: list[str],
+    update_sys_err: bool = True,
 ) -> xr.Dataset:
     """
     Interpolate flux from spacecraft frame to heliocentric frame energies.
@@ -806,6 +819,9 @@ def interpolate_map_flux_to_helio_frame(
         dataset and will be interpolated as well. For example, if ["ena_intensity"]
         is input, then the variables "ena_intensity", "ena_intensity_stat_uncert",
         and "ena_intensity_sys_err" will be interpolated.
+    update_sys_err : bool, optional
+        Flag indicating whether to update the systematic error variables as part
+        of the flux interpolation. Defaults to True.
 
     Returns
     -------
@@ -912,7 +928,8 @@ def interpolate_map_flux_to_helio_frame(
         # Update the dataset with interpolated values
         map_ds[var_name] = flux_helio
         map_ds[f"{var_name}_stat_uncert"] = stat_unc_helio
-        map_ds[f"{var_name}_sys_err"] = sys_err_helio
+        if update_sys_err:
+            map_ds[f"{var_name}_sys_err"] = sys_err_helio
 
     return map_ds
 

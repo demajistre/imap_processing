@@ -6,7 +6,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-STATIONS = ["Kiel"]
+STATIONS = ["Kiel", "UKSA"]
 
 
 def packets_created(start_file_creation: datetime, lines: list) -> dict:
@@ -64,8 +64,9 @@ def packets_created(start_file_creation: datetime, lines: list) -> dict:
                 .isoformat()
                 .replace("+00:00", "Z")
             )
-            station_dict[station]["last_data_received"].append(dt)
-            station_dict[station]["rate_kbps"].append(rate)
+            if dt not in station_dict[station]["last_data_received"]:
+                station_dict[station]["last_data_received"].append(dt)
+                station_dict[station]["rate_kbps"].append(rate)
 
     return station_dict
 
@@ -106,9 +107,9 @@ def format_ingest_data(last_filename: str, log_lines: list) -> dict:
     last_timestamp_str = last_timestamp_str.replace("_", ":")
     end_of_time = datetime.strptime(last_timestamp_str, "%Y-%jT%H:%M:%S")
 
-    # File is created every 5 minutes.
+    # File creation time of last file minus 48 hrs.
     start_of_time = datetime.strptime(last_timestamp_str, "%Y-%jT%H:%M:%S") - timedelta(
-        minutes=5
+        hours=48
     )
 
     # Parse file.
@@ -122,6 +123,7 @@ def format_ingest_data(last_filename: str, log_lines: list) -> dict:
             start_of_time.isoformat(),
             end_of_time.isoformat(),
         ],  # Overall time range of the data
+        "stations": list(STATIONS),
         **station_dict,
     }
 

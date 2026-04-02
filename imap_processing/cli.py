@@ -56,7 +56,7 @@ from imap_processing.codice import codice_l1a, codice_l1b, codice_l2
 from imap_processing.glows.l1a.glows_l1a import glows_l1a
 from imap_processing.glows.l1b.glows_l1b import glows_l1b, glows_l1b_de
 from imap_processing.glows.l2.glows_l2 import glows_l2
-from imap_processing.hi import hi_l1a, hi_l1b, hi_l1c, hi_l2
+from imap_processing.hi import hi_goodtimes, hi_l1a, hi_l1b, hi_l1c, hi_l2
 from imap_processing.hit.l1a.hit_l1a import hit_l1a
 from imap_processing.hit.l1b.hit_l1b import hit_l1b
 from imap_processing.hit.l2.hit_l2 import hit_l2
@@ -676,7 +676,7 @@ class Glows(ProcessInstrument):
 
             # Load conversion table (needed for both hist and DE)
             conversion_table_file = dependencies.get_processing_inputs(
-                descriptor="conversion-table-for-anc-data"
+                descriptor="l1b-conversion-table-for-anc-data"
             )[0]
 
             with open(conversion_table_file.imap_file_paths[0].construct_path()) as f:
@@ -691,16 +691,16 @@ class Glows(ProcessInstrument):
             if "hist" in self.descriptor:
                 # Create file lists for each ancillary type
                 excluded_regions_files = dependencies.get_processing_inputs(
-                    descriptor="map-of-excluded-regions"
+                    descriptor="l1b-map-of-excluded-regions"
                 )[0]
                 uv_sources_files = dependencies.get_processing_inputs(
-                    descriptor="map-of-uv-sources"
+                    descriptor="l1b-map-of-uv-sources"
                 )[0]
                 suspected_transients_files = dependencies.get_processing_inputs(
-                    descriptor="suspected-transients"
+                    descriptor="l1b-suspected-transients"
                 )[0]
                 exclusions_by_instr_team_files = dependencies.get_processing_inputs(
-                    descriptor="exclusions-by-instr-team"
+                    descriptor="l1b-exclusions-by-instr-team"
                 )[0]
                 pipeline_settings = dependencies.get_processing_inputs(
                     descriptor="pipeline-settings"
@@ -739,14 +739,35 @@ class Glows(ProcessInstrument):
                 datasets = [glows_l1b_de(input_dataset, conversion_table_dict)]
 
         if self.data_level == "l2":
-            science_files = dependencies.get_file_paths(source="glows")
+            science_files = dependencies.get_file_paths(source="glows", data_type="l1b")
             if len(science_files) != 1:
                 raise ValueError(
-                    f"GLOWS L1A requires exactly one input science file, received: "
-                    f"{science_files}."
+                    f"GLOWS L2 requires exactly one input science file, "
+                    f"received: {science_files}."
                 )
             input_dataset = load_cdf(science_files[0])
-            datasets = glows_l2(input_dataset)
+
+            # Load pipeline settings for L2 processing
+            current_day = np.datetime64(
+                f"{self.start_date[:4]}-{self.start_date[4:6]}-{self.start_date[6:]}"
+            )
+            day_buffer = current_day + np.timedelta64(3, "D")
+            pipeline_settings_input = dependencies.get_processing_inputs(
+                descriptor="pipeline-settings"
+            )[0]
+            pipeline_settings_combiner = GlowsAncillaryCombiner(
+                pipeline_settings_input, day_buffer
+            )
+            calibration_input = dependencies.get_processing_inputs(
+                descriptor="l2-calibration"
+            )[0]
+            calibration_combiner = GlowsAncillaryCombiner(calibration_input, day_buffer)
+
+            datasets = glows_l2(
+                input_dataset,
+                pipeline_settings_combiner.combined_dataset,
+                calibration_combiner.combined_dataset,
+            )
 
         return datasets
 
@@ -754,7 +775,7 @@ class Glows(ProcessInstrument):
 class Hi(ProcessInstrument):
     """Process IMAP-Hi."""
 
-    def do_processing(
+    def do_processing(  # noqa: PLR0912
         self, dependencies: ProcessingInputCollection
     ) -> list[xr.Dataset]:
         """
@@ -785,6 +806,57 @@ class Hi(ProcessInstrument):
             l0_files = dependencies.get_file_paths(source="hi", descriptor="raw")
             if l0_files:
                 datasets = hi_l1b.housekeeping(l0_files[0])
+            elif "goodtimes" in self.descriptor:
+                # Check self.repointing is not None (for mypy type checking)
+                if self.repointing is None:
+                    raise ValueError(
+                        "Repointing must be provided for Hi Goodtimes processing."
+                    )
+
+                # Goodtimes processing
+                l1b_de_paths = dependencies.get_file_paths(
+                    source="hi", data_type="l1b", descriptor="de"
+                )
+                if not l1b_de_paths:
+                    raise ValueError("No L1B DE files found for goodtimes processing")
+
+                l1b_hk_paths = dependencies.get_file_paths(
+                    source="hi", data_type="l1b", descriptor="hk"
+                )
+                if len(l1b_hk_paths) != 1:
+                    raise ValueError(
+                        f"Expected one L1B HK file, got {len(l1b_hk_paths)}"
+                    )
+
+                cal_prod_paths = dependencies.get_file_paths(
+                    data_type="ancillary", descriptor="cal-prod"
+                )
+                if len(cal_prod_paths) != 1:
+                    raise ValueError(
+                        f"Expected one cal-prod ancillary file, "
+                        f"got {len(cal_prod_paths)}"
+                    )
+
+                l1a_diagfee_paths = dependencies.get_file_paths(
+                    source="hi", data_type="l1a", descriptor="diagfee"
+                )
+                if len(l1a_diagfee_paths) != 1:
+                    raise ValueError(
+                        f"Expected one L1A DIAG_FEE file, got {len(l1a_diagfee_paths)}"
+                    )
+
+                # Load CDFs before passing to hi_goodtimes
+                l1b_de_datasets = [load_cdf(path) for path in l1b_de_paths]
+                l1b_hk = load_cdf(l1b_hk_paths[0])
+                l1a_diagfee = load_cdf(l1a_diagfee_paths[0])
+
+                datasets = hi_goodtimes.hi_goodtimes(
+                    self.repointing,
+                    l1b_de_datasets,
+                    l1b_hk,
+                    l1a_diagfee,
+                    cal_prod_paths[0],
+                )
             else:
                 l1a_de_file = dependencies.get_file_paths(
                     source="hi", data_type="l1a", descriptor="de"
@@ -797,17 +869,35 @@ class Hi(ProcessInstrument):
                     load_cdf(l1a_de_file), load_cdf(l1b_hk_file), esa_energies_csv
                 )
         elif self.data_level == "l1c":
-            science_paths = dependencies.get_file_paths(source="hi", data_type="l1b")
-            if len(science_paths) != 1:
-                raise ValueError(
-                    f"Expected only one science dependency. Got {science_paths}"
+            if "pset" in self.descriptor:
+                # L1C PSET processing
+                l1b_de_paths = dependencies.get_file_paths(
+                    source="hi", data_type="l1b", descriptor="de"
                 )
-            anc_paths = dependencies.get_file_paths(data_type="ancillary")
-            if len(anc_paths) != 1:
-                raise ValueError(
-                    f"Expected only one ancillary dependency. Got {anc_paths}"
+                if len(l1b_de_paths) != 1:
+                    raise ValueError(
+                        f"Expected exactly one DE science dependency. "
+                        f"Got {l1b_de_paths}"
+                    )
+                anc_paths = dependencies.get_file_paths(data_type="ancillary")
+                if len(anc_paths) != 1:
+                    raise ValueError(
+                        f"Expected exactly one ancillary dependency. Got {anc_paths}"
+                    )
+                # Load goodtimes dependency
+                goodtimes_paths = dependencies.get_file_paths(
+                    source="hi", data_type="l1b", descriptor="goodtimes"
                 )
-            datasets = hi_l1c.hi_l1c(load_cdf(science_paths[0]), anc_paths[0])
+                if len(goodtimes_paths) != 1:
+                    raise ValueError(
+                        f"Expected exactly one goodtimes dependency. "
+                        f"Got {goodtimes_paths}"
+                    )
+                datasets = hi_l1c.hi_l1c(
+                    load_cdf(l1b_de_paths[0]),
+                    anc_paths[0],
+                    load_cdf(goodtimes_paths[0]),
+                )
         elif self.data_level == "l2":
             science_paths = dependencies.get_file_paths(source="hi", data_type="l1c")
             anc_dependencies = dependencies.get_processing_inputs(data_type="ancillary")
@@ -955,16 +1045,23 @@ class Idex(ProcessInstrument):
             science_files = dependencies.get_file_paths(source="idex")
             datasets = PacketParser(science_files[0]).data
         elif self.data_level == "l1b":
-            if len(dependency_list) != 3:
+            n_expected_deps = 3 if self.descriptor == "sci-1week" else 1
+            if len(dependency_list) != n_expected_deps:
                 raise ValueError(
-                    f"Unexpected dependencies found for IDEX L1B:"
-                    f"{dependency_list}. Expected only three dependencies."
+                    f"Unexpected dependencies found for IDEX L1B {self.descriptor}:"
+                    f"{dependency_list}. Expected only {n_expected_deps} dependencies."
                 )
             # get CDF file
             science_files = dependencies.get_file_paths(source="idex")
+            # Load all the science files. There should only be one, but in the case of
+            # multiple files, we want to make sure to load them all and select the one
+            # with the latest time.
+            science_datasets = [load_cdf(f) for f in science_files]
+            if not science_datasets:
+                raise ValueError("No science files found for IDEX L1B processing.")
+            latest_file = max(science_datasets, key=lambda ds: ds["epoch"].data[0])
             # process data
-            dependency = load_cdf(science_files[0])
-            datasets = [idex_l1b(dependency)]
+            datasets = [idex_l1b(latest_file, self.descriptor)]
         elif self.data_level == "l2a":
             if len(dependency_list) != 3:
                 raise ValueError(
@@ -988,9 +1085,13 @@ class Idex(ProcessInstrument):
                 source="idex", descriptor="sci-1week"
             )
             sci_dependencies = [load_cdf(f) for f in sci_files]
-            hk_files = dependencies.get_file_paths(source="idex", descriptor="evt")
+            # sort science files by the first epoch value
+            sci_dependencies.sort(key=lambda ds: ds["epoch"].values[0])
+            hk_files = dependencies.get_file_paths(source="idex", descriptor="msg")
             # Remove duplicate housekeeping files
             hk_dependencies = [load_cdf(dep) for dep in list(set(hk_files))]
+            # sort housekeeping files by the first epoch value
+            hk_dependencies.sort(key=lambda ds: ds["epoch"].values[0])
             datasets = idex_l2b(sci_dependencies, hk_dependencies)
         return datasets
 
