@@ -14,7 +14,12 @@ from imap_processing.spice.geometry import (
     frame_transform_az_el,
     get_instrument_mounting_az_el,
 )
-from imap_processing.spice.time import met_to_sclkticks, sct_to_et
+from imap_processing.spice.time import (
+    et_to_datetime64,
+    met_to_sclkticks,
+    sct_to_et,
+    ttj2000ns_to_et,
+)
 
 
 @dataclass
@@ -46,6 +51,8 @@ class DailyLightcurve:
         number of bins in lightcurve
     l1b_data : xarray.Dataset
         L1B data filtered by good times, good angles, and good bins.
+    calibration_factor : float | None
+        Rayleigh calibration factor used for flux calculations.
     """
 
     # All variables should have n_bin elements
@@ -55,14 +62,19 @@ class DailyLightcurve:
     exposure_times: np.ndarray = field(init=False)
     flux_uncertainties: np.ndarray = field(init=False)
     histogram_flag_array: np.ndarray = field(init=False)
-    # TODO: ecliptic coordinates
     ecliptic_lon: np.ndarray = field(init=False)
     ecliptic_lat: np.ndarray = field(init=False)
     number_of_bins: int = field(init=False)
     l1b_data: InitVar[xr.Dataset]
     position_angle: InitVar[float]
+    calibration_factor: InitVar[float | None]
 
-    def __post_init__(self, l1b_data: xr.Dataset, position_angle: float) -> None:
+    def __post_init__(
+        self,
+        l1b_data: xr.Dataset,
+        position_angle: float,
+        calibration_factor: float | None,
+    ) -> None:
         """
         Compute all the daily lightcurve variables from L1B data.
 
@@ -74,6 +86,10 @@ class DailyLightcurve:
         position_angle : float
             The offset angle of the GLOWS instrument from the north spin point - this
             is used in spin angle calculations.
+        calibration_factor : float
+            Calibration factor used for flux calculations, in units of counts per second
+            per Rayleigh. This is used to convert from raw histograms and exposure times
+            to physical photon flux units.
         """
         # number_of_bins_per_histogram is the count of valid (non-FILLVAL) bins.
         # Histogram arrays from L1B are always GlowsConstants.STANDARD_BIN_COUNT
@@ -107,12 +123,16 @@ class DailyLightcurve:
         self.flux_uncertainties = np.zeros(self.number_of_bins)
 
         if (
-            len(self.exposure_times) != 0
+            self.number_of_bins > 0
             and self.exposure_times[0] > 0
-            and len(np.unique(self.exposure_times)) == 1
+            and calibration_factor
         ):
-            self.photon_flux = self.raw_histograms / self.exposure_times
-            self.flux_uncertainties = raw_uncertainties / self.exposure_times
+            self.photon_flux = (
+                self.raw_histograms / self.exposure_times
+            ) / calibration_factor
+            self.flux_uncertainties = (
+                raw_uncertainties / self.exposure_times
+            ) / calibration_factor
 
         self.spin_angle = np.zeros(0)
 
@@ -244,6 +264,8 @@ class HistogramL2:
             GLOWS histogram L1B dataset, as produced by glows_l1b.py.
         pipeline_settings : PipelineSettings
             Pipeline settings object read from ancillary file.
+        calibration_dataset : xr.Dataset
+            The cps-to-Rayleigh calibration dataset needed for flux calculations.
 
     Attributes
     ----------
@@ -327,7 +349,12 @@ class HistogramL2:
     spin_axis_orientation_average: np.ndarray[np.double]
     bad_time_flag_occurrences: np.ndarray
 
-    def __init__(self, l1b_dataset: xr.Dataset, pipeline_settings: PipelineSettings):
+    def __init__(
+        self,
+        l1b_dataset: xr.Dataset,
+        pipeline_settings: PipelineSettings,
+        calibration_dataset: xr.Dataset,
+    ) -> None:
         """
         Given an L1B dataset, process data into an output HistogramL2 object.
 
@@ -337,13 +364,26 @@ class HistogramL2:
             GLOWS histogram L1B dataset, as produced by glows_l1b.py.
         pipeline_settings : PipelineSettings
             Pipeline settings object read from ancillary file.
+        calibration_dataset : xr.Dataset
+            cps-to-Rayleigh calibration dataset used for flux calculations.
+            coords: start_time_utc,  data_vars: cps_per_r
         """
         active_flags = np.array(pipeline_settings.active_bad_time_flags, dtype=float)
+
+        # Apply sunrise/sunset offsets to extend the night region around
+        # is_night transitions before selecting good blocks.
+        flags = self.apply_is_night_offsets(
+            l1b_dataset["flags"].data,
+            is_night_idx=GlowsConstants.IS_NIGHT_FLAG_IDX,
+            sunrise_offset=int(pipeline_settings.sunrise_offset),
+            sunset_offset=int(pipeline_settings.sunset_offset),
+        )
+        flags_da = xr.DataArray(flags, dims=l1b_dataset["flags"].dims)
 
         # Select the good blocks (i.e. epoch values) according to the flags. Drop any
         # bad blocks before processing.
         good_data = l1b_dataset.isel(
-            epoch=self.return_good_times(l1b_dataset["flags"], active_flags)
+            epoch=self.return_good_times(flags_da, active_flags)
         )
         # TODO: bad angle filter
         # TODO: filter bad bins out. Needs to happen here while everything is still
@@ -438,7 +478,17 @@ class HistogramL2:
             .data[np.newaxis, :]
         )
 
-        self.daily_lightcurve = DailyLightcurve(good_data, position_angle)
+        # Select calibration factor corresponding to the mid-epoch in the L1B data.
+        if len(good_data["epoch"].data) != 0:
+            calibration_factor = self.get_calibration_factor(
+                good_data["epoch"].data, calibration_dataset
+            )
+        else:
+            calibration_factor = None  # No good data available. Still proceed
+
+        self.daily_lightcurve = DailyLightcurve(
+            good_data, position_angle, calibration_factor
+        )
 
     def filter_bad_bins(self, histograms: NDArray, bin_exclusions: NDArray) -> NDArray:
         """
@@ -493,6 +543,98 @@ class HistogramL2:
         good_times = np.where(np.all(flags[:, active_flags == 1] == 1, axis=1))[0]
         return good_times
 
+    @staticmethod
+    def apply_is_night_offsets(
+        flags: np.ndarray,
+        is_night_idx: int,
+        sunrise_offset: int,
+        sunset_offset: int,
+    ) -> np.ndarray:
+        """
+        Apply sunrise/sunset offsets to is_night transitions.
+
+        Per algorithm doc v4.4.7, Sec. 3.9.1, item 2 (raw is_night: 1=night, 0=day):
+
+        sunset_offset applies at both transitions:
+          >0: night shortens by N at each end (first N night epochs at sunset become
+              day; last N night epochs before sunrise become day)
+          <0: night extends by |N| at each end
+
+        sunrise_offset is an additional adjustment at sunrise (is_night 1->0) only:
+          >0: night extends N histograms past the raw sunrise transition
+          <0: night shortens by |N| before the raw sunrise transition
+
+        In the processed flags array: 0 = bad (night), 1 = good (day).
+
+        Parameters
+        ----------
+        flags : numpy.ndarray
+            Flags array with shape (n_epochs, FLAG_LENGTH), 0=bad, 1=good.
+        is_night_idx : int
+            Column index of the is_night flag in the flags array.
+        sunrise_offset : int
+            Additional histogram shift at the sunrise (is_night 1->0) transition.
+        sunset_offset : int
+            Histogram shift applied at both the sunset and sunrise transitions.
+
+        Returns
+        -------
+        numpy.ndarray
+            Returns the original flags array if no offsets are applied,
+            otherwise returns a modified copy.
+
+        Notes
+        -----
+        Algorithm doc v4.4.7, Sec. 3.9.1, item 2
+        is_night: 1 = daytime (good), 0 = night (bad)
+        """
+        # If sunrise_offset=0 and sunset_offset=0 then no corrections are needed
+        # relative to is_night transition set onboard.
+        if sunrise_offset == 0 and sunset_offset == 0:
+            return flags
+
+        flags_with_offsets = flags.copy()
+
+        is_night_col = flags[:, is_night_idx]
+        n = flags.shape[0]
+        diff = np.diff(is_night_col.astype(int))
+        sunset_index = np.where(diff == -1)[0]
+        sunrise_index = np.where(diff == 1)[0]
+
+        if sunrise_offset > 0:
+            # Night (flag = 0) extends by sunrise_offset relative
+            # to is_night 0 -> 1 transition.
+            for i in sunrise_index:
+                flags_with_offsets[
+                    i + 1 : min(n, i + 1 + sunrise_offset), is_night_idx
+                ] = 0
+
+        elif sunrise_offset < 0:
+            # Night (flag = 0) shortens by sunrise_offset relative
+            # to is_night 0 -> 1 transition.
+            for i in sunrise_index:
+                flags_with_offsets[
+                    max(0, i + 1 + sunrise_offset) : i + 1, is_night_idx
+                ] = 1
+
+        if sunset_offset > 0:
+            # Night (flag = 0) shortens by sunset_offset relative
+            # to is_night 1 -> 0 transition.
+            for i in sunset_index:
+                flags_with_offsets[
+                    i + 1 : min(n, i + 1 + sunset_offset), is_night_idx
+                ] = 1
+
+        elif sunset_offset < 0:
+            # Night (flag = 0) extends by sunset_offset relative
+            # to is_night 1 -> 0 transition.
+            for i in sunset_index:
+                flags_with_offsets[
+                    max(0, i + 1 + sunset_offset) : i + 1, is_night_idx
+                ] = 0
+
+        return flags_with_offsets
+
     def compute_position_angle(self) -> float:
         """
         Compute the position angle based on the instrument mounting.
@@ -517,3 +659,56 @@ class HistogramL2:
         # doesn't move from the SPICE determined mounting angle.
         glows_mounting_azimuth, _ = get_instrument_mounting_az_el(SpiceFrame.IMAP_GLOWS)
         return (360.0 - glows_mounting_azimuth) % 360.0
+
+    @staticmethod
+    def get_calibration_factor(
+        epoch_values: np.ndarray, calibration_dataset: xr.Dataset
+    ) -> float:
+        """
+        Select calibration factor for an observational day.
+
+        The calibration factor is needed to compute flux in Rayleigh units.
+        There is a strong assumption that the calibration is constant for
+        a given observational day.
+
+        Parameters
+        ----------
+        epoch_values : np.ndarray
+            Array of epoch values from the L1B dataset, in TT J2000 nanoseconds.
+        calibration_dataset : xr.Dataset
+            Dataset containing calibration data with the following structure:
+                Coords: epoch (datetime64[s])
+                Dims: epoch, cps_per_r_dim_0, start_time_utc_dim_0
+                Data vars: "cps_per_r" and "start_time_utc" are 2D (epoch, *_dim_0)
+
+                Note: epoch and start_time_utc do not necessarily match in size or
+                      values
+                    - epoch contains timestamps in the calibration data up to a defined
+                      day buffer and start_time_utc are the timestamps for all the
+                      calibration data entries.
+                    - epoch is used for selecting the time block, and start_time_utc is
+                      used for selecting the calibration value within that block.
+
+        Returns
+        -------
+        float
+            The calibration factor needed to compute flux in Rayleigh units.
+        """
+        # Use the midpoint epoch for the observation day
+        mid_idx = len(epoch_values) // 2
+        mid_epoch_utc = et_to_datetime64(ttj2000ns_to_et(epoch_values[mid_idx].item()))
+
+        # Select calibration data before or equal to mid_epoch_utc using "pad" to find
+        # the nearest preceding entry in the calibration dataset's epoch
+        # coordinate which is in UTC datetime64 format.
+        cal_at_epoch = calibration_dataset.sel(epoch=mid_epoch_utc, method="pad")
+
+        # start_time_utc is a data variable with its own index dimension.
+        # Use searchsorted to find the last entry whose start_time_utc <= mid_epoch_utc.
+        start_times = np.array(
+            cal_at_epoch["start_time_utc"].values, dtype="datetime64[ns]"
+        )
+        nearest_idx = np.searchsorted(start_times, mid_epoch_utc, side="right") - 1
+
+        # Select the calibration value at the nearest index.
+        return float(cal_at_epoch["cps_per_r"].isel(cps_per_r_dim_0=nearest_idx))
