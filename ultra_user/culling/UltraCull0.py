@@ -273,7 +273,7 @@ class UltraCull0():
         thresh = totalMean + sigThreshold * np.sqrt(totalMean)
         jj = np.nonzero(totalScaled > thresh)[0]
         for ic in range(len(mask[:,0])):
-            mask[ic,jj] = False
+            mask[ic,kk[jj]] = False
         result["mask"] = mask
         if apply is True:
             self.add_mask(mask, opName="Upstream ion cull")
