@@ -56,7 +56,7 @@ def get_pointings(start_pointing, end_pointing, sensor='90') -> list:
 
 def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20,
              n_iter=5,upstream_chans1=None, upstream_chans2=None, spec_chans=None,
-             sep_threshold_per_spin=None, nAddChans=5,cullPackage="serial_hiEnergy_stat"):
+             sep_threshold_per_spin=None, nAddChans=5,cullPackage="serial_hiEnergy_stat",vthresh=3400):
     if upstream_chans1 is None:
         upstream_chans1 = [0,1,2]
     if upstream_chans2 is None:
@@ -77,7 +77,7 @@ def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45
         cullData[repoint] = UltraCull0.UltraCull0(repoint, energy_ranges, sensor=sensor, spin_range=spin_range,
                                                   earthAng45=earthAng45, sep_threshold_per_spin=sep_threshold_per_spin)
         cnt_sum[repoint] = cullData[repoint].get_count_summary()
-        vcull[repoint] = cullData[repoint].voltage_cull()
+        vcull[repoint] = cullData[repoint].voltage_cull(v_threshold=vthresh)
         match cullPackage:
             case "serial_hiEnergy_stat":
                 ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans)

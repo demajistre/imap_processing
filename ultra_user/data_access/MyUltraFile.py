@@ -71,6 +71,15 @@ def L1Bde(repointNum, version='Latest', sensor='90', rootDir='data/imap',silent=
     return MyUltraFile('l1b', descriptor, repointNum, version=version, sensor=sensor, rootDir=rootDir,
                        silent=silent)
 
+def L1BpNde(repointNum,priority, version='Latest', sensor='90', rootDir='data/imap',silent=False) -> MyUltraFile:
+    descriptor = f"priority-{priority}-de"
+    return MyUltraFile('l1b', descriptor, repointNum, version=version, sensor=sensor, rootDir=rootDir,
+                       silent=silent)
+
+def L1Bp1de(repointNum, version='Latest', sensor='90', rootDir='data/imap',silent=False) -> MyUltraFile:
+    return L1BpNde(repointNum,1,version=version, sensor=sensor, rootDir=rootDir,silent=silent)
+
+
 def L1Ade(repointNum, version='Latest', sensor='90', rootDir='data/imap',silent=False) -> MyUltraFile:
     descriptor = 'de'
     return MyUltraFile('l1a', descriptor, repointNum, version=version, sensor=sensor, rootDir=rootDir,

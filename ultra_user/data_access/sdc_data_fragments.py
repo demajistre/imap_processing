@@ -29,6 +29,19 @@ files.extend(imap_data_access.query(instrument='ultra',data_level='l1c'))
 files = imap_data_access.query(instrument='ultra',data_level='l1b')
 files.extend(imap_data_access.query(instrument='ultra',data_level='l1c'))
 
+# revised to take into account the large number of files for 1b (the above no longer works)
+# note that we're only getting priority 1 stuff for now
+sensors = ['90','45']
+l1b_descriptors  = ['status','extendedspin','de','priority-1-de','rates','aux']
+files = list()
+for sensor in sensors:
+    for descriptor in l1b_descriptors:
+        desc = f"{sensor}sensor-{descriptor}"
+        print(desc)
+        files.extend(imap_data_access.query(instrument='ultra',descriptor=desc,data_level='l1b'))
+files.extend(imap_data_access.query(instrument='ultra',data_level='l1c'))
+
+
 ic=0
 nf=len(files)
 for f in files:
