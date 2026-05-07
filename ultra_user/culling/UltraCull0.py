@@ -227,9 +227,9 @@ class UltraCull0():
         hichan = self.combine_spin_bins(cull_channel, nAddChans)
         #emask = np.logical_and(cnt_summary[:, cull_channel] < threshold, cnt_summary[:, cull_channel] >= 0)
         emask = self.currentMask['bin_mask'].copy()
-        for ic in range(nen):
-            emask[ic,:] = np.logical_and(hichan < self.sep_thresh[ic],
-                                         hichan >= 0)
+        for ic in range(nen): #add logical or of emask
+            emask[ic,:] = np.logical_and(np.logical_and(hichan < self.sep_thresh[ic],
+                                         hichan >= 0),emask[ic,:])
         if apply is True:
             self.add_mask(emask, opName=f"energy channel {cull_channel} counts < {self.sep_thresh}")
         result["mask"] = emask
