@@ -55,13 +55,13 @@ class UltraCull0():
 
     def goodEventMet(self, ieBin:int) -> npt.NDArray:
         ebin_range = [1, 19]
-        ii = np.nonzero(np.logical_and(
+        ii = np.nonzero(np.logical_and(np.logical_and(
             np.logical_and(
                 np.logical_and(np.logical_and(
                     np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
                                    self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
                     self.de['quality_outliers'] == 0), self.de['quality_scattering'] == 0),
-                self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]))[0]
+                self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]),self.de['event_times']>0))[0]
         if self.sensor == '45' and len(ii)>0:
             t0 = np.mean(self.de['event_times'][ii])
             try:
@@ -71,7 +71,7 @@ class UltraCull0():
                 jj = np.nonzero(np.abs(local_uv[0, :] < coslim))[0]
                 ii = ii[jj]
             except:
-                print(f"No DPS frame data for {self.repoint}")
+                print(f"No DPS frame data for {self.repoint}, t0 = {spiceTime.et_to_utc(t0)} ({t0})")
                 ii = []
         return self.de['de_event_met'][ii]
 

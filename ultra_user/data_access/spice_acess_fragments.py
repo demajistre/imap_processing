@@ -21,7 +21,7 @@ spice_types =["attitude_history","earth_attitude","ephemeris_nominal","ephemeris
               "imap_frames","leapseconds","metakernel","planetary_constants","planetary_ephemeris","pointing_attitude",
               "science_frames","spacecraft_clock","spin","repoint"]
 
-url_template = 'https://api.imap-mission.com/spice-query?type=%s&start_time=0&end_time=10000000000'
+url_template = 'https://api.imap-mission.com/spice-query?type=%s&start_time=0&end_time=100000000000'
 
 
 
@@ -38,8 +38,8 @@ for file in files:
     print(f"file {ic} of {len(files)}:{file['file_name']}")
     ic=ic+1
 
-repoint_url =  "https://api.imap-mission.com/repoint-table?start_date=20250101&end_date=20260401"
-spin_url = "https://api.imap-mission.com/spin-table?start_date=20250101&end_date=20260501"
+repoint_url =  "https://api.imap-mission.com/repoint-table?start_date=20250101&end_date=20270401"
+spin_url = "https://api.imap-mission.com/spin-table?start_date=20250101&end_date=20270501"
 files=requests.get(repoint_url).json()
 files.extend(requests.get(spin_url).json())
 ic=0
