@@ -9,15 +9,19 @@ import imap_processing.spice.time as spiceTime
 from importlib import reload
 
 # change this to something better
-spiceypy.furnsh('data/imap/spice/sclk/imap_sclk_0054.tsc')
+spiceypy.furnsh('data/imap/spice/sclk/imap_sclk_0116.tsc')
 spiceypy.furnsh('data/imap/spice/lsk/naif0012.tls')
-
-spiceypy.furnsh('data/imap/spice/spk/imap_recon_20250925_20260203_v01.bsp')
+spiceypy.furnsh('data/imap/spice/spk/imap_pred_od031_20260511_20260622_v01.bsp')
+spiceypy.furnsh('data/imap/spice/spk/imap_recon_20250925_20260511_v01.bsp')
 spiceypy.furnsh('data/imap/spice/spk/de440.bsp')
 spiceypy.furnsh('data/imap/spice/fk/imap_130.tf')
 spiceypy.furnsh('data/imap/spice/fk/imap_science_110.tf')
 spiceypy.furnsh('data/imap/spice/ck/imap_dps_2025_270_2025_354_001.ah.bc')
-spiceypy.furnsh('data/imap/spice/ck/imap_dps_2025_359_2026_037_002.ah.bc')
+spiceypy.furnsh('data/imap/spice/ck/imap_dps_2025_353_2025_354_001.ah.bc')
+spiceypy.furnsh('data/imap/spice/ck/imap_dps_2025_354_2025_356_001.ah.bc')
+spiceypy.furnsh('data/imap/spice/ck/imap_dps_2025_356_2025_358_001.ah.bc')
+spiceypy.furnsh('data/imap/spice/ck/imap_dps_2025_358_2025_360_001.ah.bc')
+spiceypy.furnsh('data/imap/spice/ck/imap_dps_2025_359_2026_131_002.ah.bc')
 
 #repoint = 47
 repoint = 70

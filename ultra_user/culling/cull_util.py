@@ -116,7 +116,8 @@ def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45
             'cullFrac': cullFrac, 'cullPackage': cullPackage}
 
 
-def cullplot(cull: dict, echans: list = None, loud=False, start_utc="2026-01-01T00", chan_lims=False):
+def cullplot(cull: dict,repointings:list = None, echans: list = None,
+             loud=False, start_utc="2026-01-01T00", chan_lims=False,rawOnly=False,saveFile=None):
     if echans is None:
         echans = [0, 1, 2, 3, 4]
     if chan_lims is False:
@@ -126,8 +127,9 @@ def cullplot(cull: dict, echans: list = None, loud=False, start_utc="2026-01-01T
     cullData = cull['cullData']
     cnt_sum = cull['cnt_sum']
     scull = cull['scull']
-    repointings = list(cullData.keys())
-    fig, axs = plt.subplots(nch)
+    if repointings is None:
+        repointings = list(cullData.keys())
+    fig, axs = plt.subplots(nch,sharex=True)
     for repoint in repointings:
         if loud:
             print(repoint)
@@ -136,7 +138,7 @@ def cullplot(cull: dict, echans: list = None, loud=False, start_utc="2026-01-01T
             cnts = cnt_sum[repoint][:, ech]
             ii = np.nonzero(cullData[repoint].currentMask['bin_mask'][ech, :])[0]
             axs[ech].plot(tDay, cnts, 'r')
-            if len(ii) > 0:
+            if len(ii) > 0 and not rawOnly:
                 color = 'g'
                 if scull[repoint]['converge'][ech] == False:
                     color = 'b'
@@ -146,6 +148,8 @@ def cullplot(cull: dict, echans: list = None, loud=False, start_utc="2026-01-01T
         axs[ech].set_ylabel(f"counts ({ech})")
     axs[nch - 1].set_xlabel(f"days since {start_utc}")
     fig.suptitle(f"Ultra {cull['cullData'][repointings[0]].sensor}")
+    if saveFile is not None:
+        plt.savefig(saveFile)
     plt.show()
 
 
