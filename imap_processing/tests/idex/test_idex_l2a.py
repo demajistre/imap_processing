@@ -2,55 +2,92 @@
 
 from unittest import mock
 
+import cdflib
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
 from scipy.stats import exponnorm
 
-from imap_processing.cdf.utils import write_cdf
+from imap_processing.cdf.utils import load_cdf, write_cdf
 from imap_processing.idex import idex_constants
-from imap_processing.idex.idex_l1b import idex_l1b
+from imap_processing.idex.idex_event_flags import ALL_FLAG_NAMES
 from imap_processing.idex.idex_l2a import (
     BaselineNoiseTime,
+    _mask_non_science_derived_estimates,
+    _mask_saturated_derived_estimates,
     analyze_peaks,
     butter_lowpass_filter,
+    calculate_ion_grid_velocity_and_mass,
     calculate_kappa,
+    calculate_mass_from_velocity,
     calculate_snr,
     calculate_velocity_and_mass,
     chi_square,
     estimate_dust_mass,
     fit_impact,
-    idex_l2a,
+    invert_rise_time_to_velocity,
+    load_calibration_files,
+    log_smooth_powerlaw,
     remove_signal_noise,
     sine_fit,
     time_to_mass,
 )
-from imap_processing.idex.idex_utils import get_idex_attrs
 
 
-@pytest.fixture
-def l2a_dataset(
-    l1b_dataset: xr.Dataset, decom_test_data_sci, ancillary_files, _download_test_data
-) -> xr.Dataset:
-    """Return a ``xarray`` dataset containing test data.
-    Returns
-    -------
-    dataset : xr.Dataset
-        A ``xarray`` dataset containing the test data
-    """
-    idex_attrs = get_idex_attrs("l1b")
-    spin_phase_angles = xr.DataArray(
-        np.random.randint(0, 360, len(l1b_dataset.epoch)),
-        dims="epoch",
-        attrs=idex_attrs.get_variable_attributes("spin_phase"),
+def test_non_science_derived_estimates_are_nan() -> None:
+    """Only Science Events retain derived velocity and mass estimates."""
+    estimates = {
+        f"{waveform}_{estimate}": xr.DataArray([1.0, 2.0], dims="epoch")
+        for waveform in ("target_low", "target_high", "ion_grid")
+        for estimate in ("velocity_estimate", "dust_mass_estimate")
+    }
+    dataset = xr.Dataset(
+        estimates,
+        coords={"epoch": [0, 1]},
     )
-    with mock.patch(
-        "imap_processing.idex.idex_l1b.get_spice_data",
-        return_value={"spin_phase": spin_phase_angles},
-    ):
-        dataset = idex_l2a(idex_l1b(decom_test_data_sci, "sci-1week"), ancillary_files)
-    return dataset
+    dataset["science_event_flag"] = xr.DataArray([1, 0], dims="epoch")
+
+    _mask_non_science_derived_estimates(dataset)
+
+    for estimate in estimates:
+        np.testing.assert_array_equal(dataset[estimate].values, [1.0, np.nan])
+
+
+def test_saturated_waveform_derived_values_are_nan() -> None:
+    """Saturation masks fitted charge, velocity, and mass estimates."""
+    data = {
+        f"{waveform}_{estimate}": xr.DataArray([1.0, 2.0], dims="epoch")
+        for waveform in ("target_low", "target_high", "ion_grid")
+        for estimate in ("impact_charge", "velocity_estimate", "dust_mass_estimate")
+    }
+    dataset = xr.Dataset(data, coords={"epoch": [0, 1]})
+    for waveform in ("target_low", "target_high", "ion_grid"):
+        dataset[f"{waveform}_saturation_flag"] = xr.DataArray([0, 1], dims="epoch")
+
+    _mask_saturated_derived_estimates(dataset)
+
+    for waveform in ("target_low", "target_high", "ion_grid"):
+        for estimate in ("impact_charge", "velocity_estimate", "dust_mass_estimate"):
+            np.testing.assert_array_equal(
+                dataset[f"{waveform}_{estimate}"].values, [1.0, np.nan]
+            )
+
+
+def test_saturated_derived_values_require_all_saturation_flags() -> None:
+    """Missing saturation metadata raises an informative error."""
+    dataset = xr.Dataset(
+        {
+            "target_low_impact_charge": xr.DataArray([1.0], dims="epoch"),
+            "target_low_velocity_estimate": xr.DataArray([1.0], dims="epoch"),
+            "target_low_dust_mass_estimate": xr.DataArray([1.0], dims="epoch"),
+            "target_low_saturation_flag": xr.DataArray([0], dims="epoch"),
+        },
+        coords={"epoch": [0]},
+    )
+
+    with pytest.raises(KeyError, match="target_high_saturation_flag"):
+        _mask_saturated_derived_estimates(dataset)
 
 
 def mock_microphonics_noise(time: np.ndarray) -> np.ndarray:
@@ -66,8 +103,15 @@ def mock_microphonics_noise(time: np.ndarray) -> np.ndarray:
     return combined_sig
 
 
+def _write_calibration_csv(path, values):
+    """Write a one-row calibration CSV with the ancillary-file structure."""
+    header = "A,a1,a2,a3,v_b,v_c,k,sigma,delta\n"
+    row = ",".join(str(value) for value in values) + "\n"
+    path.write_text(header + row)
+
+
 @pytest.mark.external_test_data
-def test_l2a_logical_source_and_cdf(l2a_dataset: xr.Dataset):
+def test_l2a_logical_source_and_cdf(l2a_dataset: xr.Dataset, l1b_dataset: xr.Dataset):
     """Tests that the ``idex_l2a`` function generates datasets
     with the expected logical source.
 
@@ -76,13 +120,88 @@ def test_l2a_logical_source_and_cdf(l2a_dataset: xr.Dataset):
     l2a_dataset : xr.Dataset
         A ``xarray`` dataset containing the test data
     """
-    expected_src = "imap_idex_l2a_sci-1week"
+    expected_src = "imap_idex_l2a_sci-10days"
     assert l2a_dataset.attrs["Logical_source"] == expected_src
     # Verify the CDF file can be created with no errors.
     l2a_dataset.attrs["Data_version"] = "999"
     file_name = write_cdf(l2a_dataset)
     assert file_name.exists()
-    assert file_name.name == "imap_idex_l2a_sci-1week_20231218_v999.cdf"
+    assert file_name.name == "imap_idex_l2a_sci-10days_20231218_v999.cdf"
+    ds = load_cdf(file_name)
+    copied_context_vars = [
+        "ephemeris_position_x",
+        "ephemeris_position_y",
+        "ephemeris_position_z",
+        "ephemeris_velocity_x",
+        "ephemeris_velocity_y",
+        "ephemeris_velocity_z",
+        "longitude",
+        "latitude",
+        "solar_longitude",
+        "spin_phase",
+    ]
+    for variable_name in copied_context_vars:
+        assert variable_name in l2a_dataset.variables
+        np.testing.assert_array_equal(
+            l2a_dataset[variable_name].values,
+            l1b_dataset[variable_name].values,
+        )
+
+    for flag_name in ALL_FLAG_NAMES:
+        assert flag_name in l2a_dataset
+        np.testing.assert_array_equal(
+            l2a_dataset[flag_name].values, l1b_dataset[flag_name].values
+        )
+
+    with cdflib.CDF(file_name) as cdf_file:
+        assert cdf_file.varattsget("mass_index")["CATDESC"] == (
+            "Index variable for mass-resolved TOF peak-fit products."
+        )
+        assert cdf_file.varattsget("mass_index")["UNITS"] == " "
+        assert cdf_file.varattsget("mass_index")["VAR_NOTES"] == (
+            "Associated labels: mass_labels."
+        )
+        assert cdf_file.varattsget("tof_peak_kappa")["CATDESC"] == (
+            "Mass-scale alignment metric for the TOF peak solution."
+        )
+        assert cdf_file.varattsget("tof_peak_kappa")["FIELDNAM"] == "TOF Peak Kappa"
+        assert cdf_file.varattsget("tof_peak_kappa")["UNITS"] == " "
+        assert cdf_file.varattsget("tof_snr")["CATDESC"] == (
+            "Signal-to-noise ratio of the TOF High waveform."
+        )
+        assert cdf_file.varattsget("tof_snr")["UNITS"] == " "
+        assert cdf_file.varattsget("tof_snr")["VAR_NOTES"] == (
+            "Computed relative to a pre-impact baseline window."
+        )
+        assert cdf_file.varattsget("mass_scale")["CATDESC"] == (
+            "Preliminary time-to-mass scale for the TOF waveform."
+        )
+        assert cdf_file.varattsget("mass_scale")["UNITS"] == "amu"
+        assert cdf_file.varattsget("mass")["VAR_TYPE"] == "support_data"
+        assert cdf_file.varattsget("mass")["DISPLAY_TYPE"] == "no_plot"
+        assert cdf_file.varattsget("mass")["CATDESC"] == (
+            "Mass-scale output retained for compatibility with the L2A product "
+            "structure."
+        )
+        assert cdf_file.varattsget("mass")["FIELDNAM"] == "Mass Scale Alias"
+        assert cdf_file.varattsget("mass")["UNITS"] == "amu"
+        assert cdf_file.varattsget("mass")["VAR_NOTES"] == (
+            "Mass-scale output retained for compatibility with the current L2A "
+            "product structure. This variable is not intended to be the primary "
+            "science-facing mass-scale output."
+        )
+        assert cdf_file.varattsget("ephemeris_position_x")["FORMAT"] == "F16.6"
+        assert (
+            cdf_file.varattsget("target_high_reduced_chi_squared")["CATDESC"]
+            == "Reduced chi-square value for the Target High waveform fit."
+        )
+        for variable_name in copied_context_vars:
+            assert variable_name in cdf_file.cdf_info().zVariables
+
+    spin_phase = ds["spin_phase"].values
+    spin_phase_attrs = ds["spin_phase"].attrs
+    assert spin_phase.dtype == np.float64
+    assert np.isclose(spin_phase_attrs["FILLVAL"], np.float64(-1.0e31))
 
     expected_vars = [
         "tof_snr",
@@ -124,6 +243,22 @@ def test_l2a_logical_source_and_cdf(l2a_dataset: xr.Dataset):
     for var in l2a_dataset.data_vars:
         assert "DICT_KEY" in l2a_dataset[var].attrs, (
             f"Variable {var} is missing the DICT_KEY attribute for SPASE metadata."
+        )
+
+    # TODO: remove this NAN block when fitting logic is applied
+    expected_nan_vars = [
+        "tof_peak_area_under_fit",
+        "tof_peak_chi_square",
+        "tof_peak_fit_parameters",
+        "tof_peak_kappa",
+        "tof_peak_reduced_chi_square",
+        "tof_snr",
+        "mass",
+        "mass_scale",
+    ]
+    for var in expected_nan_vars:
+        assert np.isnan(l2a_dataset[var].data).all(), (
+            f"Variable {var} should be fully NaN for the temporary L2A patch."
         )
 
 
@@ -275,19 +410,198 @@ def test_analyze_peaks_warning(caplog):
     np.testing.assert_array_equal(area_under_curve, np.zeros(area_under_curve.shape))
 
 
+def test_load_calibration_files_returns_expected_t_rise_params(tmp_path):
+    """Tests that t-rise ancillary values are loaded into t_rise_params."""
+    expected_t_rise_params = np.array([1.27, -0.2, -2.1, -0.37, 5.3, 13.3, 13.3, 0.28])
+    yield_values = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40, 1.47])
+
+    t_rise_path = tmp_path / "t_rise.csv"
+    yield_path = tmp_path / "yield.csv"
+    _write_calibration_csv(t_rise_path, expected_t_rise_params)
+    _write_calibration_csv(yield_path, yield_values)
+
+    t_rise_params, _yield_params = load_calibration_files(
+        {
+            "l2a-calibration-curve-t-rise": t_rise_path,
+            "l2a-calibration-curve-yield-params": yield_path,
+        }
+    )
+
+    np.testing.assert_allclose(t_rise_params, expected_t_rise_params)
+
+
+def test_load_calibration_files_returns_expected_yield_params(tmp_path):
+    """Tests that yield ancillary values are loaded into yield_params."""
+    t_rise_values = np.array([1.27, -0.2, -2.1, -0.37, 5.3, 13.3, 13.3, 0.28, 1.33])
+    expected_yield_params = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40])
+
+    t_rise_path = tmp_path / "t_rise.csv"
+    yield_path = tmp_path / "yield.csv"
+    _write_calibration_csv(t_rise_path, t_rise_values)
+    _write_calibration_csv(yield_path, expected_yield_params)
+
+    _t_rise_params, yield_params = load_calibration_files(
+        {
+            "l2a-calibration-curve-t-rise": t_rise_path,
+            "l2a-calibration-curve-yield-params": yield_path,
+        }
+    )
+
+    np.testing.assert_allclose(yield_params, expected_yield_params)
+
+
+def test_log_smooth_powerlaw_yield_curve_at_10_km_s():
+    """Tests that the yield calibration returns the expected value at 10 km/s."""
+    yield_params = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40])
+
+    log_yield = log_smooth_powerlaw(np.log10(10.0), yield_params[0], yield_params[1:])
+    yield_value = 10**log_yield
+
+    assert yield_value == pytest.approx(755.0, rel=1e-3)
+
+
+def test_invert_rise_time_to_velocity_at_10_km_s():
+    """Tests that the rise-time calibration can be inverted back to 10 km/s."""
+    t_rise_params = np.array([1.27, -0.2, -2.1, -0.37, 5.3, 13.3, 13.3, 0.28])
+    expected_velocity = 10.0
+    t_rise = 10 ** log_smooth_powerlaw(
+        np.log10(expected_velocity), float(t_rise_params[0]), t_rise_params[1:]
+    )
+
+    velocity_estimate = invert_rise_time_to_velocity(t_rise, t_rise_params)
+
+    assert velocity_estimate == pytest.approx(expected_velocity, rel=1e-12)
+
+
+def test_invert_rise_time_to_velocity_invalid_t_rise_returns_nan():
+    """Tests that non-positive or non-finite rise times return NaN."""
+    t_rise_params = np.array([1.27, -0.2, -2.1, -0.37, 5.3, 13.3, 13.3, 0.28])
+
+    assert np.isnan(invert_rise_time_to_velocity(np.nan, t_rise_params))
+    assert np.isnan(invert_rise_time_to_velocity(0.0, t_rise_params))
+
+
+def test_calculate_velocity_and_mass_at_10_km_s():
+    """Tests mass estimation using a mocked 10 km/s velocity solution."""
+    t_rise_params = np.array([1.27, -0.2, -2.1, -0.37, 5.3, 13.3, 13.3, 0.28])
+    yield_params = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40])
+    sig_amp_pc = 10.0
+
+    # This test intentionally bypasses the t_rise -> velocity inversion.
+    # The t_rise calibration path is currently under review and will be
+    # covered by a dedicated follow-up test once that behavior is finalized.
+    mocked_root = mock.Mock()
+    mocked_root.root = 1.0  # 10**1.0 == 10 km/s
+
+    with mock.patch(
+        "imap_processing.idex.idex_l2a.root_scalar", return_value=mocked_root
+    ):
+        velocity_estimate, mass_estimate = calculate_velocity_and_mass(
+            sig_amp_pc, 2.0, t_rise_params, yield_params
+        )
+
+    expected_yield = 755.0090524738858
+    expected_mass_kg = sig_amp_pc * 1e-12 / expected_yield
+
+    assert velocity_estimate == pytest.approx(10.0, rel=1e-12)
+    assert mass_estimate == pytest.approx(expected_mass_kg, rel=1e-12)
+
+
+def test_ion_grid_velocity_uses_unsaturated_high_target_first():
+    """Ion Grid velocity uses the highest-gain unsaturated target charge."""
+    yield_params = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40])
+    velocity, mass = calculate_ion_grid_velocity_and_mass(
+        0.02, 1.0, 0.5, 0, 0, 0, yield_params
+    )
+
+    assert velocity == pytest.approx(55.0 * 2.0**-3.2 + 1.5)
+    assert mass == pytest.approx(
+        calculate_mass_from_velocity(1.0, velocity, yield_params)
+    )
+
+
+def test_ion_grid_velocity_falls_back_to_low_target_when_high_saturates():
+    """Ion Grid velocity falls back to Target Low when Target High saturates."""
+    yield_params = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40])
+    velocity, _ = calculate_ion_grid_velocity_and_mass(
+        0.01, 1.0, 0.5, 1, 0, 0, yield_params
+    )
+
+    assert velocity == pytest.approx(55.0 * 2.0**-3.2 + 1.5)
+
+
+@pytest.mark.parametrize("target_high_saturated", [0, 1])
+@pytest.mark.parametrize("charge_ratio", [0.009999, 1.000001])
+def test_ion_grid_velocity_outside_range_is_nan(target_high_saturated, charge_ratio):
+    """Charge ratios outside the calibrated range invalidate IG estimates."""
+    yield_params = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40])
+    velocity, mass = calculate_ion_grid_velocity_and_mass(
+        charge_ratio, 1.0, 1.0, target_high_saturated, 0, 0, yield_params
+    )
+
+    assert np.isnan(velocity)
+    assert np.isnan(mass)
+
+
+@pytest.mark.parametrize("target_high_saturated", [0, 1])
+@pytest.mark.parametrize("charge_ratio", [0.01, 0.02, 1.0])
+def test_ion_grid_velocity_range_is_inclusive(target_high_saturated, charge_ratio):
+    """Inclusive fractional-ratio bounds use percentage in the velocity fit."""
+    yield_params = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40])
+    velocity, mass = calculate_ion_grid_velocity_and_mass(
+        charge_ratio, 1.0, 1.0, target_high_saturated, 0, 0, yield_params
+    )
+
+    expected_velocity = 55.0 * (100.0 * charge_ratio) ** -3.2 + 1.5
+    assert velocity == pytest.approx(expected_velocity)
+    assert mass == pytest.approx(
+        calculate_mass_from_velocity(1.0, expected_velocity, yield_params),
+        rel=1e-12,
+        abs=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "target_high_saturated,target_low_saturated,ion_grid_saturated",
+    [(1, 1, 0), (0, 0, 1)],
+)
+def test_ion_grid_velocity_is_nan_when_required_channel_is_saturated(
+    target_high_saturated, target_low_saturated, ion_grid_saturated
+):
+    """Saturation prevents publishing Ion Grid velocity and mass."""
+    yield_params = np.array([0.06, 2.8, 5.9, 4.1, 13.0, 22.7, 8.2, 0.40])
+    velocity, mass = calculate_ion_grid_velocity_and_mass(
+        1.0,
+        1.0,
+        0.5,
+        target_high_saturated,
+        target_low_saturated,
+        ion_grid_saturated,
+        yield_params,
+    )
+
+    assert np.isnan(velocity)
+    assert np.isnan(mass)
+
+
 @pytest.mark.external_test_data
 def test_velocity_and_mass_estimate(ancillary_files):
     """Tests that the velocity and mass estimate function."""
     # Load calibration coefficients from ancillary files
     t_rise_params = pd.read_csv(
-        ancillary_files["l2a-calibration-curve-yield-params"], skiprows=1, header=None
-    ).values.flatten()[:8]
-    yield_params = pd.read_csv(
         ancillary_files["l2a-calibration-curve-t-rise"], skiprows=1, header=None
     ).values.flatten()[:8]
-    estimates = calculate_velocity_and_mass(10, 2, t_rise_params, yield_params)
+    yield_params = pd.read_csv(
+        ancillary_files["l2a-calibration-curve-yield-params"], skiprows=1, header=None
+    ).values.flatten()[:8]
+    expected_velocity = 5.0
+    t_rise = 10 ** log_smooth_powerlaw(
+        np.log10(expected_velocity), float(t_rise_params[0]), t_rise_params[1:]
+    )
+    estimates = calculate_velocity_and_mass(10, t_rise, t_rise_params, yield_params)
     assert len(estimates) == 2
     assert not np.any(np.isnan(estimates))
+    assert estimates[0] == pytest.approx(expected_velocity, rel=1e-12)
 
 
 def test_analyze_peaks_perfect_fits():
@@ -364,6 +678,146 @@ def test_estimate_dust_mass_no_noise_removal():
     assert chisqr <= 1e-12
 
     assert np.allclose(result, signal)
+
+
+def test_estimate_dust_mass_logs_baseline_warning(caplog):
+    """
+    Test that estimate_dust_mass() logs a warning if no baseline is found.
+    """
+    time = xr.DataArray(np.linspace(-60, 60, 16))
+    signal = xr.DataArray(np.linspace(0, 1, 16))
+    original_any = np.any
+
+    def fake_any(arr):
+        fake_any.calls += 1
+        if fake_any.calls == 1:
+            return False
+        return original_any(arr)
+
+    fake_any.calls = 0
+
+    with (
+        mock.patch("imap_processing.idex.idex_l2a.np.any", side_effect=fake_any),
+        mock.patch(
+            "imap_processing.idex.idex_l2a.curve_fit",
+            return_value=(np.array([0.0, 0.0, 1.0, 0.371, 37.1]), None),
+        ),
+        caplog.at_level("WARNING"),
+    ):
+        estimate_dust_mass(time, signal)
+
+    assert any(
+        "Unable to find baseline noise" in message
+        for message in caplog.text.splitlines()
+    )
+
+
+def test_estimate_dust_mass_remove_noise_logs_debug(caplog):
+    """
+    Test that estimate_dust_mass() logs that remove_noise is ignored.
+    """
+    time = xr.DataArray(np.linspace(-60, 60, 64))
+    signal = xr.DataArray(
+        fit_impact(
+            time.data,
+            time_of_impact=0.0,
+            constant_offset=1.0,
+            amplitude=10.0,
+            rise_time=0.371,
+            discharge_time=0.371,
+        )
+    )
+
+    with caplog.at_level("DEBUG"):
+        estimate_dust_mass(time, signal, remove_noise=True)
+
+    assert any(
+        "remove_noise is ignored for this fit path" in message
+        for message in caplog.text.splitlines()
+    )
+
+
+def test_estimate_dust_mass_nonfinite_signal_fallbacks():
+    """
+    Test fallback handling when the input signal is entirely non-finite.
+    """
+    time = xr.DataArray(np.linspace(-60, 60, 16))
+    signal = xr.DataArray(np.full(16, np.nan))
+
+    with mock.patch(
+        "imap_processing.idex.idex_l2a.curve_fit",
+        return_value=(np.array([0.0, 0.0, 1.0, 0.371, 37.1]), None),
+    ) as mocked_curve_fit:
+        estimate_dust_mass(time, signal)
+
+    assert np.isnan(mocked_curve_fit.call_args.kwargs["p0"][2])
+
+
+def test_estimate_dust_mass_non_ion_grid_negative_amplitude_fallback():
+    """
+    Test the non-Ion_Grid negative-amplitude fallback path.
+    """
+    time = xr.DataArray(np.linspace(-60, 60, 16))
+    signal = xr.DataArray(np.full(16, -2.0))
+
+    with mock.patch(
+        "imap_processing.idex.idex_l2a.curve_fit",
+        return_value=(np.array([0.0, -2.0, -2.0, 0.371, 37.1]), None),
+    ) as mocked_curve_fit:
+        estimate_dust_mass(time, signal)
+
+    assert mocked_curve_fit.call_args.kwargs["p0"][2] == -2.0
+
+
+def test_estimate_dust_mass_ion_grid_negative_amplitude_bounds():
+    """
+    Test that Ion Grid fits allow negative amplitudes.
+    """
+    time = xr.DataArray(np.linspace(-60, 60, 64))
+    signal = xr.DataArray(
+        fit_impact(
+            time.data,
+            time_of_impact=0.0,
+            constant_offset=0.0,
+            amplitude=-5.0,
+            rise_time=0.371,
+            discharge_time=0.371,
+        )
+    )
+
+    with mock.patch(
+        "imap_processing.idex.idex_l2a.curve_fit",
+        return_value=(np.array([0.0, 0.0, -5.0, 0.371, 37.1]), None),
+    ) as mocked_curve_fit:
+        estimate_dust_mass(time, signal, waveform_name="Ion_Grid")
+
+    bounds = mocked_curve_fit.call_args.kwargs["bounds"]
+    assert bounds[0][2] == -np.inf
+    assert bounds[1][2] < 0.0
+
+
+def test_estimate_dust_mass_curve_fit_failure_returns_nans(caplog):
+    """
+    Test that estimate_dust_mass() returns NaNs if the fit fails.
+    """
+    time = xr.DataArray(np.linspace(-60, 60, 16))
+    signal = xr.DataArray(np.linspace(0, 1, 16))
+
+    with (
+        mock.patch(
+            "imap_processing.idex.idex_l2a.curve_fit",
+            side_effect=RuntimeError("fit failed"),
+        ),
+        caplog.at_level("WARNING"),
+    ):
+        param, sig_amp, chisqr, redchi, result = estimate_dust_mass(time, signal)
+
+    assert any("Failed to fit curve" in message for message in caplog.text.splitlines())
+    assert np.all(np.isnan(param))
+    assert np.isnan(sig_amp)
+    assert np.isnan(chisqr)
+    assert np.isnan(redchi)
+    assert np.all(np.isnan(result))
 
 
 def test_lowpass_filter():

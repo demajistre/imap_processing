@@ -13,11 +13,50 @@ PUI = PickUp Ion
 ESA = ElectroStatic Analyzer
 """
 
+from enum import IntEnum
 from typing import Any
 
 import numpy as np
 
-from imap_processing.codice.utils import CODICEAPID
+
+class CODICEAPID(IntEnum):
+    """Create ENUM for CoDICE APIDs."""
+
+    COD_AUT = 1120
+    COD_BOOT_HK = 1121
+    COD_BOOT_MEMDMP = 1122
+    COD_COUNTS_COMMON = 1135
+    COD_NHK = 1136
+    COD_EVTMSG = 1137
+    COD_MEMDMP = 1138
+    COD_SHK = 1139
+    COD_RTS = 1141
+    COD_DIAG_CDHFPGA = 1144
+    COD_DIAG_SNSR_HV = 1145
+    COD_DIAG_OPTC_HV = 1146
+    COD_DIAG_APDFPGA = 1147
+    COD_DIAG_SSDFPGA = 1148
+    COD_DIAG_FSW = 1149
+    COD_DIAG_SYSVARS = 1150
+    COD_LO_IAL = 1152
+    COD_LO_PHA = 1153
+    COD_LO_SW_PRIORITY_COUNTS = 1155
+    COD_LO_SW_SPECIES_COUNTS = 1156
+    COD_LO_NSW_SPECIES_COUNTS = 1157
+    COD_LO_SW_ANGULAR_COUNTS = 1158
+    COD_LO_NSW_ANGULAR_COUNTS = 1159
+    COD_LO_NSW_PRIORITY_COUNTS = 1160
+    COD_LO_INST_COUNTS_AGGREGATED = 1161
+    COD_LO_INST_COUNTS_SINGLES = 1162
+    COD_HI_IAL = 1168
+    COD_HI_PHA = 1169
+    COD_HI_INST_COUNTS_AGGREGATED = 1170
+    COD_HI_INST_COUNTS_SINGLES = 1171
+    COD_HI_OMNI_SPECIES_COUNTS = 1172
+    COD_HI_SECT_SPECIES_COUNTS = 1173
+    COD_HI_INST_COUNTS_PRIORITIES = 1174
+    COD_CSTOL_CONFIG = 2457
+
 
 # -------L1A Constants-------
 # Numerical constants
@@ -93,10 +132,10 @@ HI_IALIRT_ELEVATION_ANGLE = np.array(
 )
 HI_IALIRT_REF_SPIN_ANGLE = np.array(
     [
-        286.85,
-        264.55,
-        343.16,
-        5.44,
+        196.85,
+        174.55,
+        253.16,
+        275.44,
     ],
     dtype=float,
 )
@@ -846,20 +885,11 @@ L1B_DATA_PRODUCT_CONFIGURATIONS: dict[str, dict] = {
     "lo-counters-singles": {
         "num_spin_sectors": 2,
     },
-    "lo-nsw-angular": {
-        "num_spin_sectors": 1,
-    },
-    "lo-sw-angular": {
-        "num_spin_sectors": 1,
-    },
     "lo-nsw-priority": {
         "num_spin_sectors": 1,
     },
     "lo-sw-priority": {
         "num_spin_sectors": 1,
-    },
-    "lo-nsw-species": {
-        "num_spin_sectors": 12,
     },
     "lo-sw-species": {
         "num_spin_sectors": 12,
@@ -890,16 +920,6 @@ LO_SW_PICKUP_ION_SPECIES_VARIABLE_NAMES = [
     "heplus",
     "cnoplus",
 ]
-LO_NSW_SPECIES_VARIABLE_NAMES = [
-    "hplus",
-    "heplusplus",
-    "c",
-    "o",
-    "ne_si_mg",
-    "fe",
-    "heplus",
-    "cnoplus",
-]
 HI_OMNI_VARIABLE_NAMES = ["h", "he3", "he4", "c", "o", "ne_mg_si", "fe", "uh", "junk"]
 HI_SECTORED_VARIABLE_NAMES = ["h", "he3he4", "cno", "fe"]
 HI_PRIORITY_VARIABLE_NAMES = [
@@ -919,18 +939,18 @@ IALIRT_HI_NUMBER_OF_SSD_PER_GROUP = 3.0
 
 L2_HI_SECTORED_ANGLE = np.array(
     [
-        285.00,
-        244.11,
-        228.69,
-        225.00,
-        228.69,
-        244.11,
-        285.00,
-        325.89,
-        341.31,
-        345.00,
-        341.31,
-        325.89,
+        195.00,
+        154.11,
+        138.69,
+        135.00,
+        138.69,
+        154.11,
+        195.00,
+        235.89,
+        251.31,
+        255.00,
+        251.31,
+        235.89,
     ]
 )
 
@@ -1014,22 +1034,22 @@ GAIN_ID_TO_STR = {1: "LG", 2: "MG", 3: "HG"}
 # The index corresponds to the SSD ID. Missing SSD IDs are represented with np.nan.
 SSD_ID_TO_SPIN_ANGLE = np.array(
     [
-        277.50,
-        236.61,
+        187.50,
+        146.61,
         np.nan,
-        221.19,
-        217.5,
-        221.19,
+        131.19,
+        127.50,
+        131.19,
         np.nan,
-        236.61,
-        277.50,
-        318.39,
+        146.61,
+        187.50,
+        228.39,
         np.nan,
-        333.81,
-        337.50,
-        333.81,
+        243.81,
+        247.50,
+        243.81,
         np.nan,
-        318.39,
+        228.39,
     ]
 )
 

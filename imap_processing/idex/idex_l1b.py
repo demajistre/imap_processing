@@ -26,9 +26,12 @@ from xarray import DataArray
 from imap_processing import imap_module_directory
 from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
 from imap_processing.idex.idex_constants import (
+    DT_BLOCK,
     IDEX_EVENT_REFERENCE_FRAME,
+    NS_TO_S,
     ConversionFactors,
 )
+from imap_processing.idex.idex_event_flags import ALL_FLAG_NAMES
 from imap_processing.idex.idex_utils import get_idex_attrs, setup_dataset
 from imap_processing.spice.geometry import (
     SpiceBody,
@@ -38,8 +41,11 @@ from imap_processing.spice.geometry import (
     instrument_pointing,
     solar_longitude,
 )
-from imap_processing.spice.spin import get_spacecraft_spin_phase, get_spin_angle
-from imap_processing.spice.time import ttj2000ns_to_et
+from imap_processing.spice.spin import (
+    get_instrument_spin_phase,
+    get_spin_angle,
+)
+from imap_processing.spice.time import et_to_met, ttj2000ns_to_et
 from imap_processing.utils import convert_raw_to_eu
 
 logger = logging.getLogger(__name__)
@@ -49,7 +55,7 @@ class EventMessage(Enum):
     """Enum class for event messages."""
 
     PULSER_ON = "SEQ success (len=0x0580, opCodeLCDictionary(enstim))"
-    PULSER_OFF = "SEQ success (len=0x0580, opCodeLCDictionary(susprel))"
+    PULSER_OFF = "UPK stim pulser operation completed, , PulserSel=0x00000007"
     SCIENCE_ON = (
         "SCI state change: sciState16Dictionary(ACQSETUP) ==> sciState16Dictionary(ACQ)"
     )
@@ -126,17 +132,17 @@ def idex_l1b(l1a_dataset: xr.Dataset, descriptor: str) -> xr.Dataset | None:
     l1a_dataset : xarray.Dataset
         IDEX L1a dataset to process.
     descriptor : str
-        Descriptor to determine the type of l1b processing to perform. E.g. "sci-1week"
-        or "msg".
+        Descriptor to determine the type of l1b processing to perform. E.g. "sci-10days"
+        or "msg-10days".
 
     Returns
     -------
     l1b_dataset : xarray.Dataset
         The``xarray`` dataset containing the processed data and supporting metadata.
     """
-    if descriptor.startswith("sci"):
+    if descriptor.startswith("sci-10days"):
         return idex_l1b_science(l1a_dataset)
-    elif descriptor.startswith("msg"):
+    elif descriptor.startswith("msg-10days"):
         return idex_l1b_msg(l1a_dataset)
     else:
         raise ValueError(f"Unsupported descriptor: {descriptor}")
@@ -165,7 +171,7 @@ def idex_l1b_msg(l1a_dataset: xr.Dataset) -> xr.Dataset | None:
     idex_attrs = get_idex_attrs("l1b")
     # set up a dataset with only epoch.
     l1b_dataset = setup_dataset(l1a_dataset, [], idex_attrs, data_vars=None)
-    l1b_dataset.attrs = idex_attrs.get_global_attributes("imap_idex_l1b_msg")
+    l1b_dataset.attrs = idex_attrs.get_global_attributes("imap_idex_l1b_msg-10days")
     # Compute science_on and pulser_on variables based on the event message. The
     # "science_on" variable indicates when the science data collection is turned on or
     # off and the "pulser_on" variable indicates when the pulser is turned on or off.
@@ -177,17 +183,22 @@ def idex_l1b_msg(l1a_dataset: xr.Dataset) -> xr.Dataset | None:
     # Set science_on to 1 when science is on and 0 when it is off. 255 otherwise.
     science_on = np.where(l1a_messages == EventMessage.SCIENCE_ON.value, 1, 255)
     science_on[l1a_messages == EventMessage.SCIENCE_OFF.value] = 0
-    # Find indices where there are consecutive PULSER_ON followed by PULSER_OFF
-    # messages. These are the only cases where we should set pulser_on to 1 and 0.
-    # Compare the messages by shifting the pulser off messages back by one and looking
-    # for matching overlaps.
-    consecutive_pulser_on_off = np.where(
-        (l1a_messages[:-1] == EventMessage.PULSER_ON.value)
-        & (l1a_messages[1:] == EventMessage.PULSER_OFF.value)
-    )[0]
+    # Find indices where PULSER_ON is followed by PULSER_OFF within 5 seconds.
+    # These are the only cases where we should set pulser_on to 1 and 0.
+    pulser_on_events = np.nonzero(l1a_messages == EventMessage.PULSER_ON.value)[0]
     pulser_on = np.full(len(l1a_messages), 255)  # initialize with 255 (unknown)
-    pulser_on[consecutive_pulser_on_off] = 1
-    pulser_on[consecutive_pulser_on_off + 1] = 0
+    epochs = l1a_dataset.epoch.values
+    # Loop through each pulser on event and check if there is a pulser off
+    # within 5 seconds.
+    for on in pulser_on_events:
+        on_epoch = epochs[on]
+        within_5s = (epochs >= on_epoch) & (epochs <= on_epoch + 5 / NS_TO_S)
+        off = np.nonzero(within_5s & (l1a_messages == EventMessage.PULSER_OFF.value))[0]
+        if off.size:
+            # If an on was followed by an off, set the values.
+            pulser_on[on] = 1
+            pulser_on[off[0]] = 0  # Use the first off event after an on.
+
     l1b_dataset["pulser_on"] = xr.DataArray(
         data=pulser_on,
         dims="epoch",
@@ -245,6 +256,8 @@ def idex_l1b_science(l1a_dataset: xr.Dataset) -> xr.Dataset:
         l1a_dataset, var_information_df, idex_attrs
     )
 
+    dead_time = get_event_dead_time(l1a_dataset, idex_attrs)
+
     waveforms_converted = convert_waveforms(l1a_dataset, idex_attrs)
 
     # Get spice data and save them as xr.DataArrays in the output. Spice data is not
@@ -255,14 +268,21 @@ def idex_l1b_science(l1a_dataset: xr.Dataset) -> xr.Dataset:
     trigger_origin = get_trigger_origin(
         l1a_dataset["idx__txhdrtrigid"].data, idex_attrs
     )
+    event_flags = {
+        name: l1a_dataset[name].copy() for name in ALL_FLAG_NAMES if name in l1a_dataset
+    }
+    for name, data_array in event_flags.items():
+        data_array.attrs = idex_attrs.get_variable_attributes(name)
     # Create l1b Dataset
     prefixes = ["shcoarse", "shfine", "time_high_sample", "time_low_sample", "aid"]
     data_vars = (
         processed_vars
+        | dead_time
         | waveforms_converted
         | trigger_settings
         | spice_data
         | trigger_origin
+        | event_flags
     )
     l1b_dataset = setup_dataset(l1a_dataset, prefixes, idex_attrs, data_vars)
     l1b_dataset.attrs = idex_attrs.get_global_attributes("imap_idex_l1b_sci")
@@ -331,7 +351,7 @@ def convert_waveforms(
     l1a_dataset: xr.Dataset, idex_attrs: ImapCdfAttributes
 ) -> dict[str, xr.DataArray]:
     """
-    Apply transformation from raw DN to picocoulombs (pC) for each of the six waveforms.
+    Apply the channel-specific transformation from raw DN to engineering units.
 
     Parameters
     ----------
@@ -344,17 +364,18 @@ def convert_waveforms(
     -------
     waveforms_converted : dict
         A dictionary where the keys are the waveform array names and the values are
-        xr.DataArrays representing the waveforms transformed into picocoulombs.
+        xr.DataArrays representing the converted waveforms. TOF channels are in mA;
+        target and ion-grid channels are in pC.
     """
-    waveforms_pc = {}
+    waveforms_converted = {}
 
     for var in ConversionFactors:
-        waveforms_pc[var.name] = l1a_dataset[var.name] * var.value
-        waveforms_pc[var.name].attrs = idex_attrs.get_variable_attributes(
+        waveforms_converted[var.name] = l1a_dataset[var.name] * var.value
+        waveforms_converted[var.name].attrs = idex_attrs.get_variable_attributes(
             var.name.lower()
         )
 
-    return waveforms_pc
+    return waveforms_converted
 
 
 def get_trigger_mode_and_level(
@@ -439,6 +460,13 @@ def get_trigger_mode_and_level(
             vectorize=True,
             output_dtypes=[object, float],
         )
+        # Allocate the object array explicitly.  Otherwise pandas 3 string
+        # inference converts the no-trigger None values to NaN.
+        mode_values = np.asarray(mode_array.data, dtype=object)
+        mode_values[pd.isna(mode_values)] = None
+        object_mode_array = xr.full_like(modes, None, dtype=object)
+        object_mode_array.data[:] = mode_values
+        mode_array = object_mode_array
         # There should be an array of modes and threshold levels for each channel.
         # write each of them out as separate variables because there may be
         # multiple channels that can trigger an event. The trigger origin variable
@@ -498,6 +526,57 @@ def get_trigger_origin(
     }
 
 
+def get_event_dead_time(
+    l1a_dataset: xr.Dataset,
+    idex_attrs: ImapCdfAttributes,
+) -> dict[str, xr.DataArray]:
+    """
+    Compute event dead time (in seconds) from packed txhdrblocks.
+
+    The dead time is encoded via two bitfields:
+    - dead_blocks_base  (6 bits)
+    - dead_blocks_shift (4 bits)
+
+    Dead time is computed as:
+        dead_time = dead_blocks_base * 2**dead_blocks_shift * DT_BLOCK
+
+    where DT_BLOCK is the duration of a single low-rate block.
+
+    Parameters
+    ----------
+    l1a_dataset : xarray.Dataset
+        IDEX L1A dataset containing the packed `idx__txhdrblocks` variable.
+    idex_attrs : ImapCdfAttributes
+        CDF attribute manager object.
+
+    Returns
+    -------
+    dict[str, xarray.DataArray]
+        Dictionary containing the `dead_time` DataArray (seconds).
+    """
+    txhdrblocks = l1a_dataset["idx__txhdrblocks"].data
+
+    # Extract bitfields
+    dead_blocks_shift = (txhdrblocks >> 20) & 0b1111
+    dead_blocks_base = (txhdrblocks >> 24) & 0b111111
+
+    # Convert to float once
+    base = dead_blocks_base.astype(np.float64)
+    shift = dead_blocks_shift.astype(np.float64)
+
+    # Compute dead time
+    dead_time_array: NDArray[np.float64] = base * np.power(2.0, shift) * DT_BLOCK
+
+    return {
+        "dead_time": xr.DataArray(
+            name="dead_time",
+            data=dead_time_array,
+            dims="epoch",
+            attrs=idex_attrs.get_variable_attributes("dead_time"),
+        )
+    }
+
+
 def get_spice_data(
     l1a_dataset: xr.Dataset, idex_attrs: ImapCdfAttributes
 ) -> dict[str, xr.DataArray]:
@@ -518,10 +597,12 @@ def get_spice_data(
     """
     # convert 'epoch' from nanoseconds to seconds since j2000
     et = ttj2000ns_to_et(l1a_dataset["epoch"].data)
-    # Get 'shcoarse' (Mission Elapsed Time)
-    met = l1a_dataset["shcoarse"].data
+    # Get (Mission Elapsed Time)
+    met = et_to_met(et)
     # Get spacecraft spin phase in degrees
-    spin_phase = get_spacecraft_spin_phase(query_met_times=met)
+    spin_phase = get_instrument_spin_phase(
+        query_met_times=met, instrument=SpiceFrame.IMAP_IDEX
+    )
     imap_spin_phase = get_spin_angle(spin_phase, degrees=True)
     # Get the position and velocity of IMAP in ecliptic frame
     ephemeris = imap_state(et, observer=SpiceBody.SUN)

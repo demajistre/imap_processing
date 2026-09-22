@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Generator, Iterable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, ClassVar
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,8 @@ from numpy import typing as npt
 from numpy.typing import NDArray
 
 from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
+
+logger = logging.getLogger(__name__)
 
 
 class HIAPID(IntEnum):
@@ -95,6 +98,15 @@ class HiConstants:
         in Filter 2.
     STAT_FILTER_2_BIN_PADDING : int
         Number of bins to add on each side of pulse angle range in Filter 2.
+    GAIN_TEST_HV_DELTA_V : dict[str, float]
+        Hardcoded per-field tolerance (in volts) used to detect gain test
+        intervals: a HVSCI segment is excluded if any field's median value
+        deviates from the pointing's own first-HVSCI-segment reference value
+        by more than this delta.
+    EXCESS_BACKGROUND_COUNT_RATE : float
+        Constant rate offset (per second) to subtract from combined background
+        rates. Corrects for excess counts from the outer ESA during background
+        testing. Applied after summing individual background components.
     """
 
     # TODO: read DE_CLOCK_TICK_US from
@@ -128,6 +140,40 @@ class HiConstants:
     STAT_FILTER_2_MIN_EVENTS = 6
     STAT_FILTER_2_MAX_TIME_DELTA = 5000 * DE_CLOCK_TICK_S
     STAT_FILTER_2_BIN_PADDING = 1
+
+    # Hardcoded per-field tolerances (volts) for gain test detection. A HVSCI
+    # segment is excluded (flagged BAD_DETECTOR_VOLTAGE) if any field's median
+    # value deviates from the pointing's own first-HVSCI-segment reference
+    # value by more than this delta. Values provided by Paul Janzen (Hi
+    # instrument team). The dict's keys are also the set of detector high
+    # voltage monitor fields used to detect gain test intervals within a
+    # pointing -- see hi_l1b.de_gain_test_filter() and
+    # hi_l1b.compute_reference_hv_values(). Note "tof" is the raw CCSDS
+    # mnemonic name for the U-Can voltage monitor (see IMAP-Hi Algorithm
+    # Document Section 8, Level 0 Packet Definitions).
+    GAIN_TEST_HV_DELTA_V: ClassVar[dict[str, float]] = {
+        "pos_defl": 1500.0,
+        "neg_defl": 1500.0,
+        "tof": 50.0,
+        "mcp_f": 10.0,
+        "mcp_b": 50.0,
+        "cem_f": 10.0,
+        "cem_bk_a": 25.0,
+        "cem_bk_b": 25.0,
+    }
+
+    # Background rate correction
+    # Constant offset to subtract from combined background rates to correct
+    # for excess counts from the outer ESA during background testing.
+    EXCESS_BACKGROUND_COUNT_RATE = 0.002  # per second
+    EXCESS_BACKGROUND_COUNT_RATE_UNC = 0.001
+    # ESAs 7, 8, 9 get an extra 0.0025/s uncertainty to account for possible
+    # unidentified additional background in these ESA steps.
+    UPPER_ESA_EXTRA_BACKGROUND_UNC = xr.DataArray(
+        np.array([0.0025, 0.0025, 0.0055]),
+        dims=["esa_energy_step"],
+        coords={"esa_energy_step": np.array([7, 8, 9], dtype=int)},
+    )
 
 
 def parse_sensor_number(full_string: str) -> int:
@@ -456,6 +502,82 @@ class EsaEnergyStepLookupTable:
             return results.astype(self._esa_energy_step_dtype)
 
 
+class GoodMetRangeLookupTable:
+    """Class for holding a table of MET ranges that pass a boolean check."""
+
+    def __init__(self) -> None:
+        self.df = pd.DataFrame(
+            {
+                "start_met": pd.Series(dtype="float64"),
+                "end_met": pd.Series(dtype="float64"),
+            }
+        )
+        self._indexed = False
+
+    def add_entry(self, start_met: float, end_met: float) -> None:
+        """
+        Add a single good MET range to the lookup table.
+
+        Parameters
+        ----------
+        start_met : float
+            Start mission elapsed time of the time range.
+        end_met : float
+            End mission elapsed time of the time range.
+        """
+        new_row = pd.DataFrame({"start_met": [start_met], "end_met": [end_met]})
+        self.df = pd.concat([self.df, new_row], ignore_index=True)
+        self._indexed = False
+
+    def _ensure_indexed(self) -> None:
+        """Sort the internal DataFrame by start_met for faster queries."""
+        if not self._indexed:
+            self.df = self.df.sort_values("start_met").reset_index(drop=True)
+            self._indexed = True
+
+    def query(self, query_met: float | Iterable[float]) -> bool | np.ndarray:
+        """
+        Query MET(s) to determine whether each falls within a good range.
+
+        Parameters
+        ----------
+        query_met : float or array_like
+            Mission elapsed time value(s) to query.
+
+        Returns
+        -------
+        bool or numpy.ndarray
+            - If input is scalar: True if query_met falls within any good
+              MET range, False otherwise.
+            - If input is array-like: boolean numpy array of the same length
+              as the input.
+
+        Notes
+        -----
+        Ranges are treated as inclusive on both ends.
+        """
+        self._ensure_indexed()
+
+        is_scalar_met = np.isscalar(query_met)
+        query_mets = np.atleast_1d(query_met)
+        results = np.zeros(query_mets.shape, dtype=bool)
+
+        if self.df.empty:
+            logger.debug(
+                "GoodMetRangeLookupTable is empty; all %d queried MET "
+                "value(s) return False (likely no HVSCI segments matched "
+                "the pointing's reference voltages).",
+                query_mets.size,
+            )
+        else:
+            starts = self.df["start_met"].to_numpy()
+            ends = self.df["end_met"].to_numpy()
+            for start, end in zip(starts, ends, strict=False):
+                results |= (query_mets >= start) & (query_mets <= end)
+
+        return bool(results[0]) if is_scalar_met else results
+
+
 class _BaseConfigAccessor:
     """
     Base class for configuration DataFrame accessors.
@@ -538,8 +660,30 @@ class CalibrationProductConfig(_BaseConfigAccessor):
     """Register custom accessor for calibration product configuration DataFrames."""
 
     index_columns = (
+        "gain_config_id",
         "calibration_prod",
         "esa_energy_step",
+    )
+    # Detector voltage difference (and U-Can voltage) fields used to match a
+    # pointing's gain state to a gain_config_id row. See
+    # compute_gain_match_values() for how a pointing's own values are
+    # derived, and match_gain_config_id() below for the matching logic.
+    # hi_l1b.de_gain_test_filter() sets these directly as L1B DE global
+    # attributes and hi_l1c.add_pset_geometric_factor() reads them back
+    # the same way.
+    GAIN_MATCH_FIELDS = (
+        "mcp_delta_v",
+        "cem_a_delta_v",
+        "cem_b_delta_v",
+        "tof_v",
+    )
+    # Columns holding the nominal value and tolerance for each gain match
+    # field. These are constant across (calibration_prod, esa_energy_step)
+    # within a gain_config_id, so the CSV only needs to specify them once per
+    # gain_config_id group -- placed as the final columns of the file, after
+    # the full calibration product definition.
+    gain_match_columns = tuple(
+        f"{field}{suffix}" for field in GAIN_MATCH_FIELDS for suffix in ("", "_tol")
     )
     required_columns = (
         "coincidence_type_list",
@@ -548,7 +692,49 @@ class CalibrationProductConfig(_BaseConfigAccessor):
             for det_pair in _BaseConfigAccessor.tof_detector_pairs
             for limit in ["low", "high"]
         ],
+        *gain_match_columns,
     )
+
+    def _validate(self, df: pd.DataFrame) -> None:
+        """
+        Validate the calibration product configuration.
+
+        Extends base validation to verify the gain match columns are
+        non-null and consistent across (calibration_prod, esa_energy_step)
+        for each gain_config_id.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            DataFrame to validate.
+
+        Raises
+        ------
+        AttributeError
+            If required columns or index levels are missing.
+        ValueError
+            If gain match values are missing or inconsistent within a
+            gain_config_id group.
+        """
+        super()._validate(df)
+
+        for gain_config_id, group in df.groupby(level="gain_config_id"):
+            for col in self.gain_match_columns:
+                if group[col].isna().any():
+                    raise ValueError(
+                        f"Missing {col} value(s) for gain_config_id="
+                        f"{gain_config_id}. The first row for each "
+                        f"gain_config_id must specify a value for every "
+                        f"gain match field."
+                    )
+                if group[col].nunique() > 1:
+                    raise ValueError(
+                        f"Inconsistent {col} values across rows for "
+                        f"gain_config_id={gain_config_id}: "
+                        f"{group[col].unique().tolist()}. Gain match values "
+                        f"must be identical across all calibration_prod/"
+                        f"esa_energy_step rows for a gain_config_id."
+                    )
 
     @classmethod
     def from_csv(cls, path: str | Path | IO[str]) -> pd.DataFrame:
@@ -572,6 +758,11 @@ class CalibrationProductConfig(_BaseConfigAccessor):
             converters={"coincidence_type_list": lambda s: tuple(s.split("|"))},
             comment="#",
         )
+        # Forward-fill gain match columns within each gain_config_id group.
+        # This allows the CSV to specify these values only on the group's
+        # first row.
+        gain_cols = list(cls.gain_match_columns)
+        df[gain_cols] = df.groupby(level="gain_config_id")[gain_cols].ffill()
         # Trigger the accessor to run validation and add coincidence_type_values
         _ = df.cal_prod_config.number_of_products
         return df
@@ -589,6 +780,100 @@ class CalibrationProductConfig(_BaseConfigAccessor):
         """
         return len(self._obj.index.unique(level="calibration_prod"))
 
+    @classmethod
+    def compute_gain_match_values(
+        cls, raw_hv_values: dict[str, float]
+    ) -> dict[str, float]:
+        """
+        Derive the back/front voltage differences used for geometric factor lookup.
+
+        Computed as back minus front (rather than front minus back) so that
+        the resulting deltas are positive, consistent with real flight
+        detector voltages (front voltages are more negative than back
+        voltages -- see imap_processing/hi/gain_test_analysis.ipynb).
+
+        Parameters
+        ----------
+        raw_hv_values : dict[str, float]
+            Raw detector high voltage values keyed by field name, e.g. as
+            returned by hi_l1b.compute_reference_hv_values() (must contain
+            "mcp_f", "mcp_b", "cem_f", "cem_bk_a", "cem_bk_b", and "tof").
+
+        Returns
+        -------
+        dict[str, float]
+            Dictionary with keys matching GAIN_MATCH_FIELDS, for use with
+            match_gain_config_id().
+        """
+        delta_formulas = {
+            "mcp_delta_v": raw_hv_values["mcp_b"] - raw_hv_values["mcp_f"],
+            "cem_a_delta_v": raw_hv_values["cem_bk_a"] - raw_hv_values["cem_f"],
+            "cem_b_delta_v": raw_hv_values["cem_bk_b"] - raw_hv_values["cem_f"],
+            "tof_v": raw_hv_values["tof"],
+        }
+        return {field: delta_formulas[field] for field in cls.GAIN_MATCH_FIELDS}
+
+    def match_gain_config_id(self, hv_deltas: dict[str, float]) -> int | None:
+        """
+        Find the gain_config_id whose reference values match the given deltas.
+
+        Parameters
+        ----------
+        hv_deltas : dict[str, float]
+            Mapping of CalibrationProductConfig.GAIN_MATCH_FIELDS field names
+            to a pointing's derived values (see compute_gain_match_values()).
+
+        Returns
+        -------
+        int or None
+            The matching gain_config_id, or None if any input value is NaN
+            (e.g. because a pointing's reference detector voltages could
+            not be determined) or if zero or multiple gain_config_id rows
+            match.
+        """
+        if any(np.isnan(value) for value in hv_deltas.values()):
+            return None
+        gain_config_ids = self._obj.index.get_level_values("gain_config_id").unique()
+        matches = []
+        for gain_config_id in gain_config_ids:
+            row = self._obj.loc[gain_config_id].iloc[0]
+            if all(
+                abs(hv_deltas[field] - row[field]) <= row[f"{field}_tol"]
+                for field in self.GAIN_MATCH_FIELDS
+            ):
+                matches.append(int(gain_config_id))
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
+    def select_gain_config(self, hv_deltas: dict[str, float]) -> pd.DataFrame | None:
+        """
+        Select this configuration's rows for a pointing's matched gain state.
+
+        A pointing's gain state is constant for the whole pointing (see
+        hi_l1b.de_gain_test_filter()), so this only needs to be done once
+        per pointing and the result shared by every consumer of the
+        calibration product configuration (geometric factor lookup, counts
+        binning, etc.) rather than each matching hv_deltas independently.
+
+        Parameters
+        ----------
+        hv_deltas : dict[str, float]
+            Mapping of CalibrationProductConfig.GAIN_MATCH_FIELDS field names
+            to a pointing's derived values (see compute_gain_match_values()).
+
+        Returns
+        -------
+        pandas.DataFrame or None
+            The subset of rows for the matched gain_config_id, indexed by
+            (calibration_prod, esa_energy_step), or None if hv_deltas don't
+            match exactly one gain_config_id (see match_gain_config_id()).
+        """
+        gain_config_id = self.match_gain_config_id(hv_deltas)
+        if gain_config_id is None:
+            return None
+        return self._obj.loc[gain_config_id]
+
 
 @pd.api.extensions.register_dataframe_accessor("background_config")
 class BackgroundConfig(_BaseConfigAccessor):
@@ -597,22 +882,123 @@ class BackgroundConfig(_BaseConfigAccessor):
     index_columns = (
         "calibration_prod",
         "background_index",
+        "esa_energy_step",
     )
+    # Columns that must be consistent across esa_energy_step for each
+    # (calibration_prod, background_index) combination
+    tof_columns = tuple(
+        f"tof_{det_pair}_{limit}"
+        for det_pair in _BaseConfigAccessor.tof_detector_pairs
+        for limit in ["low", "high"]
+    )
+
     required_columns = (
         "coincidence_type_list",
-        *[
-            f"tof_{det_pair}_{limit}"
-            for det_pair in _BaseConfigAccessor.tof_detector_pairs
-            for limit in ["low", "high"]
-        ],
+        *tof_columns,
         "scaling_factor",
         "uncertainty",
     )
+
+    def _validate(self, df: pd.DataFrame) -> None:
+        """
+        Validate the background configuration.
+
+        Extends base validation to verify:
+        1. TOF windows and coincidence types are consistent across esa_energy_step
+           for each (calibration_prod, background_index) combination.
+        2. All required columns (coincidence_type_list, TOF windows, scaling_factor,
+           uncertainty) are non-null for every row.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            DataFrame to validate.
+
+        Raises
+        ------
+        AttributeError
+            If required columns or index are missing.
+        ValueError
+            If TOF windows or coincidence types differ across ESA energy steps,
+            or if any required values are null/missing.
+        """
+        super()._validate(df)
+
+        # Check that all required columns have non-null values for every row
+        # This catches cases where forward-fill didn't populate values
+        # (e.g., missing first row in a group) or where scaling_factor/uncertainty
+        # are missing for some ESA steps
+        required_non_null = [
+            "coincidence_type_list",
+            *self.tof_columns,
+            "scaling_factor",
+            "uncertainty",
+        ]
+
+        for col in required_non_null:
+            null_mask = df[col].isna()
+            if null_mask.any():
+                # Get the index values of rows with null values
+                null_rows = df.index[null_mask].tolist()
+                raise ValueError(
+                    f"Null values found in required column '{col}' for rows: "
+                    f"{null_rows}. All background configuration rows must have "
+                    f"non-null values for coincidence_type_list, TOF windows, "
+                    f"scaling_factor, and uncertainty."
+                )
+
+        # Columns that must be consistent across ESA steps
+        consistency_columns = [*self.tof_columns, "coincidence_type_list"]
+
+        # Group by (calibration_prod, background_index) and check consistency
+        grouped = df.groupby(level=["calibration_prod", "background_index"])
+
+        for (cal_prod, bg_idx), group in grouped:
+            for col in consistency_columns:
+                unique_values = group[col].unique()
+                if len(unique_values) > 1:
+                    raise ValueError(
+                        f"Inconsistent {col} values across esa_energy_step for "
+                        f"calibration_prod={cal_prod}, background_index={bg_idx}. "
+                        f"Found values: {unique_values.tolist()}. "
+                        f"TOF windows and coincidence types must be identical "
+                        f"across all ESA energy steps."
+                    )
+
+    def get_tof_config(self) -> pd.DataFrame:
+        """
+        Get TOF window configuration with one row per background.
+
+        Returns one row per (calibration_prod, background_index) combination.
+        Since TOF windows are validated to be consistent across esa_energy_step,
+        this returns the first row for each (calibration_prod, background_index)
+        combination containing only the TOF-related columns.
+
+        Returns
+        -------
+        tof_config : pandas.DataFrame
+            DataFrame indexed by (calibration_prod, background_index) with
+            coincidence_type_list, coincidence_type_values, and TOF window columns.
+        """
+        tof_cols = [
+            "coincidence_type_list",
+            "coincidence_type_values",
+            *self.tof_columns,
+        ]
+        return self._obj.groupby(level=["calibration_prod", "background_index"])[
+            tof_cols
+        ].first()
 
     @classmethod
     def from_csv(cls, path: str | Path | IO[str]) -> pd.DataFrame:
         """
         Read background configuration CSV file into a pandas.DataFrame.
+
+        TOF window columns and coincidence_type_list can be specified only on
+        the first row of each (calibration_prod, background_index) group and
+        will be forward-filled to subsequent rows. This reduces redundancy in
+        the CSV file since these values must be identical across ESA energy
+        steps.
 
         Parameters
         ----------
@@ -625,12 +1011,40 @@ class BackgroundConfig(_BaseConfigAccessor):
             Validated background configuration DataFrame with
             coincidence_type_values column added.
         """
+
+        def parse_coincidence_list(s: str) -> tuple | None:
+            """
+            Parse coincidence type list, returning None for empty strings.
+
+            Parameters
+            ----------
+            s : str
+                Pipe-delimited string of coincidence types.
+
+            Returns
+            -------
+            tuple or None
+                Tuple of coincidence type strings, or None if input is empty.
+            """
+            if pd.isna(s) or s == "":
+                return None
+            return tuple(s.split("|"))
+
         df = pd.read_csv(
             path,
             index_col=cls.index_columns,
-            converters={"coincidence_type_list": lambda s: tuple(s.split("|"))},
+            converters={"coincidence_type_list": parse_coincidence_list},
             comment="#",
         )
+
+        # Forward-fill TOF columns and coincidence_type_list within each
+        # (calibration_prod, background_index) group. This allows the CSV to
+        # specify these values only on the first row of each group.
+        fill_columns = ["coincidence_type_list", *cls.tof_columns]
+        df[fill_columns] = df.groupby(level=["calibration_prod", "background_index"])[
+            fill_columns
+        ].ffill()
+
         # Trigger the accessor to run validation and add coincidence_type_values
         _ = df.background_config.calibration_product_numbers
         return df

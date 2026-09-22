@@ -273,22 +273,37 @@ def swapi_l2(
     # update attrs
     l2_dataset[
         "swp_pcem_rate_stat_uncert_plus"
-    ].attrs = cdf_manager.get_variable_attributes("pcem_rate_uncertainty")
+    ].attrs = cdf_manager.get_variable_attributes("swp_pcem_rate_stat_uncert_plus")
     l2_dataset[
         "swp_pcem_rate_stat_uncert_minus"
-    ].attrs = cdf_manager.get_variable_attributes("pcem_rate_uncertainty")
+    ].attrs = cdf_manager.get_variable_attributes("swp_pcem_rate_stat_uncert_minus")
     l2_dataset[
         "swp_scem_rate_stat_uncert_plus"
-    ].attrs = cdf_manager.get_variable_attributes("scem_rate_uncertainty")
+    ].attrs = cdf_manager.get_variable_attributes("swp_scem_rate_stat_uncert_plus")
     l2_dataset[
         "swp_scem_rate_stat_uncert_minus"
-    ].attrs = cdf_manager.get_variable_attributes("scem_rate_uncertainty")
+    ].attrs = cdf_manager.get_variable_attributes("swp_scem_rate_stat_uncert_minus")
     l2_dataset[
         "swp_coin_rate_stat_uncert_plus"
-    ].attrs = cdf_manager.get_variable_attributes("coin_rate_uncertainty")
+    ].attrs = cdf_manager.get_variable_attributes("swp_coin_rate_stat_uncert_plus")
     l2_dataset[
         "swp_coin_rate_stat_uncert_minus"
-    ].attrs = cdf_manager.get_variable_attributes("coin_rate_uncertainty")
+    ].attrs = cdf_manager.get_variable_attributes("swp_coin_rate_stat_uncert_minus")
+
+    depend_on_esa_energy = [
+        "swp_l1a_flags",
+        "swp_pcem_rate",
+        "swp_scem_rate",
+        "swp_coin_rate",
+        "swp_pcem_rate_stat_uncert_plus",
+        "swp_pcem_rate_stat_uncert_minus",
+        "swp_scem_rate_stat_uncert_plus",
+        "swp_scem_rate_stat_uncert_minus",
+        "swp_coin_rate_stat_uncert_plus",
+        "swp_coin_rate_stat_uncert_minus",
+    ]
+    for variable in depend_on_esa_energy:
+        l2_dataset[variable].attrs["DEPEND_1"] = "esa_energy"
 
     # TODO: add thruster firing flag
     # TODO: add other flags

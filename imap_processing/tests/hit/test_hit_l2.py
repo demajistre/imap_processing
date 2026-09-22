@@ -1,11 +1,13 @@
 from unittest.mock import Mock, patch
 
+import cdflib
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
 
 from imap_processing import imap_module_directory
+from imap_processing.cdf.utils import write_cdf
 from imap_processing.hit.l1a import hit_l1a
 from imap_processing.hit.l1b.hit_l1b import (
     SUMMED_PARTICLE_ENERGY_RANGE_MAPPING,
@@ -32,7 +34,56 @@ from imap_processing.hit.l2.hit_l2 import (
     process_standard_intensity,
     process_summed_intensity,
     reshape_for_sectored,
+    transform_to_10_minute_chunks,
 )
+
+EXPECTED_STANDARD_LABLAXIS = {
+    "h_standard_intensity": "H Intensity Standard",
+    "he3_standard_intensity": "He3 Intensity Standard",
+    "he4_standard_intensity": "He4 Intensity Standard",
+    "he_standard_intensity": "He Intensity Standard",
+    "c_standard_intensity": "C Intensity Standard",
+    "o_standard_intensity": "O Intensity Standard",
+    "n_standard_intensity": "N Intensity Standard",
+    "ne_standard_intensity": "Ne Intensity Standard",
+    "na_standard_intensity": "Na Intensity Standard",
+    "mg_standard_intensity": "Mg Intensity Standard",
+    "al_standard_intensity": "Al Intensity Standard",
+    "si_standard_intensity": "Si Intensity Standard",
+    "s_standard_intensity": "S Intensity Standard",
+    "ar_standard_intensity": "Ar Intensity Standard",
+    "ca_standard_intensity": "Ca Intensity Standard",
+    "fe_standard_intensity": "Fe Intensity Standard",
+    "ni_standard_intensity": "Ni Intensity Standard",
+}
+
+EXPECTED_SUMMED_LABLAXIS = {
+    "h_summed_intensity": "H intensity summed",
+    "he3_summed_intensity": "He3 intensity summed",
+    "he4_summed_intensity": "He4 intensity summed",
+    "he_summed_intensity": "He intensity summed",
+    "c_summed_intensity": "C intensity summed",
+    "o_summed_intensity": "O intensity summed",
+    "n_summed_intensity": "N intensity summed",
+    "ne_summed_intensity": "Ne intensity summed",
+    "na_summed_intensity": "Na intensity summed",
+    "mg_summed_intensity": "Mg intensity summed",
+    "al_summed_intensity": "Al intensity summed",
+    "si_summed_intensity": "Si intensity summed",
+    "s_summed_intensity": "S intensity summed",
+    "ar_summed_intensity": "Ar intensity summed",
+    "ca_summed_intensity": "Ca intensity summed",
+    "fe_summed_intensity": "Fe intensity summed",
+    "ni_summed_intensity": "Ni intensity summed",
+}
+
+EXPECTED_MACROPIXEL_LABLAXIS = {
+    "h_macropixel_intensity": "H Intensity Macropixel",
+    "he4_macropixel_intensity": "He4 Intensity Macropixel",
+    "cno_macropixel_intensity": "CNO Intensity Macropixel",
+    "nemgsi_macropixel_intensity": "NeMgSi Intensity Macropixel",
+    "fe_macropixel_intensity": "Fe Intensity Macropixel",
+}
 
 
 @pytest.fixture(scope="module")
@@ -743,6 +794,76 @@ def test_process_macropixel_intensity(
         )
 
 
+def test_transform_to_10_minute_chunks():
+    """Test that transform_to_10_minute_chunks correctly regroups one-minute
+    macropixel records into 10-minute chunks and re-centers the epoch."""
+    n_minutes = 20
+    minute_ns = 60_000_000_000
+    epochs = np.arange(n_minutes, dtype=np.int64) * minute_ns
+
+    # Each species/energy combination occupies one fixed minute slot within
+    # every 10-record group, in this order (mirrors the physical packet
+    # cadence handled by transform_to_10_minute_chunks).
+    species_energy = [
+        ("h", 3),
+        ("he4", 2),
+        ("cno", 2),
+        ("nemgsi", 2),
+        ("fe", 1),
+    ]
+
+    data_vars = {}
+    slot_for = {}
+    species_i = 0
+    for species, num_energy_levels in species_energy:
+        energy_dim = f"{species}_energy_mean"
+        values = np.array(
+            [[m * 100 + e for e in range(num_energy_levels)] for m in range(n_minutes)],
+            dtype=np.float32,
+        )
+        data_vars[f"{species}_macropixel_intensity"] = (("epoch", energy_dim), values)
+        for energy_i in range(num_energy_levels):
+            slot_for[(species, energy_i)] = species_i
+            species_i += 1
+
+    macropixel_dataset = xr.Dataset(data_vars, coords={"epoch": epochs})
+
+    result = transform_to_10_minute_chunks(macropixel_dataset)
+
+    n_chunks = n_minutes // 10
+    assert len(result["epoch"]) == n_chunks
+
+    # epoch_delta is always half of a 10-minute chunk.
+    expected_epoch_delta = np.full(
+        n_chunks, SECONDS_PER_10_MIN * 1_000_000_000 // 2, dtype=np.int64
+    )
+    np.testing.assert_array_equal(result["epoch_delta"].values, expected_epoch_delta)
+
+    # Each new epoch is centered on its 10-minute group, then shifted back by
+    # a full 10-minute chunk.
+    for chunk in range(n_chunks):
+        start = epochs[chunk * 10]
+        end = epochs[chunk * 10 + 9]
+        expected_epoch = start + (end - start) // 2 - SECONDS_PER_10_MIN * 1_000_000_000
+        assert result["epoch"].values[chunk] == expected_epoch
+
+    # Each species/energy variable should pull its value from the minute slot
+    # it physically occupies within every 10-record group.
+    for species, num_energy_levels in species_energy:
+        var = f"{species}_macropixel_intensity"
+        for energy_i in range(num_energy_levels):
+            slot = slot_for[(species, energy_i)]
+            expected = np.array(
+                [(chunk * 10 + slot) * 100 + energy_i for chunk in range(n_chunks)],
+                dtype=np.float32,
+            )
+            np.testing.assert_array_equal(
+                result[var].values[:, energy_i],
+                expected,
+                err_msg=f"Mismatch for {var} energy index {energy_i}",
+            )
+
+
 def test_process_summed_intensity(l1b_summed_rates_dataset, ancillary_dependencies):
     """Test the variables in the summed intensity dataset"""
 
@@ -883,3 +1004,22 @@ def test_hit_l2(
         dependencies[dataset_key], ancillary_dependencies[ancillary_key]
     )
     assert l2_dataset.attrs["Logical_source"] == expected_logical_source
+    l2_dataset.attrs["Data_version"] = "001"
+    l2_cdf_filepath = write_cdf(l2_dataset)
+    if "standard-intensity" in expected_logical_source:
+        expected_lablaxis = EXPECTED_STANDARD_LABLAXIS
+    elif "macropixel-intensity" in expected_logical_source:
+        expected_lablaxis = EXPECTED_MACROPIXEL_LABLAXIS
+    else:
+        expected_lablaxis = EXPECTED_SUMMED_LABLAXIS
+    with cdflib.CDF(l2_cdf_filepath) as cdf_file:
+        dynamic_threshold_info = cdf_file.varinq("dynamic_threshold_state")
+        dynamic_threshold_attrs = cdf_file.varattsget("dynamic_threshold_state")
+        assert dynamic_threshold_info.Data_Type_Description == "CDF_UINT1"
+        assert dynamic_threshold_attrs["FILLVAL"] == np.uint8(255)
+
+        for variable_name, field_name_content in expected_lablaxis.items():
+            variable_attrs = cdf_file.varattsget(variable_name)
+            species = variable_name.split("_")[0]
+            assert variable_attrs["LABL_PTR_1"] == f"{species}_energy_mean_label"
+            assert variable_attrs["FIELDNAM"] == field_name_content

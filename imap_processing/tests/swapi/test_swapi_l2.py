@@ -1,6 +1,7 @@
 import json
 from unittest.mock import patch
 
+import cdflib
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,6 +16,8 @@ from imap_processing.swapi.l2.swapi_l2 import (
     swapi_l2,
 )
 from imap_processing.swapi.swapi_utils import read_swapi_lut_table
+
+SWAPI_RATE_VALIDMAX = 65535 / SWAPI_LIVETIME
 
 
 @pytest.fixture(scope="session")
@@ -83,7 +86,7 @@ def test_swapi_l2_cdf(
     )
     # Create HK CDF File
     processed_hk_data = swapi_l1(collection_obj, descriptor="hk")
-    hk_cdf_filename = "imap_swapi_l1a_hk_20240924_v999.cdf"
+    hk_cdf_filename = "imap_swapi_l1a_hk_20240924_v001.0001.cdf"
     hk_cdf_path = write_cdf(processed_hk_data[0])
     assert hk_cdf_path.name == hk_cdf_filename
 
@@ -107,7 +110,7 @@ def test_swapi_l2_cdf(
     )
     # Create L1 CDF File
     processed_sci_data = swapi_l1(collection_obj, descriptor="sci")
-    cdf_filename = "imap_swapi_l1_sci_20240924_v999.cdf"
+    cdf_filename = "imap_swapi_l1_sci_20240924_v001.0001.cdf"
     cdf_path = write_cdf(processed_sci_data[0])
     assert cdf_path.name == cdf_filename
 
@@ -124,7 +127,80 @@ def test_swapi_l2_cdf(
         lut_notes_df=lut_notes_table,
     )
     l2_cdf = write_cdf(l2_dataset)
-    assert l2_cdf.name == "imap_swapi_l2_sci_20240924_v999.cdf"
+    assert l2_cdf.name == "imap_swapi_l2_sci_20240924_v001.0001.cdf"
+    cdf_file = cdflib.CDF(l2_cdf)
+    esa_energy_info = cdf_file.varinq("esa_energy")
+    esa_energy_attrs = cdf_file.varattsget("esa_energy")
+    esa_step_attrs = cdf_file.varattsget("esa_step")
+    sci_start_time_attrs = cdf_file.varattsget("sci_start_time")
+    swp_l1a_flags_attrs = cdf_file.varattsget("swp_l1a_flags")
+    global_attrs = cdf_file.globalattsget()
+    assert esa_energy_info.Data_Type_Description == "CDF_DOUBLE"
+    assert np.isclose(esa_energy_attrs["FILLVAL"], np.float64(-1.0e31))
+    assert esa_energy_attrs["VALIDMAX"] == np.float64(21000.0)
+    assert esa_energy_attrs["VALIDMIN"] == np.float64(0.0)
+    assert esa_energy_attrs["VAR_TYPE"] == "data"
+    assert esa_energy_attrs["DEPEND_1"] == "esa_step"
+    assert cdf_file.varattsget("swp_l1a_flags")["DEPEND_1"] == "esa_energy"
+    assert cdf_file.varattsget("swp_pcem_rate")["DEPEND_1"] == "esa_energy"
+    assert (
+        cdf_file.varattsget("swp_pcem_rate_stat_uncert_plus")["DEPEND_1"]
+        == "esa_energy"
+    )
+    assert esa_step_attrs["SCALETYP"] == "linear"
+    assert "SCALE_TYP" not in esa_step_attrs
+    assert esa_energy_attrs["CATDESC"] == (
+        "ESA energy in eV/q corresponding to each step id for each sweep"
+    )
+    assert esa_energy_attrs["LABLAXIS"] == "Energy (eV/q)"
+    assert (
+        "corresponding energy in eV/q is provided by esa_energy"
+        in esa_step_attrs["CATDESC"]
+    )
+
+    assert sci_start_time_attrs["FORMAT"] == "A23"
+    assert swp_l1a_flags_attrs["VALIDMAX"] == np.uint16(32767)
+    assert "SWP_PCEM_COMP" in swp_l1a_flags_attrs["VAR_NOTES"]
+    assert "SCEM_INT_ST" in swp_l1a_flags_attrs["VAR_NOTES"]
+    assert (
+        "top-hat electrostatic analyzer designed to measure energy-per-charge "
+        "distributions" in global_attrs["TEXT"][0]
+    )
+    assert (
+        "https://imap.princeton.edu/spacecraft/instruments/"
+        "solar-wind-and-pickup-ions-swapi" in global_attrs["TEXT"][0]
+    )
+    assert "constant livetime of 145ms" in global_attrs["TEXT"][0]
+    assert (
+        "includes the ESA energy associated with each voltage step"
+        in (global_attrs["TEXT"][0])
+    )
+
+    rate_variables = [
+        "swp_pcem_rate",
+        "swp_scem_rate",
+        "swp_coin_rate",
+        "swp_pcem_rate_stat_uncert_plus",
+        "swp_pcem_rate_stat_uncert_minus",
+        "swp_scem_rate_stat_uncert_plus",
+        "swp_scem_rate_stat_uncert_minus",
+        "swp_coin_rate_stat_uncert_plus",
+        "swp_coin_rate_stat_uncert_minus",
+    ]
+    for variable in rate_variables:
+        variable_attrs = cdf_file.varattsget(variable)
+        assert np.isclose(variable_attrs["VALIDMAX"], SWAPI_RATE_VALIDMAX)
+
+    pcem_rate_attrs = cdf_file.varattsget("swp_pcem_rate")
+    pcem_uncert_plus_attrs = cdf_file.varattsget("swp_pcem_rate_stat_uncert_plus")
+    pcem_uncert_minus_attrs = cdf_file.varattsget("swp_pcem_rate_stat_uncert_minus")
+    assert pcem_rate_attrs["DELTA_PLUS_VAR"] == "swp_pcem_rate_stat_uncert_plus"
+    assert pcem_rate_attrs["DELTA_MINUS_VAR"] == "swp_pcem_rate_stat_uncert_minus"
+    assert pcem_uncert_plus_attrs["VAR_TYPE"] == "support_data"
+    assert pcem_uncert_minus_attrs["VAR_TYPE"] == "support_data"
+    assert pcem_uncert_plus_attrs["FIELDNAM"] != pcem_uncert_minus_attrs["FIELDNAM"]
+    assert pcem_uncert_plus_attrs["LABLAXIS"] != pcem_uncert_minus_attrs["LABLAXIS"]
+    assert pcem_uncert_plus_attrs["CATDESC"] != pcem_uncert_minus_attrs["CATDESC"]
 
     # Test uncertainty variables are as expected
     np.testing.assert_array_equal(

@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -7,6 +8,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from imap_processing.ancillary.ancillary_dataset_combiner import GlowsAncillaryCombiner
 from imap_processing.glows.l1b.glows_l1b import glows_l1b, glows_l1b_de
 from imap_processing.glows.l1b.glows_l1b_data import (
     AncillaryParameters,
@@ -158,7 +160,10 @@ def test_validation_data_histogram(
     }
 
     for validation_output in out["output"]:
-        epoch_val = met_to_ttj2000ns(validation_output["imap_start_time"])
+        epoch_val = met_to_ttj2000ns(
+            validation_output["imap_start_time"]
+            + validation_output["imap_end_time_offset"] / 2
+        )
 
         # Skip validation data that doesn't match our single dataset timerange
         if epoch_val > end_time:
@@ -325,6 +330,121 @@ def test_get_threshold():
         assert threshold == exp
 
 
+def _spin_offset_settings(times, values):
+    """Build PipelineSettings from a spin-offset correction time/value table."""
+    return PipelineSettings(
+        xr.Dataset(
+            {
+                "spin_offset_correction_times": (["t"], times),
+                "spin_offset_correction_values": (["t"], values),
+            }
+        )
+    )
+
+
+def test_get_spin_offset_correction():
+    """Asof lookup: a value takes effect from its timestamp forward, and times
+    before the first entry fall back to the earliest value.
+    """
+    settings = _spin_offset_settings(
+        ["2025-11-12T00:00:00", "2026-07-08T15:50:00"], [1.047, 2.347]
+    )
+
+    def lookup(time):
+        return settings.get_spin_offset_correction(np.datetime64(time))
+
+    assert lookup("2025-01-01T00:00:00") == pytest.approx(1.047)  # before first entry
+    assert lookup("2026-07-08T15:49:59") == pytest.approx(1.047)  # 1 s before switch
+    assert lookup("2026-07-08T15:50:00") == pytest.approx(2.347)  # switch is inclusive
+
+
+def test_get_spin_offset_correction_sorts_by_time():
+    """Out-of-order ancillary entries are sorted on construction."""
+    settings = _spin_offset_settings(
+        ["2026-07-08T15:50:00", "2025-11-12T00:00:00"], [2.347, 1.047]
+    )
+    assert settings.get_spin_offset_correction(
+        np.datetime64("2026-01-01T00:00:00")
+    ) == pytest.approx(1.047)
+
+
+def test_get_spin_offset_correction_fallbacks():
+    """The deprecated scalar raises; a missing table defaults to 0.0."""
+    with pytest.raises(ValueError, match="deprecated scalar"):
+        PipelineSettings(xr.Dataset({"spin_offset_correction": 1.5}))
+    empty = PipelineSettings(xr.Dataset())
+    assert empty.get_spin_offset_correction(np.datetime64("2026-01-01T00:00:00")) == 0.0
+
+
+def test_pipeline_settings_from_json_parses_spin_offset_table():
+    """ISO time strings survive the full JSON -> dataset -> PipelineSettings path,
+    parsing to datetime64 with a working asof lookup.
+    """
+    json_path = (
+        Path(__file__).parent
+        / "validation_data"
+        / "imap_glows_pipeline-settings_20251112_v001.json"
+    )
+    settings = PipelineSettings(
+        GlowsAncillaryCombiner.convert_json_to_dataset(json_path)
+    )
+    assert settings.get_spin_offset_correction(
+        np.datetime64("2026-01-01T00:00:00")
+    ) == pytest.approx(1.047)  # first entry
+    assert settings.get_spin_offset_correction(
+        np.datetime64("2026-07-08T15:50:00")
+    ) == pytest.approx(2.347)  # second entry takes effect at its timestamp
+
+
+def _mock_histogram_for_flags(number_of_events):
+    """Minimal HistogramL1B-like object exposing what compute_flags reads."""
+
+    class MockHistogram:
+        flags_set_onboard = 0
+        is_generated_on_ground = 1
+        filter_temperature_std_dev = 0.0
+        hv_voltage_std_dev = 0.0
+        spin_period_std_dev = 0.0
+        pulse_length_std_dev = 0.0
+        deserialize_flags = staticmethod(HistogramL1B.deserialize_flags)
+
+    hist = MockHistogram()
+    hist.number_of_events = number_of_events
+    return hist
+
+
+@pytest.mark.parametrize(
+    ("number_of_events", "n_sigma", "avg", "std", "expected"),
+    [
+        (100, 3.0, 100.0, 10.0, 1),  # inside the band -> good
+        (200, 3.0, 100.0, 10.0, 0),  # outside the band -> bad
+        (200, -1.0, 100.0, 10.0, 1),  # negative threshold disables the check
+        (200, 3.0, np.nan, np.nan, 1),  # no daytime reference disables the check
+    ],
+)
+def test_compute_flags_is_beyond_daily_statistical_error(
+    number_of_events, n_sigma, avg, std, expected
+):
+    """is_beyond_daily_statistical_error (flag 11) is bad (0) only for a block
+    outside the n-sigma band; a negative threshold or a missing (NaN) daytime
+    reference disables the check (good).
+    """
+    thresholds = {
+        "n_sigma_threshold_lower": n_sigma,
+        "n_sigma_threshold_upper": n_sigma,
+        "std_dev_threshold__celsius_deg": 1.0,
+        "std_dev_threshold__volt": 1.0,
+        "std_dev_threshold__sec": 1.0,
+        "std_dev_threshold__usec": 1.0,
+    }
+    settings = PipelineSettings(
+        xr.Dataset({k: xr.DataArray(v) for k, v in thresholds.items()})
+    )
+    hist = _mock_histogram_for_flags(number_of_events)
+    flags = HistogramL1B.compute_flags(hist, settings, np.double(avg), np.double(std))
+    assert flags[11] == expected
+
+
 @patch("imap_processing.glows.l1b.glows_l1b_data.geometry.imap_state")
 @patch("imap_processing.glows.l1b.glows_l1b_data.get_instrument_spin_phase")
 @patch("imap_processing.glows.l1b.glows_l1b_data.get_spin_data")
@@ -339,20 +459,17 @@ def test_update_spice_parameters_spin_axis_near_wrapping_point(
     mock_get_instrument_spin_phase,
     mock_imap_state,
 ):
-    """Test spin axis orientation calculation near the longitude wrapping point.
+    """Test spin axis orientation longitude is in [0, 360] near the 0/360 boundary.
 
-    This test verifies that cartesian_to_latitudinal is called with degrees=False
-    so that circmean/circstd receive values in radians. The bug was that without
-    degrees=False, values in degrees would be passed to circmean/circstd which
-    expect radians with low=-pi, high=pi.
+    Verifies that circmean correctly averages longitudes that straddle the 0/360
+    degree boundary and that the result is wrapped to [0, 360) rather than [-180, 180].
 
     Test conditions:
-    - Longitude values straddling +/-pi (wrapping point at 180 degrees)
+    - Longitude values straddling 0/360 degrees
     - Latitude near equator (-4 degrees)
 
-    If the bug existed (degrees=True or default), circmean would receive values
-    like 179 or -179 degrees when it expects radians in [-pi, pi]. This would
-    produce nonsensical results because 179 >> pi.
+    Arithmetic mean of [359, 1, 358, 2, 0] would give ~144 degrees (wrong).
+    Correct circular mean should give ~0 degrees.
     """
     # Mock time conversions - creates a time range of 5 seconds
     mock_met_to_sclkticks.return_value = 1000
@@ -368,10 +485,8 @@ def test_update_spice_parameters_spin_axis_near_wrapping_point(
     # Mock instrument spin phase
     mock_get_instrument_spin_phase.return_value = 0.5
 
-    # Create cartesian vectors that straddle the longitude wrapping point.
-    # Some points at +179 degrees and some at -179 degrees (which should
-    # average to ~180 degrees when using proper circular mean).
-    # Latitude near equator at -4 degrees.
+    # Create cartesian vectors that straddle the 0/360 degree boundary.
+    # Points at [359, 1, 358, 2, 0] degrees longitude, latitude near equator.
     #
     # For spherical to cartesian (r=1):
     # x = cos(lat) * cos(lon)
@@ -379,8 +494,8 @@ def test_update_spice_parameters_spin_axis_near_wrapping_point(
     # z = sin(lat)
     lat_rad = np.deg2rad(-4.0)  # Near equator
 
-    # Create 5 time steps: [+179, -179, +178, -178, +180] degrees longitude
-    longitudes_deg = np.array([179.0, -179.0, 178.0, -178.0, 180.0])
+    # Equivalent in [-180, 180] range: [-1, 1, -2, 2, 0] degrees
+    longitudes_deg = np.array([359.0, 1.0, 358.0, 2.0, 0.0])
     longitudes_rad = np.deg2rad(longitudes_deg)
 
     # Build cartesian vectors for each time step
@@ -402,12 +517,18 @@ def test_update_spice_parameters_spin_axis_near_wrapping_point(
     class MockHistogram:
         def __init__(self):
             self.imap_start_time = 100.0
-            self.glows_time_offset = 5.0  # 5 second duration
+            self.imap_time_offset = 5.0  # 5 second duration
 
     mock_hist = MockHistogram()
 
     # Call the actual update_spice_parameters method
     HistogramL1B.update_spice_parameters(mock_hist)
+
+    # Verify spin_offset_correction shifts position_angle_offset_average by the
+    # given amount.
+    base_angle = mock_hist.position_angle_offset_average
+    HistogramL1B.update_spice_parameters(mock_hist, spin_offset_correction=5.0)
+    assert mock_hist.position_angle_offset_average == pytest.approx(base_angle + 5.0)
 
     # Verify the spin axis orientation values
     lon_result = mock_hist.spin_axis_orientation_average[0]
@@ -415,18 +536,14 @@ def test_update_spice_parameters_spin_axis_near_wrapping_point(
     lon_std = mock_hist.spin_axis_orientation_std_dev[0]
     lat_std = mock_hist.spin_axis_orientation_std_dev[1]
 
-    # The circular mean of [179, -179, 178, -178, 180] should be ~180 degrees
-    # (or equivalently -180 degrees). The key test is that the result is NOT
-    # near 0 degrees, which would happen if the values weren't properly handled
-    # as circular data near the wrapping point.
-    #
-    # With the bug (degrees=True), circmean would receive [179, -179, ...] and
-    # interpret these as radians, giving completely wrong results.
-    #
-    # Check that longitude is near 180 degrees (could be reported as -180)
-    assert abs(abs(lon_result) - 180.0) < 5.0, (
-        f"Longitude {lon_result} should be near +/-180 degrees. "
-        "If near 0, the circular mean failed at the wrapping point."
+    # Output longitude must be in [0, 360).
+    assert 0.0 <= lon_result < 360.0, f"Longitude {lon_result} is outside [0, 360)."
+
+    # Circular mean of values near 0/360 boundary should be near 0 degrees,
+    # not near 144 degrees (arithmetic mean) or 180 degrees.
+    assert lon_result < 5.0 or lon_result > 355.0, (
+        f"Longitude {lon_result} should be near 0/360 degrees. "
+        "If near 144 or 180, the circular mean failed at the wrapping point."
     )
 
     # Latitude should be near -4 degrees
@@ -435,3 +552,100 @@ def test_update_spice_parameters_spin_axis_near_wrapping_point(
     # Standard deviations should be small (all points are within a few degrees)
     assert lon_std < 5.0, f"Longitude std dev {lon_std} should be small"
     assert lat_std < 1.0, f"Latitude std dev {lat_std} should be small"
+
+
+def test_flag_from_mask_dataset_tolerance():
+    """flag_from_mask_dataset matches block identifiers within a 5-second
+    tolerance rather than requiring an exact string match, since the
+    ancillary file's identifier can differ from this block's own by a few
+    seconds."""
+    mask_dataset = xr.Dataset(
+        {
+            "l1b_unique_block_identifier": (
+                ["time_block"],
+                ["2026-01-01T15:00:00", "2026-01-01T15:01:00"],
+            ),
+            "histogram_mask_array": (
+                ["time_block"],
+                ["1" * 10, "0" * 5 + "1" * 5],
+            ),
+        }
+    )
+
+    def fake_hist(identifier):
+        return SimpleNamespace(
+            unique_block_identifier=identifier, histogram=np.zeros(10)
+        )
+
+    all_ones = np.ones(10, dtype=bool)
+    all_zeros = np.zeros(10, dtype=bool)
+    second_entry_mask = np.array([False] * 5 + [True] * 5)
+
+    # Exact match.
+    mask = HistogramL1B.flag_from_mask_dataset(
+        fake_hist("2026-01-01T15:00:00"), mask_dataset
+    )
+    np.testing.assert_array_equal(mask, all_ones)
+
+    # Within the 5-second tolerance.
+    mask = HistogramL1B.flag_from_mask_dataset(
+        fake_hist("2026-01-01T15:00:03"), mask_dataset
+    )
+    np.testing.assert_array_equal(mask, all_ones)
+
+    # Exactly at the tolerance boundary (inclusive).
+    mask = HistogramL1B.flag_from_mask_dataset(
+        fake_hist("2026-01-01T15:00:05"), mask_dataset
+    )
+    np.testing.assert_array_equal(mask, all_ones)
+
+    # Just beyond the tolerance: no match, all-False mask.
+    mask = HistogramL1B.flag_from_mask_dataset(
+        fake_hist("2026-01-01T15:00:06"), mask_dataset
+    )
+    np.testing.assert_array_equal(mask, all_zeros)
+
+    # Equidistant from both entries (30s from each), beyond tolerance either way:
+    # no match.
+    mask = HistogramL1B.flag_from_mask_dataset(
+        fake_hist("2026-01-01T15:00:30"), mask_dataset
+    )
+    np.testing.assert_array_equal(mask, all_zeros)
+
+    # Closer to the second entry: matches the second entry's mask, not the first.
+    mask = HistogramL1B.flag_from_mask_dataset(
+        fake_hist("2026-01-01T15:00:58"), mask_dataset
+    )
+    np.testing.assert_array_equal(mask, second_entry_mask)
+
+
+def test_flag_from_mask_dataset_picks_closest_within_tolerance():
+    """When more than one ancillary entry falls within the tolerance window,
+    flag_from_mask_dataset uses the closest one."""
+    mask_dataset = xr.Dataset(
+        {
+            "l1b_unique_block_identifier": (
+                ["time_block"],
+                ["2026-01-01T15:00:00", "2026-01-01T15:00:04"],
+            ),
+            "histogram_mask_array": (
+                ["time_block"],
+                ["1" * 5 + "0" * 5, "0" * 5 + "1" * 5],
+            ),
+        }
+    )
+    hist = SimpleNamespace(
+        unique_block_identifier="2026-01-01T15:00:02", histogram=np.zeros(10)
+    )
+    # 2026-01-01T15:00:02 is within 5s of both entries (2s and 2s away - tied).
+    # np.argmin resolves ties by taking the first occurring minimum, matching
+    # the earlier (closer-in-index) entry.
+    mask = HistogramL1B.flag_from_mask_dataset(hist, mask_dataset)
+    np.testing.assert_array_equal(mask, np.array([True] * 5 + [False] * 5))
+
+    # Now favor the second entry unambiguously (1s vs 3s away).
+    hist = SimpleNamespace(
+        unique_block_identifier="2026-01-01T15:00:03", histogram=np.zeros(10)
+    )
+    mask = HistogramL1B.flag_from_mask_dataset(hist, mask_dataset)
+    np.testing.assert_array_equal(mask, np.array([False] * 5 + [True] * 5))

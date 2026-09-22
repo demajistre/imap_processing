@@ -1,13 +1,14 @@
 """Module for GLOWS L1B data products."""
 
 import dataclasses
+import logging
 from dataclasses import InitVar, dataclass, field
 
 import numpy as np
 import xarray as xr
 from scipy.stats import circmean, circstd
 
-from imap_processing.glows import FLAG_LENGTH
+from imap_processing.glows import BAD_TIME_FLAG_NAMES, FLAG_LENGTH
 from imap_processing.glows.utils.constants import TimeTuple
 from imap_processing.quality_flags import GLOWSL1bFlags
 from imap_processing.spice import geometry
@@ -24,6 +25,8 @@ from imap_processing.spice.spin import (
     get_spin_data,
 )
 from imap_processing.spice.time import met_to_datetime64, met_to_sclkticks, sct_to_et
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -96,6 +99,12 @@ class PipelineSettings:  # numpydoc ignore=PR02
     sunset_offset: float = field(init=False)
     processing_thresholds: dict = field(init=False)
 
+    # Spin angle offset correction [degrees] applied to fix positions of stars
+    # seen by GLOWS. It is implemented as time dependent to handle ACS
+    # adjustments applied onboard, e.g., on Jul 8th, 2026
+    _spin_offset_correction_times: np.ndarray = field(init=False, repr=False)
+    _spin_offset_correction_values: np.ndarray = field(init=False, repr=False)
+
     def __post_init__(self, pipeline_dataset: xr.Dataset) -> None:
         """
         Extract pipeline settings from the dataset.
@@ -130,37 +139,18 @@ class PipelineSettings:  # numpydoc ignore=PR02
             self.active_bad_angle_flags = [True, True, True, True]
 
         # Extract active bad-time flags (default to all True if not present)
-        _time_flag_names = [
-            "is_pps_missing",
-            "is_time_status_missing",
-            "is_phase_missing",
-            "is_spin_period_missing",
-            "is_overexposed",
-            "is_direct_event_non_monotonic",
-            "is_night",
-            "is_hv_test_in_progress",
-            "is_test_pulse_in_progress",
-            "is_memory_error_detected",
-            "is_generated_on_ground",
-            "is_beyond_daily_statistical_error",
-            "is_temperature_std_dev_beyond_threshold",
-            "is_hv_voltage_std_dev_beyond_threshold",
-            "is_spin_period_std_dev_beyond_threshold",
-            "is_pulse_length_std_dev_beyond_threshold",
-            "is_spin_period_difference_beyond_threshold",
-        ]
         if "active_bad_time_flags" in pipeline_dataset.data_vars:
             self.active_bad_time_flags = list(
                 pipeline_dataset["active_bad_time_flags"].values
             )
         elif any(
             f"active_bad_time_flags_{n}" in pipeline_dataset.data_vars
-            for n in _time_flag_names
+            for n in BAD_TIME_FLAG_NAMES
         ):
             # Flattened format from convert_json_to_dataset
             self.active_bad_time_flags = [
                 bool(pipeline_dataset[f"active_bad_time_flags_{name}"].values)
-                for name in _time_flag_names
+                for name in BAD_TIME_FLAG_NAMES
             ]
         else:
             # Default: assume all bad-time flags are active
@@ -169,6 +159,49 @@ class PipelineSettings:  # numpydoc ignore=PR02
         # Extract sunrise/sunset offsets (default to 0.0 if not present)
         self.sunrise_offset = float(pipeline_dataset.get("sunrise_offset", 0.0))
         self.sunset_offset = float(pipeline_dataset.get("sunset_offset", 0.0))
+
+        # Extract time-dependent spin-offset correction table (deg units), sorted
+        # by time for the asof lookup in get_spin_offset_correction.
+        if (
+            "spin_offset_correction_times" in pipeline_dataset.data_vars
+            and "spin_offset_correction_values" in pipeline_dataset.data_vars
+        ):
+            # Times are ISO 8601 strings in the JSON (e.g. "2026-07-08T15:50:00").
+            # We use dtype="datetime64[s]" so np.asarray parses those strings
+            # directly to the target resolution.
+            times = np.asarray(
+                pipeline_dataset["spin_offset_correction_times"].values,
+                dtype="datetime64[s]",
+            )
+            values = np.asarray(
+                pipeline_dataset["spin_offset_correction_values"].values, dtype=float
+            )
+            order = np.argsort(times)
+            self._spin_offset_correction_times = times[order]
+            self._spin_offset_correction_values = values[order]
+        elif "spin_offset_correction" in pipeline_dataset.data_vars:
+            # The deprecated scalar 'spin_offset_correction' format is no longer
+            # supported. With correct dependency resolution an old-format file should
+            # never reach this code, so treat it as an error rather than silently
+            # applying a possibly-wrong correction to the science data.
+            raise ValueError(
+                "GLOWS L1B: pipeline settings use the deprecated scalar "
+                "'spin_offset_correction', which is no longer supported. Provide the "
+                "time-dependent 'spin_offset_correction_times'/"
+                "'spin_offset_correction_values' table instead, or check that the "
+                "correct pipeline-settings ancillary version is being used."
+            )
+        else:
+            # No spin-offset correction is configured: no correction is applied
+            # (0.0 at all times), but warn since this is unexpected for production
+            # settings files.
+            logger.warning(
+                "GLOWS L1B: pipeline settings contain no spin-offset correction "
+                "('spin_offset_correction_times'/'spin_offset_correction_values'); "
+                "defaulting the correction to 0."
+            )
+            self._spin_offset_correction_times = np.array([], dtype="datetime64[s]")
+            self._spin_offset_correction_values = np.array([], dtype=float)
 
         # Extract processing thresholds (collect all threshold-related variables)
         self.processing_thresholds = {}
@@ -197,6 +230,39 @@ class PipelineSettings:  # numpydoc ignore=PR02
                 break
 
         return return_value
+
+    def get_spin_offset_correction(self, time: np.datetime64) -> float:
+        """
+        Look up the spin-offset correction [degrees] in effect at the given time.
+
+        Uses the table entry with the latest time that is not after ``time``
+        (step-function/asof lookup): a new correction value takes effect from
+        its timestamp forward until superseded by a later entry.
+
+        Parameters
+        ----------
+        time : np.datetime64
+            The observation time to look up the correction for.
+
+        Returns
+        -------
+        float
+            The spin-offset correction in effect at the given time. Falls back
+            to the earliest entry's value if ``time`` precedes every entry, or
+            to 0.0 if the table is empty.
+        """
+        if self._spin_offset_correction_times.size == 0:
+            return 0.0
+        index = int(
+            np.searchsorted(
+                self._spin_offset_correction_times,
+                time.astype("datetime64[s]"),
+                side="right",
+            )
+            - 1
+        )
+        index = max(index, 0)
+        return float(self._spin_offset_correction_values[index])
 
 
 @dataclass
@@ -806,6 +872,8 @@ class HistogramL1B:
     ancillary_exclusions: InitVar[AncillaryExclusions]
     ancillary_parameters: InitVar[AncillaryParameters]
     pipeline_settings: InitVar[PipelineSettings]
+    daily_total_counts_average: InitVar[np.double]
+    daily_total_counts_std_dev: InitVar[np.double]
     # TODO:
     # - Determine a good way to output flags as "human readable"
     # - Bad angle algorithm using SPICE locations
@@ -820,6 +888,8 @@ class HistogramL1B:
         ancillary_exclusions: AncillaryExclusions,
         ancillary_parameters: AncillaryParameters,
         pipeline_settings: PipelineSettings,
+        daily_total_counts_average: np.double,
+        daily_total_counts_std_dev: np.double,
     ) -> None:
         """
         Will process data.
@@ -842,12 +912,18 @@ class HistogramL1B:
             Ancillary parameters for decoding histogram data.
         pipeline_settings : PipelineSettings
             Pipeline settings for processing thresholds and flags.
+        daily_total_counts_average : numpy.double
+            Mean of total histogram counts across daytime L1A blocks for the day,
+            used for the is_beyond_daily_statistical_error flag.
+        daily_total_counts_std_dev : numpy.double
+            Standard deviation of total histogram counts across daytime L1A blocks
+            for the day, used for the is_beyond_daily_statistical_error flag.
         """
         # self.histogram_flag_array = np.zeros((2,))
         day = met_to_datetime64(self.imap_start_time)
 
         # Add SPICE related variables
-        self.update_spice_parameters()
+        self.update_spice_parameters(pipeline_settings.get_spin_offset_correction(day))
         # Calculate the spin angle bin center using actual histogram length from L1A
         n_bins = len(self.histogram)
         phi = (np.arange(n_bins, dtype=np.float64) + 0.5) / n_bins
@@ -892,14 +968,25 @@ class HistogramL1B:
         # is_inside_excluded_region, is_excluded_by_instr_team,
         # is_suspected_transient] x 3600 bins
         self.histogram_flag_array = self._compute_histogram_flag_array(day_exclusions)
-        self.flags = self.compute_flags(pipeline_settings)
+        self.flags = self.compute_flags(
+            pipeline_settings, daily_total_counts_average, daily_total_counts_std_dev
+        )
 
-    def update_spice_parameters(self) -> None:
-        """Update SPICE parameters based on the current state."""
+    def update_spice_parameters(self, spin_offset_correction: float = 0.0) -> None:
+        """
+        Update SPICE parameters based on the current state.
+
+        Parameters
+        ----------
+        spin_offset_correction : float
+            Spin angle offset [degrees] in effect for this block's time, looked up
+            from the (time-dependent) pipeline settings and added to
+            position_angle_offset_average to correct a systematic bias in observed
+            star positions. Default: 0.0.
+        """
         data_start_met = self.imap_start_time
-        # use of imap_start_time and glows_time_offset is correct.
         data_end_met = np.double(self.imap_start_time) + np.double(
-            self.glows_time_offset
+            self.imap_time_offset
         )
         data_start_time_et = sct_to_et(met_to_sclkticks(data_start_met))
         data_end_time_et = sct_to_et(met_to_sclkticks(data_end_met))
@@ -926,25 +1013,28 @@ class HistogramL1B:
             ),
             degrees=True,
         )
-        self.position_angle_offset_average = np.double(angle_offset)
+        self.position_angle_offset_average = np.double(angle_offset) + np.double(
+            spin_offset_correction
+        )
         self.position_angle_offset_std_dev = np.double(
             0.0
         )  # Set to zero per algorithm document
 
         # Calculate spin axis orientation
 
-        spin_axis_all_times = geometry.cartesian_to_latitudinal(
+        spin_axis_all_times = geometry.cartesian_to_spherical(
             geometry.frame_transform(
                 time_range,
                 np.array([0, 0, 1]),
                 SpiceFrame.IMAP_SPACECRAFT,
                 SpiceFrame.ECLIPJ2000,
             ),
-            degrees=False,
         )
         # Calculate circular statistics for longitude (wraps around)
-        lon_mean = circmean(spin_axis_all_times[..., 1], low=-np.pi, high=np.pi)
-        lon_std = circstd(spin_axis_all_times[..., 1], low=-np.pi, high=np.pi)
+        # Convert to radians for use with circular statistics methods
+        spin_axis_all_times = np.radians(spin_axis_all_times)
+        lon_mean = circmean(spin_axis_all_times[..., 1], low=0, high=2 * np.pi)
+        lon_std = circstd(spin_axis_all_times[..., 1], low=0, high=2 * np.pi)
         lat_mean = circmean(spin_axis_all_times[..., 2], low=-np.pi, high=np.pi)
         lat_std = circstd(spin_axis_all_times[..., 2], low=-np.pi, high=np.pi)
         # Convert circular statistics to degrees and store
@@ -1003,7 +1093,12 @@ class HistogramL1B:
 
         return flags
 
-    def compute_flags(self, pipeline_settings: PipelineSettings) -> np.ndarray:
+    def compute_flags(
+        self,
+        pipeline_settings: PipelineSettings,
+        daily_total_counts_average: np.double,
+        daily_total_counts_std_dev: np.double,
+    ) -> np.ndarray:
         """
         Compute the 17 bad-time flags for this histogram.
 
@@ -1011,6 +1106,11 @@ class HistogramL1B:
         ----------
         pipeline_settings : PipelineSettings
             Pipeline settings containing processing thresholds.
+        daily_total_counts_average : numpy.double
+            Mean of total histogram counts across daytime L1A blocks for the day.
+        daily_total_counts_std_dev : numpy.double
+            Standard deviation of total histogram counts across daytime L1A blocks
+            for the day.
 
         Returns
         -------
@@ -1029,10 +1129,32 @@ class HistogramL1B:
         is_generated_on_ground = np.uint8(1 - int(self.is_generated_on_ground))
 
         # Section 12.3.2 of the Algorithm Document: ground processing flags: flag 2.
-        # Checks if total count in a given histogram is far from the daily average.
-        # Placeholder until daily histogram is available in glows_l1b.py.
-        # TODO: this equation needs to be clarified.
-        is_beyond_daily_statistical_error = np.uint8(1)
+        # Checks if a histogram's total count is far from the daily average. The check
+        # is disabled (always good) when the n-sigma thresholds are absent or negative,
+        # or when no daytime blocks were available to build the daily reference (NaN).
+        n_sigma_lower = pipeline_settings.get_threshold("n_sigma_threshold_lower")
+        n_sigma_upper = pipeline_settings.get_threshold("n_sigma_threshold_upper")
+        if (
+            n_sigma_lower is not None
+            and n_sigma_upper is not None
+            and n_sigma_lower >= 0
+            and n_sigma_upper >= 0
+            and not np.isnan(daily_total_counts_average)
+            and not np.isnan(daily_total_counts_std_dev)
+        ):
+            lower_bound = (
+                daily_total_counts_average - n_sigma_lower * daily_total_counts_std_dev
+            )
+            upper_bound = (
+                daily_total_counts_average + n_sigma_upper * daily_total_counts_std_dev
+            )
+            # number_of_events equals the sum of the histogram's valid bins.
+            is_beyond_daily_statistical_error = np.uint8(
+                lower_bound <= self.number_of_events <= upper_bound
+            )
+        else:
+            # Disabled
+            is_beyond_daily_statistical_error = np.uint8(1)
 
         # Section 12.3.2 of the Algorithm Document: ground processing flags: flag 3-7.
         # (1=good, 0=bad).
@@ -1067,6 +1189,45 @@ class HistogramL1B:
 
         return np.concatenate([onboard_flags, ground_flags])
 
+    @staticmethod
+    def calculate_look_vectors_dps(
+        imap_spin_angle_bin_cntr: np.ndarray, position_angle_offset_average: np.double
+    ) -> np.ndarray:
+        """
+        Calculate the look direction vectors in DPS frame for a histogramming block.
+
+        Parameters
+        ----------
+        imap_spin_angle_bin_cntr : numpy.ndarray
+            Array of shape (3600) representing the centers of the spin angle bins.
+        position_angle_offset_average : float
+            Effective offset angle defined in section 10.6 of the algorithm document,
+            i.e. Angle from GLOWS instrument to spin angle 0 in DPS frame.
+
+        Returns
+        -------
+        look_vecs_dps : numpy.ndarray
+            Array of shape (nbin, 3) representing the look directions in DPS frame
+            for each of the bins.
+        """
+        azimuth = (
+            imap_spin_angle_bin_cntr - position_angle_offset_average + 360.0
+        ) % 360.0
+
+        # Instrument pointing direction in the DPS frame.
+        az_el = get_instrument_mounting_az_el(SpiceFrame.IMAP_GLOWS)
+        elevation = az_el[1]
+
+        spherical = np.stack(
+            [np.ones_like(azimuth), azimuth, np.full_like(azimuth, elevation)],
+            axis=-1,
+        )  # (nbin, 3)
+
+        # Convert to unit cartesian vectors.
+        look_vecs_dps = spherical_to_cartesian(spherical)  # (nbin, 3)
+
+        return look_vecs_dps
+
     def flag_uv_and_excluded(self, exclusions: AncillaryExclusions) -> tuple:
         """
         Create boolean mask where True means bin is within radius of UV source.
@@ -1083,25 +1244,12 @@ class HistogramL1B:
         inside_excluded_region : np.ndarray
             Boolean mask for inside excluded region.
         """
-        # Rotate spin-angle bin centers by the instrument position-angle offset
-        # so azimuth=0 aligns with the instrument pointing direction.
-        azimuth = (
-            self.imap_spin_angle_bin_cntr + self.position_angle_offset_average
-        ) % 360.0
-        # Ephemeris start time of the histogram accumulation.
         data_start_time_et = sct_to_et(met_to_sclkticks(self.imap_start_time))
 
-        # Instrument pointing direction in the DPS frame.
-        az_el = get_instrument_mounting_az_el(SpiceFrame.IMAP_GLOWS)
-        elevation = az_el[1]
-
-        spherical = np.stack(
-            [np.ones_like(azimuth), azimuth, np.full_like(azimuth, elevation)],
-            axis=-1,
-        )  # (nbin, 3)
-
-        # Convert to unit cartesian vectors.
-        look_vecs_dps = spherical_to_cartesian(spherical)  # (nbin, 3)
+        # Calculate unit cartesian vectors in DPS.
+        look_vecs_dps = self.calculate_look_vectors_dps(
+            self.imap_spin_angle_bin_cntr, self.position_angle_offset_average
+        )
 
         # Transform unit cartesian vectors to ECLIPJ2000 frame.
         look_vecs_ecl = frame_transform(
@@ -1138,7 +1286,6 @@ class HistogramL1B:
         # the same direction and needs mask.
         # If dot product -> 0 the two directions are perpendicular on the sky.
         uv_cos_sep = look_vecs_ecl @ uv_vecs.T  # (nbin, n_src)
-
         # Determine if the pixel is too close to any of the source radii.
         close_to_uv_source = np.any(
             uv_cos_sep >= np.cos(uv_radius)[None, :], axis=1
@@ -1187,11 +1334,21 @@ class HistogramL1B:
         mask : np.ndarray
             Boolean array of shape (n_bins,). True where the bin is flagged.
         """
-        identifiers = mask_dataset["l1b_unique_block_identifier"].values
-        match = np.where(identifiers == self.unique_block_identifier)[0]
+        # Match by timestamp within a tolerance rather than exact string equality:
+        # the ancillary file's block identifier can differ from this block's own
+        # by a few seconds, because the GLOWS team and the SDC may use different
+        # sclk kernel versions when converting the block start time. If more than
+        # one entry falls within the tolerance, use the closest one.
+        identifiers = mask_dataset["l1b_unique_block_identifier"].values.astype(
+            "datetime64[s]"
+        )
+        self_time = np.datetime64(self.unique_block_identifier)
+        diffs = np.abs(identifiers - self_time)
+        match = np.where(diffs <= np.timedelta64(5, "s"))[0]
         if not match.size:
             return np.zeros(len(self.histogram), dtype=bool)
-        mask_str = mask_dataset["histogram_mask_array"].values[match[0]]
+        best = match[np.argmin(diffs[match])]
+        mask_str = mask_dataset["histogram_mask_array"].values[best]
 
         # Parse the "0"/"1" character string into a boolean array
         mask = np.array(list(mask_str)) == "1"

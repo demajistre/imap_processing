@@ -1,15 +1,23 @@
 from unittest.mock import patch
 
+import cdflib
 import numpy as np
 import pytest
 import xarray as xr
 
+from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
+from imap_processing.cdf.utils import write_cdf
+from imap_processing.glows import BAD_TIME_FLAG_NAMES
 from imap_processing.glows.l1b.glows_l1b import glows_l1b
 from imap_processing.glows.l1b.glows_l1b_data import (
     HistogramL1B,
     PipelineSettings,
 )
-from imap_processing.glows.l2.glows_l2 import glows_l2
+from imap_processing.glows.l2.glows_l2 import (
+    _normalize_global_attr_to_string,
+    create_l2_dataset,
+    glows_l2,
+)
 from imap_processing.glows.l2.glows_l2_data import DailyLightcurve, HistogramL2
 from imap_processing.glows.utils.constants import GlowsConstants
 from imap_processing.spice.time import et_to_datetime64, ttj2000ns_to_et
@@ -36,7 +44,6 @@ def l1b_hists():
     return input
 
 
-@patch.object(HistogramL2, "compute_position_angle", return_value=42.0)
 @patch.object(
     HistogramL1B,
     "flag_uv_and_excluded",
@@ -46,7 +53,6 @@ def l1b_hists():
 def test_glows_l2(
     mock_spice_function,
     mock_flag_uv_and_excluded,
-    mock_compute_position_angle,
     l1a_dataset,
     mock_ancillary_exclusions,
     mock_pipeline_settings,
@@ -66,11 +72,17 @@ def test_glows_l2(
         mock_pipeline_settings,
         mock_conversion_table_dict,
     )
+    l1b_hist_dataset.attrs["Repointing"] = "repoint00047"
 
     # Test case 1: L1B dataset has good times
     l2 = glows_l2(l1b_hist_dataset, mock_pipeline_settings, mock_calibration_dataset)[0]
     assert l2.attrs["Logical_source"] == "imap_glows_l2_hist"
     assert np.allclose(l2["filter_temperature_average"].values, [57.6], rtol=0.1)
+    assert l2["identifier"].values[0] == 47
+    assert "flight_software_version" in l2.attrs
+    assert "pkts_file_name" in l2.attrs
+    assert "flight_software_version" not in l2.data_vars
+    assert "pkts_file_name" not in l2.data_vars
 
     # Test case 2: L1B dataset has no good times (all flags 0)
     l1b_hist_dataset_no_good_times = l1b_hist_dataset.copy(deep=True)
@@ -96,7 +108,6 @@ def test_glows_l2(
     assert any(record.levelname == "WARNING" for record in caplog.records)
 
 
-@patch.object(HistogramL2, "compute_position_angle", return_value=42.0)
 @patch.object(
     HistogramL1B,
     "flag_uv_and_excluded",
@@ -106,7 +117,6 @@ def test_glows_l2(
 def test_generate_l2(
     mock_spice_function,
     mock_flag_uv_and_excluded,
-    mock_compute_position_angle,
     l1a_dataset,
     mock_ancillary_exclusions,
     mock_pipeline_settings,
@@ -125,6 +135,7 @@ def test_generate_l2(
         mock_pipeline_settings,
         mock_conversion_table_dict,
     )
+    l1b_hist_dataset.attrs["Repointing"] = "repoint00047"
     day = et_to_datetime64(ttj2000ns_to_et(l1b_hist_dataset["epoch"].data[0]))
     pipeline_settings = PipelineSettings(
         mock_pipeline_settings.sel(epoch=day, method="nearest")
@@ -158,11 +169,186 @@ def test_generate_l2(
             l2.hv_voltage_std_dev, expected_values["hv_voltage_std_dev"], 0.01
         )
 
+        cdf_attrs = ImapCdfAttributes()
+        cdf_attrs.add_instrument_global_attrs("glows")
+        cdf_attrs.add_instrument_variable_attrs("glows", "l2")
+        output = create_l2_dataset(l2, cdf_attrs, l1b_hist_dataset.attrs)
+        assert output["epoch"].data[0] == (l2.start_time + l2.end_time) / 2
+        for var in ["photon_flux", "ecliptic_lon"]:
+            assert np.issubdtype(output[var].dtype, np.floating)
+
         # Test case 2: L1B dataset has no good times (all flags 0)
         l1b_hist_dataset["flags"].values = np.zeros(l1b_hist_dataset.flags.shape)
         ds = HistogramL2(l1b_hist_dataset, pipeline_settings, mock_calibration_dataset)
         expected_number_of_good_l1b_inputs = 0
         assert ds.number_of_good_l1b_inputs == expected_number_of_good_l1b_inputs
+        assert ds.bad_time_flag_occurrences.dtype == np.uint16
+
+
+@patch.object(
+    HistogramL1B,
+    "flag_uv_and_excluded",
+    return_value=(np.zeros(3600, dtype=bool), np.zeros(3600, dtype=bool)),
+)
+@patch.object(HistogramL1B, "update_spice_parameters", autospec=True)
+def test_glows_l2_cdf_metadata(
+    mock_spice_function,
+    mock_flag_uv_and_excluded,
+    l1a_dataset,
+    mock_ancillary_exclusions,
+    mock_pipeline_settings,
+    mock_conversion_table_dict,
+    mock_ecliptic_bin_centers,
+    mock_calibration_dataset,
+):
+    """Written GLOWS L2 CDF metadata should match the intended label and attr types."""
+    mock_spice_function.side_effect = mock_update_spice_parameters
+
+    l1b_hist_dataset = glows_l1b(
+        l1a_dataset[0],
+        mock_ancillary_exclusions.excluded_regions,
+        mock_ancillary_exclusions.uv_sources,
+        mock_ancillary_exclusions.suspected_transients,
+        mock_ancillary_exclusions.exclusions_by_instr_team,
+        mock_pipeline_settings,
+        mock_conversion_table_dict,
+    )
+    l1b_hist_dataset.attrs["Repointing"] = "repoint00047"
+    l2_dataset = glows_l2(
+        l1b_hist_dataset, mock_pipeline_settings, mock_calibration_dataset
+    )[0]
+    l2_dataset.attrs["Data_version"] = "001"
+    cdf_path = write_cdf(l2_dataset)
+
+    with cdflib.CDF(cdf_path) as cdf_file:
+        bins_label_info = cdf_file.varinq("bins_label")
+        bins_label_attrs = cdf_file.varattsget("bins_label")
+        bins_label_values = cdf_file.varget("bins_label")
+        flags_values = cdf_file.varget("flags")
+        identifier_attrs = cdf_file.varattsget("identifier")
+        flags_label_info = cdf_file.varinq("flags_label")
+        flags_label_attrs = cdf_file.varattsget("flags_label")
+        flags_label_values = cdf_file.varget("flags_label")
+        bad_time_info = cdf_file.varinq("bad_time_flag_occurrences")
+        bad_time_attrs = cdf_file.varattsget("bad_time_flag_occurrences")
+        photon_flux_attrs = cdf_file.varattsget("photon_flux")
+        start_time_attrs = cdf_file.varattsget("start_time")
+        end_time_attrs = cdf_file.varattsget("end_time")
+        global_attrs = cdf_file.globalattsget()
+
+        assert bins_label_info.Data_Type_Description == "CDF_CHAR"
+        assert bins_label_attrs["FORMAT"] == "A4"
+        assert list(bins_label_values[:5]) == ["0", "1", "2", "3", "4"]
+
+        np.testing.assert_array_equal(flags_values, np.arange(len(BAD_TIME_FLAG_NAMES)))
+        assert flags_label_info.Data_Type_Description == "CDF_CHAR"
+        assert flags_label_attrs["FORMAT"] == "A42"
+        assert list(flags_label_values) == list(BAD_TIME_FLAG_NAMES)
+        assert max(len(name) for name in BAD_TIME_FLAG_NAMES) <= int(
+            flags_label_attrs["FORMAT"][1:]
+        ), (
+            "Update flags_label FORMAT in imap_glows_l2_variable_attrs.yaml "
+            "if a flag name exceeds A42."
+        )
+
+        assert bad_time_info.Data_Type_Description == "CDF_UINT2"
+        assert bad_time_attrs["FORMAT"] == "I5"
+        assert bad_time_attrs["VAR_TYPE"] == "data"
+        assert (
+            identifier_attrs["CATDESC"]
+            == "Spin-axis pointing number to identify observational day"
+        )
+        assert identifier_attrs["FIELDNAM"] == "Spin-axis pointing number"
+        for attr_name in (
+            "TIME_BASE",
+            "TIME_SCALE",
+            "REFERENCE_POSITION",
+            "RESOLUTION",
+        ):
+            assert attr_name not in photon_flux_attrs
+
+        for time_attrs in (start_time_attrs, end_time_attrs):
+            assert time_attrs["TIME_BASE"] == "J2000"
+            assert time_attrs["TIME_SCALE"] == "Terrestrial Time"
+            assert time_attrs["REFERENCE_POSITION"] == "Rotating Earth Geoid"
+            assert time_attrs["RESOLUTION"] == "ISO8601"
+
+        assert global_attrs["flight_software_version"] == ["131329"]
+        assert (
+            "https://imap.princeton.edu/spacecraft/instruments/"
+            "global-solar-wind-structure-glows" in global_attrs["TEXT"][0]
+        )
+
+
+@patch.object(
+    HistogramL1B,
+    "flag_uv_and_excluded",
+    return_value=(np.zeros(3600, dtype=bool), np.zeros(3600, dtype=bool)),
+)
+@patch.object(HistogramL1B, "update_spice_parameters", autospec=True)
+def test_glows_l2_cdf_fillvals(
+    mock_spice_function,
+    mock_flag_uv_and_excluded,
+    l1a_dataset,
+    mock_ancillary_exclusions,
+    mock_pipeline_settings,
+    mock_conversion_table_dict,
+    mock_ecliptic_bin_centers,
+    mock_calibration_dataset,
+):
+    mock_spice_function.side_effect = mock_update_spice_parameters
+
+    l1b_hist_dataset = glows_l1b(
+        l1a_dataset[0],
+        mock_ancillary_exclusions.excluded_regions,
+        mock_ancillary_exclusions.uv_sources,
+        mock_ancillary_exclusions.suspected_transients,
+        mock_ancillary_exclusions.exclusions_by_instr_team,
+        mock_pipeline_settings,
+        mock_conversion_table_dict,
+    )
+    l1b_hist_dataset.attrs["Repointing"] = "repoint00047"
+
+    l2_dataset = glows_l2(
+        l1b_hist_dataset, mock_pipeline_settings, mock_calibration_dataset
+    )[0]
+    l2_dataset.attrs["Data_version"] = "001"
+    cdf_file_path = write_cdf(l2_dataset)
+    with cdflib.CDF(cdf_file_path) as cdf_file:
+        histogram_flag_info = cdf_file.varinq("histogram_flag_array")
+        histogram_flag_attrs = cdf_file.varattsget("histogram_flag_array")
+        number_of_bins_info = cdf_file.varinq("number_of_bins")
+        number_of_bins_attrs = cdf_file.varattsget("number_of_bins")
+        photon_flux_info = cdf_file.varinq("photon_flux")
+        photon_flux_attrs = cdf_file.varattsget("photon_flux")
+        ecliptic_lon_info = cdf_file.varinq("ecliptic_lon")
+        ecliptic_lon_attrs = cdf_file.varattsget("ecliptic_lon")
+
+        assert histogram_flag_info.Data_Type_Description == "CDF_UINT1"
+        assert histogram_flag_attrs["FILLVAL"] == np.uint8(255)
+        assert histogram_flag_attrs["VAR_TYPE"] == "data"
+        assert number_of_bins_info.Data_Type_Description == "CDF_UINT2"
+        assert number_of_bins_attrs["FILLVAL"] == np.uint16(65535)
+        assert photon_flux_info.Data_Type_Description == "CDF_DOUBLE"
+        assert np.isclose(photon_flux_attrs["FILLVAL"], np.float64(-1.0e31))
+        assert ecliptic_lon_info.Data_Type_Description == "CDF_DOUBLE"
+        assert np.isclose(ecliptic_lon_attrs["FILLVAL"], np.float64(-1.0e31))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ""),
+        ("131329", "131329"),
+        ([], ""),
+        (np.array([]), ""),
+        ([131329], "131329"),
+        ((131329,), "131329"),
+        (np.array([131329]), "131329"),
+    ],
+)
+def test_normalize_global_attr_to_string(value, expected):
+    assert _normalize_global_attr_to_string(value) == expected
 
 
 def test_bin_exclusions(l1b_hists):

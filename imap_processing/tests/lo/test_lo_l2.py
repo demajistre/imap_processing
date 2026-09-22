@@ -1,2815 +1,1699 @@
-"""Comprehensive test suite for IMAP-Lo L2 data processing."""
+"""Test suite for IMAP-Lo L2 map processing."""
 
-from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
-import pandas as pd
 import pytest
 import xarray as xr
 
-from imap_processing.cdf.utils import load_cdf
-from imap_processing.ena_maps.ena_maps import RectangularSkyMap
+from imap_processing import imap_module_directory
+from imap_processing.cdf.utils import load_cdf, write_cdf
+from imap_processing.ena_maps.ena_maps import match_coords_to_indices
+from imap_processing.ena_maps.utils.coordinates import CoordNames
+from imap_processing.ena_maps.utils.corrections import PowerLawFluxCorrector
 from imap_processing.ena_maps.utils.naming import MapDescriptor
-from imap_processing.lo.l1c.lo_l1c import (
-    ESA_ENERGY_STEPS,
-    N_OFF_ANGLE_BINS,
-    N_SPIN_ANGLE_BINS,
-    OFF_ANGLE_BIN_CENTERS,
-    PSET_DIMS,
-    PSET_SHAPE,
-    SPIN_ANGLE_BIN_CENTERS,
+from imap_processing.lo.constants import LoConstants
+from imap_processing.lo.l2.lo_l2 import (
+    ANCILLARY_DATA_DIR as PACKAGE_ANCILLARY_DIR,
 )
 from imap_processing.lo.l2.lo_l2 import (
-    _prepare_corrections,
-    add_efficiency_factors_to_pset,
-    calculate_all_rates_and_intensities,
-    calculate_backgrounds,
-    calculate_bootstrap_corrections,
-    calculate_efficiency_corrected_quantities,
-    calculate_flux_corrections,
-    calculate_intensities,
-    calculate_rates,
-    calculate_sputtering_corrections,
-    cleanup_intermediate_variables,
-    create_sky_map_from_psets,
-    initialize_geometric_factor_variables,
+    FILLED_VARIABLES,
+    FILLVAL_FLOAT,
+    ISN_MASKED_VARIABLES,
+    LoSpinAnglePointingSet,
+    _bootstrap_correct_intensity,
+    _complete_pointings,
+    _compton_getting_correct_intensity,
+    _dps_spin_angles,
+    _esa_calibration,
+    _extrapolate_top_intensity,
+    _spacecraft_frame_energy,
+    _spin_phase_mask,
+    finalize_dataset,
     lo_l2,
-    load_efficiency_data,
-    normalize_pset_coordinates,
-    populate_geometric_factors,
-    process_single_pset,
-    project_pset_to_map,
-    reduce_geometric_factor_dataset,
+    load_bootstrap_correction_data,
+    load_isn_mask_parameters,
+    load_sputter_correction_data,
 )
+from imap_processing.spice.time import met_to_ttj2000ns
 
-# =============================================================================
-# FIXTURES FOR MOCK DATA
-# =============================================================================
+ANCILLARY_DIR = imap_module_directory / "tests/lo/test_anc"
+
+# A full-spin map, so that every spin-angle bin lands on it. The "ns" and
+# "nbs" after "ena" ask for neither the sputter nor the bootstrap correction,
+# so these are the uncorrected maps.
+FULL_DESCRIPTOR = "l090-enansnbs-h-sf-nsp-full-hae-6deg-3mo"
+RAM_DESCRIPTOR = "l090-enansnbs-h-sf-nsp-ram-hae-6deg-3mo"
+
+# The same full-spin map, sputter corrected only.
+SPUTTER_DESCRIPTOR = "l090-enasnbs-h-sf-nsp-full-hae-6deg-3mo"
+
+# The same full-spin map, bootstrap corrected only.
+BOOTSTRAP_DESCRIPTOR = "l090-enansbs-h-sf-nsp-full-hae-6deg-3mo"
+
+# The same map in the heliospheric frame, which is what asks for the
+# Compton-Getting correction. Neither of the other corrections is made.
+CG_DESCRIPTOR = "l090-enansnbs-h-hf-nsp-full-hae-6deg-3mo"
+
+# The same uncorrected full-spin map, with the ISN band masked out. The "msk"
+# follows the bootstrap code. The mask is tuned per pivot angle, which is the
+# sensor of the descriptor, so each pivot gets its own descriptor: 90 masks the
+# bright pixels, 75 has too narrow a band to mask any, and 105 masks the top
+# half of each ESA level. See imap_lo_isn-mask-parameters-small_v001.csv.
+MASK_DESCRIPTOR = "l090-enansnbsmsk-h-sf-nsp-full-hae-6deg-3mo"
+NARROW_MASK_DESCRIPTOR = "l075-enansnbsmsk-h-sf-nsp-full-hae-6deg-3mo"
+OUTLIER_MASK_DESCRIPTOR = "l105-enansnbsmsk-h-sf-nsp-full-hae-6deg-3mo"
+
+# A pivot angle the mask ancillary carries no tuning for.
+UNTUNED_MASK_DESCRIPTOR = "l060-enansnbsmsk-h-sf-nsp-full-hae-6deg-3mo"
+
+# The combined maps, written "ilo" rather than with a pivot angle of their own.
+# These select no pivot angle, so every pointing given to them is accumulated.
+COMBINED_DESCRIPTOR = "ilo-enansnbs-h-sf-nsp-full-hae-6deg-3mo"
+COMBINED_RAM_DESCRIPTOR = "ilo-enansnbs-h-sf-nsp-ram-hae-6deg-3mo"
+COMBINED_MASK_DESCRIPTOR = "ilo-enansnbsmsk-h-sf-nsp-full-hae-6deg-3mo"
+
+# The pivot angles a combined map is built from in these tests.
+COMBINED_PIVOTS = (75.0, 90.0, 105.0)
+
+# The fraction of an ESA level's peak intensity that the pivot 90 tuning masks
+# from, and the variables it blanks out.
+MASK_THRESHOLD_FRACTION = 0.5
+
+# The contents of imap_lo_sputter-correction-factors-small, as
+# {target ESA step: {source ESA step: factor}}, 1-based as in the ancillary.
+SPUTTER_FACTORS = {2: {3: 0.5}, 5: {3: 0.25, 6: 0.1}}
+
+# The contents of imap_lo_bootstrap-correction-factors-small, as
+# {target ESA step: {source ESA step: coefficient}}, 1-based as in the
+# ancillary. Step 8 is the virtual ESA step above the top of the map.
+BOOTSTRAP_FACTORS = {2: {3: 0.4, 5: 0.2}, 6: {7: 0.5}, 7: {8: 0.6}}
+
+N_ESA = LoConstants.N_ESA_LEVELS
+N_SPIN_BINS = LoConstants.N_SPIN_ANGLE_BINS
+PIVOT = 90.0
+
+# Good-time window [MET seconds] that the "in-window" histogram epochs fall in.
+GT_START = 511_000_000.0
+GT_END = 511_000_600.0
+IN_METS = [511_000_150.0, 511_000_200.0, 511_000_250.0]
+OUT_METS = [510_990_000.0, 511_010_000.0]
+
+# The ESA level energies [keV] of imap_lo_hydrogen-geometric-factor-small, by
+# ESA mode, which the map takes its energy binning from.
+ESA_ENERGIES = {
+    0: np.array([0.010, 0.020, 0.040, 0.080, 0.160, 0.320, 0.640]),
+    1: np.array([0.011, 0.022, 0.044, 0.088, 0.176, 0.352, 0.704]),
+}
+
+# The hydrogen geometric factors of the same file, by ESA mode.
+GEO_FACTORS = {
+    0: np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]) * 1e-5,
+    1: np.array([1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7]) * 1e-5,
+}
+
+# The ESA passband half-widths of the same file, a tenth of each center energy.
+ESA_ENERGY_DELTAS = {mode: energies / 10 for mode, energies in ESA_ENERGIES.items()}
+
+# The fill value as it lands in the map, which writes its variables as float32.
+FILL = np.float32(FILLVAL_FLOAT)
 
 
-@pytest.fixture(params=["h", "o", "doubles", "triples"])
-def species_name(request):
-    """Parametrized fixture for different species names."""
-    return request.param
+def is_fill(values):
+    """Whether each element of a map variable holds the fill value."""
+    return np.asarray(values) == FILL
 
 
-@pytest.fixture
-def sample_pset():
-    """Create a sample pointing set with typical data variables."""
-    # Create counts data with some non-zero values
-    counts = np.zeros(PSET_SHAPE)
-    counts[:, 2:4, 10:20, 5:15] = 5  # Add some counts for testing
+def measured(values):
+    """The elements of a map variable that are not filled."""
+    values = np.asarray(values)
+    return values[~is_fill(values)]
 
-    exposure_factor = np.full(PSET_SHAPE, 0.5)
 
-    # Create background rates data
-    background_rates = np.full(PSET_SHAPE, 0.1)  # 0.1 counts/s background
-    background_rates_stat_uncert = np.full(PSET_SHAPE, 0.01)  # 10% uncertainty
+@pytest.fixture(autouse=True)
+def use_test_geometric_factors():
+    """Point the map at the small geometric factor ancillary in ``test_anc``.
 
-    # Create coordinate arrays
-    lons, lats = np.meshgrid(
-        SPIN_ANGLE_BIN_CENTERS, OFF_ANGLE_BIN_CENTERS, indexing="ij"
-    )
-    hae_longitude = np.empty((1, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS))
-    hae_latitude = np.empty((1, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS))
-    hae_longitude[0, :, :] = lons
-    hae_latitude[0, :, :] = lats
+    The map reads its geometric factors, and the ESA level energies they were
+    measured at, straight out of the ancillary shipped with the package. The
+    test file stands in for it so the tests do not have to track the flight
+    calibration.
+    """
+    with patch("imap_processing.lo.l2.lo_l2.ANCILLARY_DATA_DIR", ANCILLARY_DIR):
+        yield
 
-    dataset = xr.Dataset(
+
+def product_attrs(repointing, product):
+    """The global attributes an L1B input of a pointing is written with."""
+
+    return {
+        "Repointing": f"repoint{repointing:05d}",
+        "Logical_source": f"imap_lo_l1b_{product}",
+    }
+
+
+def make_pointing(repointing=100, pivot=PIVOT, seed=42):
+    """Build the three synthetic L1B inputs of one pointing.
+
+    The in-window epochs carry modest counts and exposure; the out-of-window
+    epochs carry large values that good-time filtering must exclude.
+    """
+    mets = np.array(IN_METS + OUT_METS)
+    in_idx = np.arange(len(IN_METS))
+    out_idx = np.arange(len(IN_METS), mets.size)
+
+    rng = np.random.default_rng(seed)
+    counts = np.zeros((mets.size, N_ESA, N_SPIN_BINS))
+    exposure = np.zeros_like(counts)
+    for i in in_idx:
+        counts[i] = rng.integers(0, 4, size=(N_ESA, N_SPIN_BINS)).astype(float)
+        exposure[i] = 2.0 * (np.arange(N_ESA)[:, None] + 1)
+    for i in out_idx:
+        counts[i] = 999.0
+        exposure[i] = 999.0
+
+    histrates = xr.Dataset(
         {
-            "counts": (PSET_DIMS, counts),
-            "exposure_factor": (PSET_DIMS, exposure_factor),
-            "background_rates": (PSET_DIMS, background_rates),
-            "background_rates_stat_uncert": (
-                PSET_DIMS,
-                background_rates_stat_uncert,
-            ),
-            "hae_longitude": (("epoch", "spin_angle", "off_angle"), hae_longitude),
-            "hae_latitude": (("epoch", "spin_angle", "off_angle"), hae_latitude),
+            "h_counts": (["epoch", "esa_step", "spin_bin_6"], counts),
+            # The sputter correction reads the oxygen counts of the same
+            # pointing. Making them the hydrogen counts lets a test predict the
+            # correction from the hydrogen counts the uncorrected map reports.
+            "o_counts": (["epoch", "esa_step", "spin_bin_6"], counts),
+            "exposure_time_6deg": (["epoch", "esa_step", "spin_bin_6"], exposure),
+            "esa_mode": ("epoch", np.zeros(mets.size, dtype=int)),
         },
-        coords={
-            "epoch": [8.1794907049e17],
-            "esa_energy_step": ESA_ENERGY_STEPS,
-            "spin_angle": SPIN_ANGLE_BIN_CENTERS,
-            "off_angle": OFF_ANGLE_BIN_CENTERS,
-        },
+        coords={"epoch": met_to_ttj2000ns(mets)},
+        attrs=product_attrs(repointing, "histrates"),
     )
-    return dataset
-
-
-@pytest.fixture
-def sample_pset_for_species(species_name):
-    """Create a sample pointing set for a specific species."""
-    # Create counts data with some non-zero values
-    counts = np.zeros(PSET_SHAPE)
-    if species_name == "h":
-        counts[:, 2:4, 10:20, 5:15] = 5
-    elif species_name == "o":
-        counts[:, 1:3, 15:25, 8:18] = 3
-    elif species_name == "doubles":
-        counts[:, 0:2, 5:15, 10:20] = 2
-    elif species_name == "triples":
-        counts[:, 3:5, 20:30, 15:25] = 1
-
-    exposure_factor = np.full(PSET_SHAPE, 0.5)
-
-    # Create coordinate arrays
-    lons, lats = np.meshgrid(
-        SPIN_ANGLE_BIN_CENTERS, OFF_ANGLE_BIN_CENTERS, indexing="ij"
-    )
-    hae_longitude = np.empty((1, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS))
-    hae_latitude = np.empty((1, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS))
-    hae_longitude[0, :, :] = lons
-    hae_latitude[0, :, :] = lats
-
-    # Base dataset with coords and exposure time
-    dataset_dict = {
-        "counts": (PSET_DIMS, counts),
-        "exposure_factor": (PSET_DIMS, exposure_factor),
-        "hae_longitude": (("epoch", "spin_angle", "off_angle"), hae_longitude),
-        "hae_latitude": (("epoch", "spin_angle", "off_angle"), hae_latitude),
-    }
-
-    # Add background rates only for h and o
-    if species_name in ["h", "o"]:
-        bg_rate = np.full(PSET_SHAPE, 0.1 if species_name == "h" else 0.05)
-        bg_uncert = np.full(PSET_SHAPE, 0.01 if species_name == "h" else 0.005)
-        dataset_dict["background_rates"] = (PSET_DIMS, bg_rate)
-        dataset_dict["background_rates_stat_uncert"] = (
-            PSET_DIMS,
-            bg_uncert,
-        )
-
-    dataset = xr.Dataset(
-        dataset_dict,
-        coords={
-            "epoch": [8.1794907049e17],
-            "esa_energy_step": ESA_ENERGY_STEPS,
-            "spin_angle": SPIN_ANGLE_BIN_CENTERS,
-            "off_angle": OFF_ANGLE_BIN_CENTERS,
-        },
-    )
-    return dataset
-
-
-@pytest.fixture
-def minimal_pset():
-    """Create a minimal pointing set with typical data for testing."""
-    counts = np.ones(PSET_SHAPE)  # All ones for easy testing
-    exposure_factor = np.full(PSET_SHAPE, 1.0)  # 1 second exposure for easy math
-
-    # Create simple background rates for testing
-    background_rates = np.full(PSET_SHAPE, 0.2)  # 0.2 counts/s
-    background_rates_stat_uncert = np.full(PSET_SHAPE, 0.02)  # 10% uncertainty
-
-    # Simple coordinate arrays
-    lons, lats = np.meshgrid(
-        SPIN_ANGLE_BIN_CENTERS, OFF_ANGLE_BIN_CENTERS, indexing="ij"
-    )
-    hae_longitude = np.empty((1, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS))
-    hae_latitude = np.empty((1, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS))
-    hae_longitude[0, :, :] = lons
-    hae_latitude[0, :, :] = lats
-
-    dataset = xr.Dataset(
+    goodtimes = xr.Dataset(
         {
-            "counts": (PSET_DIMS, counts),
-            "exposure_factor": (PSET_DIMS, exposure_factor),
-            "background_rates": (PSET_DIMS, background_rates),
-            "background_rates_stat_uncert": (
-                PSET_DIMS,
-                background_rates_stat_uncert,
-            ),
-            "hae_longitude": (("epoch", "spin_angle", "off_angle"), hae_longitude),
-            "hae_latitude": (("epoch", "spin_angle", "off_angle"), hae_latitude),
+            "pivot": ("epoch", [pivot]),
+            "gt_start_met": ("epoch", [GT_START]),
+            "gt_end_met": ("epoch", [GT_END]),
         },
-        coords={
-            "epoch": [8.1794907049e17],
-            "esa_energy_step": ESA_ENERGY_STEPS,
-            "spin_angle": SPIN_ANGLE_BIN_CENTERS,
-            "off_angle": OFF_ANGLE_BIN_CENTERS,
-        },
+        coords={"epoch": [0]},
+        attrs=product_attrs(repointing, "goodtimes"),
     )
-    return dataset
-
-
-@pytest.fixture
-def minimal_pset_for_species(species_name):
-    """Create a minimal pointing set for a specific species."""
-    # Create simple counts data
-    if species_name == "h":
-        counts = np.ones(PSET_SHAPE)
-    elif species_name == "o":
-        counts = np.ones(PSET_SHAPE) * 0.5
-    elif species_name == "doubles":
-        counts = np.ones(PSET_SHAPE) * 0.2
-    elif species_name == "triples":
-        counts = np.ones(PSET_SHAPE) * 0.1
-
-    exposure_factor = np.full(PSET_SHAPE, 1.0)  # 1 second exposure for easy math
-
-    # Simple coordinate arrays
-    lons, lats = np.meshgrid(
-        SPIN_ANGLE_BIN_CENTERS, OFF_ANGLE_BIN_CENTERS, indexing="ij"
+    background = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07])
+    bgrates = xr.Dataset(
+        {"h_background_rates": (["epoch", "esa_step"], background[np.newaxis, :])},
+        coords={"epoch": [0], "esa_step": np.arange(1, N_ESA + 1)},
+        attrs=product_attrs(repointing, "bgrates"),
     )
-    hae_longitude = np.empty((1, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS))
-    hae_latitude = np.empty((1, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS))
-    hae_longitude[0, :, :] = lons
-    hae_latitude[0, :, :] = lats
 
-    # Base dataset with coords and exposure time
-    dataset_dict = {
-        "counts": (PSET_DIMS, counts),
-        "exposure_factor": (PSET_DIMS, exposure_factor),
-        "hae_longitude": (("epoch", "spin_angle", "off_angle"), hae_longitude),
-        "hae_latitude": (("epoch", "spin_angle", "off_angle"), hae_latitude),
+    return {
+        "repointing": repointing,
+        "goodtimes": goodtimes,
+        "bgrates": bgrates,
+        "histrates": histrates,
+        "expected_counts": counts[in_idx].sum(axis=(0, 2)),
+        "expected_exposure": exposure[in_idx].sum(axis=(0, 2)),
+        "background": background,
     }
 
-    # Add background rates for all species
-    bg_rate = np.full(PSET_SHAPE, 0.2 if species_name == "h" else 0.1)
-    bg_uncert = np.full(PSET_SHAPE, 0.02 if species_name == "h" else 0.01)
-    dataset_dict["background_rates"] = (PSET_DIMS, bg_rate)
-    dataset_dict["background_rates_stat_uncert"] = (PSET_DIMS, bg_uncert)
 
-    dataset = xr.Dataset(
-        dataset_dict,
-        coords={
-            "epoch": [8.1794907049e17],
-            "esa_energy_step": ESA_ENERGY_STEPS,
-            "spin_angle": SPIN_ANGLE_BIN_CENTERS,
-            "off_angle": OFF_ANGLE_BIN_CENTERS,
-        },
-    )
-    return dataset
+def as_dependencies(*pointings, products=("goodtimes", "bgrates", "histrates")):
+    """Turn pointings into the sci_dependencies lo_l2 takes.
 
-
-@pytest.fixture
-def sample_efficiency_data():
-    """Create sample efficiency factor data for testing."""
-    data = {
-        "Date": [np.datetime64("2025-01-01"), np.datetime64("2025-01-02")],
-        "E-Step1_eff": [0.8, 0.85],
-        "E-Step2_eff": [0.82, 0.87],
-        "E-Step3_eff": [0.84, 0.89],
-        "E-Step4_eff": [0.86, 0.91],
-        "E-Step5_eff": [0.88, 0.93],
-        "E-Step6_eff": [0.90, 0.95],
-        "E-Step7_eff": [0.92, 0.97],
-    }
-    return pd.DataFrame(data)
-
-
-@pytest.fixture
-def sample_geometric_factor_data():
-    """Create sample geometric factor data for testing."""
-    h_gf_data = []
-    o_gf_data = []
-
-    for i in range(7):  # 7 energy steps
-        h_gf_data.append(
-            {
-                "esa_mode": 0,
-                "Observed_E-Step": i + 1,
-                "incident_E-Step": i + 1,
-                "Cntr_E": 0.01 * (i + 1),  # Simple energy values
-                "Cntr_E_unc": 0.001 * (i + 1),
-                "GF_Trpl_H": 1e-4 * (i + 1),
-                "GF_Trpl_H_unc": 1e-5 * (i + 1),
-                "GF_Dbl_all": 2e-4 * (i + 1),
-                "GF_Dbl_all_unc": 2e-5 * (i + 1),
-                "GF_Trpl_all": 3e-4 * (i + 1),
-                "GF_Trpl_all_unc": 3e-5 * (i + 1),
-            }
-        )
-
-        o_gf_data.append(
-            {
-                "esa_mode": 0,
-                "Observed_E-Step": i + 1,
-                "incident_E-Step": i + 1,
-                "Cntr_E": 0.015 * (i + 1),  # Slightly different for oxygen
-                "Cntr_E_unc": 0.0015 * (i + 1),
-                "GF_Trpl_O": 1.5e-4 * (i + 1),
-                "GF_Trpl_O_unc": 1.5e-5 * (i + 1),
-            }
-        )
-
-    return pd.DataFrame(h_gf_data), pd.DataFrame(o_gf_data)
-
-
-@pytest.fixture
-def sample_sky_map_dataset():
-    """Create a sample sky map dataset for testing calculations."""
-    # Create a simple rectangular map
-    n_lon, n_lat = 60, 30
-    n_energy = 7
-
-    dataset = xr.Dataset(
-        coords={
-            "epoch": [8.1794907049e17],
-            "energy": list(range(n_energy)),
-            "longitude": np.linspace(0, 360, n_lon, endpoint=False),
-            "latitude": np.linspace(-90, 90, n_lat),
-        }
-    )
-
-    # Current lo_l2.py uses generic variable names, not species-specific
-    counts = np.ones((1, n_energy, n_lon, n_lat)) * 10  # 10 counts for easy math
-    dataset["counts"] = (("epoch", "energy", "longitude", "latitude"), counts)
-
-    # Add efficiency-corrected quantities for intensity calculations
-    eff_corr = counts / 0.9  # Assuming 90% efficiency
-    dataset["counts_over_eff"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        eff_corr,
-    )
-    dataset["counts_over_eff_squared"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        eff_corr,
-    )
-
-    # Add exposure time using the current naming convention
-    exposure = np.ones((1, n_energy, n_lon, n_lat)) * 1.0  # 1 second
-    dataset["exposure_factor"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        exposure,
-    )
-
-    return dataset
-
-
-@pytest.fixture
-def sample_dataset_with_geometric_factors():
-    """Create a dataset with geometric factors for testing calculations."""
-    dataset = xr.Dataset(
-        coords={
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-        }
-    )
-
-    # Add current generic variable names used by lo_l2.py
-    dataset["counts_over_eff"] = (("epoch", "energy"), np.ones((1, 7)) * 100)
-    dataset["counts_over_eff_squared"] = (("epoch", "energy"), np.ones((1, 7)) * 100)
-    dataset["exposure_factor"] = (("epoch", "energy"), np.ones((1, 7)) * 1.0)
-    dataset["geometric_factor"] = (("energy",), np.ones(7) * 1e-4)
-    dataset["energy"] = (("energy",), np.ones(7) * 0.1)  # Energy values
-    dataset["geometric_factor_stat_uncert"] = (("energy",), np.ones(7) * 1e-5)
-
-    return dataset
-
-
-@pytest.fixture
-def sample_dataset_with_background_intermediates():
-    """Create a dataset with background intermediate variables for testing."""
-    # Create a simple rectangular map with background data
-    n_energy = 7
-
-    dataset = xr.Dataset(
-        coords={
-            "epoch": [8.1794907049e17],
-            "energy": list(range(n_energy)),
-        }
-    )
-
-    # Add the intermediate background variables using current naming convention
-    bg_rate_exposure_factor = np.ones((1, n_energy)) * 0.2  # 0.2 counts
-    dataset["bg_rate_exposure_factor"] = (("epoch", "energy"), bg_rate_exposure_factor)
-
-    # Background uncertainty squared times exposure time squared
-    bg_rate_stat_uncert_exposure_factor2 = np.ones((1, n_energy)) * 0.004  # 0.02^2
-    dataset["bg_rate_stat_uncert_exposure_factor2"] = (
-        ("epoch", "energy"),
-        bg_rate_stat_uncert_exposure_factor2,
-    )
-
-    # Add exposure time (using current naming convention)
-    exposure = np.ones((1, n_energy)) * 1.0  # 1 second
-    dataset["exposure_factor"] = (("epoch", "energy"), exposure)
-
-    # Add geometric factors for systematic uncertainty calculation
-    dataset["geometric_factor"] = (("energy",), np.ones(n_energy) * 1e-4)
-    dataset["geometric_factor_stat_uncert"] = (("energy",), np.ones(n_energy) * 1e-5)
-
-    return dataset
-
-
-@pytest.fixture
-def sample_dataset_with_sputtering_data():
-    """Create datasets with ENA intensities for sputtering correction testing."""
-    # Create a simple map dataset with the required variables for sputtering correction
-    n_energy = 7
-    n_lon, n_lat = 10, 5  # Smaller for testing
-
-    coords = {
-        "epoch": [8.1794907049e17],
-        "energy": list(range(n_energy)),
-        "longitude": np.linspace(0, 360, n_lon, endpoint=False),
-        "latitude": np.linspace(-90, 90, n_lat),
+    The CLI keys the inputs by repointing and then by product descriptor, see
+    ``cli.Lo.do_processing``.
+    """
+    return {
+        pointing["repointing"]: {product: pointing[product] for product in products}
+        for pointing in pointings
     }
 
-    # Create hydrogen dataset
-    h_intensity_values = np.ones((1, n_energy, n_lon, n_lat)) * 1e6  # Base intensity
-    h_intensity_values[0, 4, :, :] *= 3  # Higher at energy level 4 (ESA level 5)
-    h_intensity_values[0, 5, :, :] *= 2  # Higher at energy level 5 (ESA level 6)
 
-    h_dataset = xr.Dataset(coords=coords)
-    h_dataset["ena_intensity"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        h_intensity_values,
-    )
-    h_dataset["bg_intensity"] = h_dataset["ena_intensity"] * 0.1  # 10% background
+def identity_pointing(et, az_el, *args, **kwargs):
+    """Stand in for the SPICE DPS transform: spin angle -> lon, off -> lat.
 
-    # Add statistical uncertainties
-    h_dataset["ena_intensity_stat_uncert"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        np.sqrt(h_intensity_values) * 0.1,
-    )
-    h_dataset["bg_intensity_stat_uncert"] = np.sqrt(h_dataset["bg_intensity"]) * 0.1
-
-    # Add systematic error
-    h_dataset["ena_intensity_sys_err"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        h_intensity_values * 0.05,
-    )
-    h_dataset["bg_intensity_sys_err"] = h_dataset["bg_intensity"] * 0.05
-
-    # Create oxygen dataset
-    o_intensity_values = np.ones((1, n_energy, n_lon, n_lat)) * 1e6  # Base intensity
-    o_intensity_values[0, 4, :, :] *= 5  # Higher at energy level 4 (ESA level 5)
-    o_intensity_values[0, 5, :, :] *= 3  # Higher at energy level 5 (ESA level 6)
-
-    o_dataset = xr.Dataset(coords=coords)
-    o_dataset["ena_intensity"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        o_intensity_values,
-    )
-    o_dataset["bg_intensity"] = o_dataset["ena_intensity"] * 0.1  # 10% background
-    o_dataset["bg_intensity_stat_uncert"] = np.sqrt(o_dataset["bg_intensity"]) * 0.1
-
-    # Add statistical uncertainties
-    o_dataset["ena_intensity_stat_uncert"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        np.sqrt(o_intensity_values) * 0.1,
-    )
-    o_dataset["bg_intensity_stat_uncert"] = (
-        np.sqrt(o_dataset["bg_intensity_stat_uncert"]) * 0.1
-    )
-
-    # Add systematic error
-    o_dataset["ena_intensity_sys_err"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        o_intensity_values * 0.05,
-    )
-    o_dataset["bg_intensity_sys_err"] = o_dataset["bg_intensity"] * 0.05
-
-    # Add geometric factors for intensity calculations
-    o_dataset["geometric_factor"] = (("energy",), np.ones(n_energy))
-
-    return h_dataset, o_dataset
+    Like the real ``frame_transform_az_el``, the singleton off-angle dimension
+    is squeezed out.
+    """
+    return np.asarray(az_el)[:, 0, :]
 
 
-@pytest.fixture
-def sample_dataset_with_bootstrap_data():
-    """Create a dataset with ENA intensities for bootstrap correction testing."""
-    # Create a simple map dataset with the required variables for bootstrap correction
-    n_energy = 7
-    n_lon, n_lat = 10, 5  # Smaller for testing
-
-    coords = {
-        "epoch": [8.1794907049e17],
-        "energy": list(range(n_energy)),
-        "longitude": np.linspace(0, 360, n_lon, endpoint=False),
-        "latitude": np.linspace(-90, 90, n_lat),
+def make_pointing_set(sky_map, spin_angles, pivot=PIVOT):
+    """Build the in-memory pointing set of one pointing, sky pointing mocked."""
+    energy = np.arange(1.0, N_ESA + 1.0)
+    values = {
+        name: np.ones((N_ESA, spin_angles.size))
+        for name in ("ena_count", "exposure_factor", "bg_rate_exposure")
     }
-
-    # Create realistic energy values for hydrogen
-    energy_values = np.array([0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0])  # keV
-
-    # Create intensity values that follow a power law distribution
-    # Higher intensities at lower energies
-    base_intensity = 1e6  # particles/(cm^2 sr s keV)
-    intensity_values = np.ones((1, n_energy, n_lon, n_lat))
-    for i in range(n_energy):
-        # Power law: I = I0 * (E/E0)^(-2.5)
-        intensity_values[0, i, :, :] = base_intensity * (energy_values[i] / 1.0) ** (
-            -2.5
+    with patch(
+        "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+        side_effect=identity_pointing,
+    ):
+        return LoSpinAnglePointingSet(
+            met_to_ttj2000ns(GT_START),
+            pivot,
+            spin_angles,
+            values,
+            sky_map.spice_reference_frame,
+            energy,
         )
-
-    dataset = xr.Dataset(coords=coords)
-    dataset["ena_intensity"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        intensity_values,
-    )
-    dataset["energy"] = (("energy",), energy_values)
-    dataset["geometric_factor"] = (("energy",), np.ones(n_energy))
-
-    # Add background rates (much lower values)
-    dataset["bg_intensity"] = (
-        dataset["ena_intensity"]
-        * 0.1
-        / (dataset["geometric_factor"] * dataset["energy"])
-    )
-
-    # Add statistical uncertainties (Poisson-like)
-    dataset["ena_intensity_stat_uncert"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        np.sqrt(intensity_values) * 0.1,
-    )
-
-    # Add systematic error (5% of intensity)
-    dataset["ena_intensity_sys_err"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        intensity_values * 0.05,
-    )
-
-    return dataset
 
 
 @pytest.fixture
-def lo_flux_factors_file():
-    """Path to the LO flux factors test file."""
-    # Use the actual test data file from the ena_maps test data
-    test_data_path = Path(__file__).parent.parent / "ena_maps" / "data"
-    return test_data_path / "imap_lo_esa-eta-fit-factors_20240101_v001.csv"
+def one_pointing():
+    """A single synthetic pointing."""
+    return make_pointing()
 
 
 @pytest.fixture
-def sample_dataset_with_intensities():
-    """Create a dataset with intensities for flux correction testing."""
-    n_energy = 7
-    n_lon, n_lat = 6, 4  # Small for testing
+def anc_dependencies():
+    """The ancillary files a map takes as a dependency.
 
-    # Create realistic energy values matching the flux factors file
-    energy_values = np.array([16.35, 30.56, 56.4, 105, 199.8, 407.5, 795.3])
-
-    coords = {
-        "epoch": [8.1794907049e17],
-        "energy": energy_values,
-        "longitude": np.linspace(0, 360, n_lon, endpoint=False),
-        "latitude": np.linspace(-90, 90, n_lat),
-    }
-
-    # Create intensity values with some spatial and energy structure
-    intensity_values = np.ones((1, n_energy, n_lon, n_lat))
-    for i in range(n_energy):
-        # Power law: I = I0 * (E/E0)^(-2.0)
-        intensity_values[0, i, :, :] = 1e6 * (energy_values[i] / 100.0) ** (-2.0)
-
-    # Add some spatial structure
-    for j in range(n_lon):
-        for k in range(n_lat):
-            intensity_values[0, :, j, k] *= 1.0 + 0.1 * np.sin(j) * np.cos(k)
-
-    dataset = xr.Dataset(coords=coords)
-    dataset["ena_intensity"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        intensity_values,
-    )
-
-    # Add statistical uncertainties (10% of intensity)
-    dataset["ena_intensity_stat_uncert"] = (
-        ("epoch", "energy", "longitude", "latitude"),
-        intensity_values * 0.1,
-    )
-
-    dataset["bg_intensity"] = dataset["ena_intensity"] * 0.5  # 50% background
-
-    # Add statistical uncertainties (10% of intensity)
-    dataset["bg_intensity_stat_uncert"] = dataset["bg_intensity"] * 0.1
-
-    return dataset
+    A heliospheric frame map is Compton-Getting corrected, which is the only
+    thing the ESA eta fit factors are read for.
+    """
+    return [ANCILLARY_DIR / "imap_lo_esa-eta-fit-factors_20240101_v001.csv"]
 
 
-# =============================================================================
-# UNIT TESTS FOR INDIVIDUAL FUNCTIONS
-# =============================================================================
+@pytest.fixture
+def shipped_ancillaries():
+    """Read the calibration ancillaries shipped with the package.
+
+    Undoes the autouse ``use_test_geometric_factors`` patch (a more common use-case)
+        for tests that need the shipped ancillaries.
+    """
+    with patch("imap_processing.lo.l2.lo_l2.ANCILLARY_DATA_DIR", PACKAGE_ANCILLARY_DIR):
+        yield
 
 
-class TestLoadEfficiencyData:
-    """Tests for the load_efficiency_data function."""
-
-    def test_load_efficiency_data_with_files(self, tmp_path):
-        """Test loading efficiency data when files are present."""
-        # Create temporary efficiency files
-        eff_file1 = tmp_path / "efficiency-factor_v001.csv"
-        eff_file2 = tmp_path / "efficiency-factor_v002.csv"
-
-        # Create sample data
-        data1 = pd.DataFrame(
-            {
-                "Date": [np.datetime64("2025-01-01")],
-                "E-Step1_eff": [0.8],
-                "E-Step2_eff": [0.82],
-                "E-Step3_eff": [0.84],
-                "E-Step4_eff": [0.86],
-                "E-Step5_eff": [0.88],
-                "E-Step6_eff": [0.90],
-                "E-Step7_eff": [0.92],
-            }
+@pytest.fixture
+def full_map(one_pointing, anc_dependencies):
+    """The full-spin map of one pointing, with the sky pointing mocked."""
+    with patch(
+        "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+        side_effect=identity_pointing,
+    ):
+        (dataset,) = lo_l2(
+            as_dependencies(one_pointing), anc_dependencies, FULL_DESCRIPTOR
         )
+    return dataset, one_pointing
 
-        data2 = pd.DataFrame(
-            {
-                "Date": [np.datetime64("2025-01-02")],
-                "E-Step1_eff": [0.85],
-                "E-Step2_eff": [0.87],
-                "E-Step3_eff": [0.89],
-                "E-Step4_eff": [0.91],
-                "E-Step5_eff": [0.93],
-                "E-Step6_eff": [0.95],
-                "E-Step7_eff": [0.97],
-            }
+
+@pytest.fixture
+def sputter_maps(one_pointing, anc_dependencies):
+    """The sputter corrected and uncorrected maps of the same pointing.
+
+    The two differ only in whether the correction was applied, so the
+    uncorrected map supplies the counts the correction is predicted from.
+    """
+    with patch(
+        "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+        side_effect=identity_pointing,
+    ):
+        (corrected,) = lo_l2(
+            as_dependencies(one_pointing), anc_dependencies, SPUTTER_DESCRIPTOR
         )
+        (raw,) = lo_l2(as_dependencies(one_pointing), anc_dependencies, FULL_DESCRIPTOR)
+    return corrected, raw
 
-        # Save to CSV
-        data1.to_csv(eff_file1, index=False)
-        data2.to_csv(eff_file2, index=False)
 
-        # Mock the ancillary file reader
+@pytest.fixture
+def bootstrap_maps(one_pointing, anc_dependencies):
+    """The bootstrap corrected and uncorrected maps of the same pointing.
+
+    The two differ only in whether the correction was applied, so the
+    uncorrected map supplies the intensities the correction is predicted from.
+    """
+    with patch(
+        "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+        side_effect=identity_pointing,
+    ):
+        (corrected,) = lo_l2(
+            as_dependencies(one_pointing), anc_dependencies, BOOTSTRAP_DESCRIPTOR
+        )
+        (raw,) = lo_l2(as_dependencies(one_pointing), anc_dependencies, FULL_DESCRIPTOR)
+    return corrected, raw
+
+
+@pytest.fixture
+def cg_maps(one_pointing, anc_dependencies):
+    """The Compton-Getting corrected and uncorrected maps of one pointing.
+
+    The two differ only in the frame they are made in, which is what asks for
+    the correction, so the spacecraft frame map supplies the intensities the
+    correction is predicted from.
+    """
+    with patch(
+        "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+        side_effect=identity_pointing,
+    ):
+        (corrected,) = lo_l2(
+            as_dependencies(one_pointing), anc_dependencies, CG_DESCRIPTOR
+        )
+        (raw,) = lo_l2(as_dependencies(one_pointing), anc_dependencies, FULL_DESCRIPTOR)
+    return corrected, raw
+
+
+@pytest.fixture
+def masked_maps(one_pointing, anc_dependencies):
+    """The ISN masked and unmasked maps of the same pointing.
+
+    The two differ only in whether the band was masked out, so the unmasked map
+    supplies the intensities the mask is predicted from.
+    """
+    with patch(
+        "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+        side_effect=identity_pointing,
+    ):
+        (masked,) = lo_l2(
+            as_dependencies(one_pointing), anc_dependencies, MASK_DESCRIPTOR
+        )
+        (raw,) = lo_l2(as_dependencies(one_pointing), anc_dependencies, FULL_DESCRIPTOR)
+    return masked, raw
+
+
+@pytest.fixture
+def pointings_at_every_pivot():
+    """One synthetic pointing at each of the pivot angles a map combines."""
+    return [
+        make_pointing(repointing=100 + i, pivot=pivot, seed=i + 1)
+        for i, pivot in enumerate(COMBINED_PIVOTS)
+    ]
+
+
+class TestCombinedMap:
+    """A map that selects no pivot angle and takes every pointing it is given."""
+
+    def test_every_pivot_angle_is_accumulated(
+        self, pointings_at_every_pivot, anc_dependencies
+    ):
+        """The counts of all three pointings land on the one combined map."""
         with patch(
-            "imap_processing.lo.l2.lo_l2.lo_ancillary.read_ancillary_file"
-        ) as mock_read:
-            mock_read.side_effect = [data1, data2]
-
-            # Test the function
-            result = load_efficiency_data([str(eff_file1), str(eff_file2)])
-
-            # Verify results
-            assert len(result) == 2
-            assert "Date" in result.columns
-            assert "E-Step1_eff" in result.columns
-            assert mock_read.call_count == 2
-
-    def test_load_efficiency_data_no_files(self):
-        """Test loading efficiency data when no files are present."""
-        result = load_efficiency_data([])
-
-        assert isinstance(result, pd.DataFrame)
-        assert result.empty
-
-    def test_load_efficiency_data_non_efficiency_files(self):
-        """Test that non-efficiency files are ignored."""
-        files = ["some_other_file.csv", "another_file.txt"]
-        result = load_efficiency_data(files)
-
-        assert isinstance(result, pd.DataFrame)
-        assert result.empty
-
-
-class TestReduceGeometricFactor:
-    """Tests for the reduce_geometric_factor_dataset function."""
-
-    @pytest.mark.parametrize("species", ["h", "o"])
-    @pytest.mark.parametrize("esa_mode", [0, 1])
-    def test_reduce_geometric_factor_dataset(
-        self,
-        species,
-        esa_mode,
-    ):
-        """Test functionality of reduce_geometric_factor_dataset with real gf data."""
-
-        result = reduce_geometric_factor_dataset(species, esa_mode)
-
-        # Verify it returns an xarray Dataset
-        assert isinstance(result, xr.Dataset)
-
-        # Verify it has 7 energy steps
-        assert len(result["Observed_E-Step"]) == 7
-
-        # Verify the index is 1-7
-        expected_indices = list(range(1, 8))
-        np.testing.assert_array_equal(
-            result["Observed_E-Step"].values, expected_indices
-        )
-
-        # Verify that incident_E-Step == Observed_E-Step
-        np.testing.assert_array_equal(
-            result["incident_E-Step"].values, result["Observed_E-Step"].values
-        )
-
-    @patch("imap_processing.lo.l2.lo_l2.load_geometric_factor_data")
-    def test_reduce_geometric_factor_dataset_hydrogen(
-        self, mock_load_gf, sample_geometric_factor_data
-    ):
-        """Test that hydrogen geometric factors are correctly loaded and processed."""
-        h_gf_data, _ = sample_geometric_factor_data
-        mock_load_gf.return_value = h_gf_data
-
-        result = reduce_geometric_factor_dataset("h", esa_mode=0)
-
-        # Check that hydrogen-specific columns are present
-        assert "Cntr_E" in result.data_vars
-        assert "GF_Trpl_H" in result.data_vars
-        assert "GF_Trpl_H_unc" in result.data_vars
-
-        # Verify energy values match expected for hydrogen
-        expected_energies = [0.01 * (i + 1) for i in range(7)]
-        np.testing.assert_array_almost_equal(result["Cntr_E"].values, expected_energies)
-
-    @patch("imap_processing.lo.l2.lo_l2.load_geometric_factor_data")
-    def test_reduce_geometric_factor_dataset_oxygen(
-        self, mock_load_gf, sample_geometric_factor_data
-    ):
-        """Test that oxygen geometric factors are correctly loaded and processed."""
-        _, o_gf_data = sample_geometric_factor_data
-        mock_load_gf.return_value = o_gf_data
-
-        result = reduce_geometric_factor_dataset("o", esa_mode=0)
-
-        # Check that oxygen-specific columns are present
-        assert "Cntr_E" in result.data_vars
-        assert "GF_Trpl_O" in result.data_vars
-        assert "GF_Trpl_O_unc" in result.data_vars
-
-        # Verify energy values match expected for oxygen
-        expected_energies = [0.015 * (i + 1) for i in range(7)]
-        np.testing.assert_array_almost_equal(result["Cntr_E"].values, expected_energies)
-
-    @patch("imap_processing.lo.l2.lo_l2.load_geometric_factor_data")
-    def test_reduce_geometric_factor_dataset_esa_mode_filtering(
-        self, mock_load_gf, sample_geometric_factor_data
-    ):
-        """Test that ESA mode filtering works correctly."""
-        h_gf_data, _ = sample_geometric_factor_data
-
-        # Create data with two ESA modes
-        h_gf_mode_0 = h_gf_data.copy()
-        h_gf_mode_1 = h_gf_data.copy()
-
-        # Modify mode 1 data to have different GF values
-        for col in ["GF_Trpl_H", "GF_Dbl_all", "GF_Trpl_all"]:
-            h_gf_mode_1[col] = h_gf_mode_1[col] * 1.5
-        h_gf_mode_1["esa_mode"] = 1
-
-        combined_data = pd.concat([h_gf_mode_0, h_gf_mode_1], ignore_index=True)
-        mock_load_gf.return_value = combined_data
-
-        # Get data for mode 0
-        result_mode_0 = reduce_geometric_factor_dataset("h", esa_mode=0)
-
-        # Get data for mode 1
-        result_mode_1 = reduce_geometric_factor_dataset("h", esa_mode=1)
-
-        # Verify that mode 1 has different (larger) GF values
-        assert np.all(
-            result_mode_1["GF_Trpl_H"].values > result_mode_0["GF_Trpl_H"].values
-        )
-
-        # Verify the ratio is approximately 1.5
-        ratio = result_mode_1["GF_Trpl_H"].values / result_mode_0["GF_Trpl_H"].values
-        np.testing.assert_array_almost_equal(ratio, np.ones(7) * 1.5)
-
-    @patch("imap_processing.lo.l2.lo_l2.load_geometric_factor_data")
-    def test_reduce_geometric_factor_dataset_duplicate_removal(
-        self, mock_load_gf, sample_geometric_factor_data
-    ):
-        """Test that duplicate Observed_E-Step values are handled correctly."""
-        h_gf_data, _ = sample_geometric_factor_data
-
-        # Add duplicate rows with same Observed_E-Step but different incident_E-Step
-        duplicates = h_gf_data.copy()
-        duplicates["incident_E-Step"] = [
-            i + 8 for i in range(7)
-        ]  # Different incident steps
-
-        combined_data = pd.concat([h_gf_data, duplicates], ignore_index=True)
-        mock_load_gf.return_value = combined_data
-
-        result = reduce_geometric_factor_dataset("h", esa_mode=0)
-
-        # Should still have exactly 7 energy steps (duplicates removed)
-        assert len(result["Observed_E-Step"]) == 7
-
-        # Verify no duplicate indices
-        assert len(np.unique(result["Observed_E-Step"].values)) == 7
-
-    @patch("imap_processing.lo.l2.lo_l2.load_geometric_factor_data")
-    def test_reduce_geometric_factor_dataset_invalid_species(self, mock_load_gf):
-        """Test that invalid species raises appropriate error."""
-        # Mock should raise ValueError for invalid species
-        mock_load_gf.side_effect = ValueError(
-            "Geometric factors only available for 'h' and 'o', got 'invalid'"
-        )
-
-        with pytest.raises(ValueError, match="Geometric factors only available"):
-            reduce_geometric_factor_dataset("invalid", esa_mode=0)
-
-    @patch("imap_processing.lo.l2.lo_l2.load_geometric_factor_data")
-    def test_reduce_geometric_factor_dataset_no_esa_mode_column(
-        self, mock_load_gf, sample_geometric_factor_data
-    ):
-        """Test handling when esa_mode column is missing from data."""
-        h_gf_data, _ = sample_geometric_factor_data
-
-        # Remove esa_mode column if it exists
-        if "esa_mode" in h_gf_data.columns:
-            h_gf_data = h_gf_data.drop(columns=["esa_mode"])
-
-        mock_load_gf.return_value = h_gf_data
-
-        # Should still work, just won't filter by esa_mode
-        result = reduce_geometric_factor_dataset("h", esa_mode=0)
-
-        # Should return 7 energy steps
-        assert len(result["Observed_E-Step"]) == 7
-        assert isinstance(result, xr.Dataset)
-
-
-class TestNormalizePsetCoordinates:
-    """Tests for the normalize_pset_coordinates function."""
-
-    @pytest.mark.parametrize("species", ["h", "o"])
-    def test_normalize_coordinates_basic(self, species):
-        """Test basic coordinate normalization for a specific species."""
-        # Create a pset with the specified species
-        pset = xr.Dataset(
-            {
-                f"{species}_counts": (PSET_DIMS, np.ones(PSET_SHAPE)),
-                "exposure_time": (PSET_DIMS, np.ones(PSET_SHAPE)),
-                f"{species}_background_rates": (PSET_DIMS, np.ones(PSET_SHAPE) * 0.1),
-                f"{species}_background_rates_stat_uncert": (
-                    PSET_DIMS,
-                    np.ones(PSET_SHAPE) * 0.01,
-                ),
-            },
-            coords={
-                "epoch": [8.1794907049e17],
-                "esa_energy_step": ESA_ENERGY_STEPS,
-                "spin_angle": SPIN_ANGLE_BIN_CENTERS,
-                "off_angle": OFF_ANGLE_BIN_CENTERS,
-            },
-        )
-
-        result = normalize_pset_coordinates(pset, species)
-
-        # Check that dimensions were renamed
-        assert "energy" in result.dims
-        assert "esa_energy_step" not in result.dims
-
-        # Check that energy coordinate is present
-        assert "energy" in result.coords
-        expected_energies = (
-            np.array([0.01633, 0.03047, 0.05576, 0.1063, 0.2, 0.405, 0.7873])
-            if species == "h"
-            else np.array([0.016, 0.032, 0.065, 0.135, 0.279, 0.601, 1.206])
-        )
-        np.testing.assert_array_equal(result.coords["energy"], expected_energies)
-
-        # Check that old coordinate variable was dropped
-        assert "esa_energy_step" not in result.variables
-
-        # Check that variables were renamed
-        assert "counts" in result.data_vars
-        assert "exposure_factor" in result.data_vars
-        assert "bg_rate" in result.data_vars
-        assert "bg_rate_stat_uncert" in result.data_vars
-
-        # Check that old variable names are gone
-        assert f"{species}_counts" not in result.data_vars
-        assert "exposure_time" not in result.data_vars
-
-    @pytest.mark.parametrize("species", ["doubles", "triples"])
-    def test_normalize_coordinates_no_background(self, species):
-        """Test normalization for species without background rates."""
-        # Create a pset with only counts and exposure time
-        pset = xr.Dataset(
-            {
-                f"{species}_counts": (PSET_DIMS, np.ones(PSET_SHAPE)),
-                "exposure_time": (PSET_DIMS, np.ones(PSET_SHAPE)),
-            },
-            coords={
-                "epoch": [8.1794907049e17],
-                "esa_energy_step": ESA_ENERGY_STEPS,
-                "spin_angle": SPIN_ANGLE_BIN_CENTERS,
-                "off_angle": OFF_ANGLE_BIN_CENTERS,
-            },
-        )
-
-        # For species without background rates, the function should fail
-        # because geometric factors can only be retrieved for "h" and "o"
-        with pytest.raises(ValueError, match="Geometric factors only available"):
-            normalize_pset_coordinates(pset, species)
-
-    def test_normalize_coordinates_removes_old_coordinate(self):
-        """Test that old esa_energy_step coordinate is removed."""
-        species = "h"
-        pset = xr.Dataset(
-            {
-                f"{species}_counts": (PSET_DIMS, np.ones(PSET_SHAPE)),
-                "exposure_time": (PSET_DIMS, np.ones(PSET_SHAPE)),
-                f"{species}_background_rates": (PSET_DIMS, np.ones(PSET_SHAPE) * 0.1),
-                f"{species}_background_rates_stat_uncert": (
-                    PSET_DIMS,
-                    np.ones(PSET_SHAPE) * 0.01,
-                ),
-                "esa_energy_step_var": xr.DataArray([1, 2, 3, 4, 5, 6, 7]),  # Variable
-            },
-            coords={
-                "epoch": [8.1794907049e17],
-                "esa_energy_step": ESA_ENERGY_STEPS,
-                "spin_angle": SPIN_ANGLE_BIN_CENTERS,
-                "off_angle": OFF_ANGLE_BIN_CENTERS,
-            },
-        )
-
-        result = normalize_pset_coordinates(pset, species)
-
-        # Should remove the esa_energy_step coordinate and variable
-        assert "esa_energy_step" not in result.variables
-        assert "esa_energy_step_var" in result.variables  # Data variable should remain
-
-
-class TestAddEfficiencyFactorsToPset:
-    """Tests for the add_efficiency_factors_to_pset function."""
-
-    def test_add_efficiency_factors_with_data(
-        self, minimal_pset, sample_efficiency_data
-    ):
-        """Test adding efficiency factors when data is available."""
-        # Set the epoch to match our sample data
-        pset = minimal_pset.copy()
-        # Convert date to TT2000 nanoseconds (approximate)
-        epoch_ns = 8.1794907049e17  # This should correspond to 2025-01-01
-        pset = pset.assign_coords(epoch=[epoch_ns])
-
-        with (
-            patch("imap_processing.lo.l2.lo_l2.ttj2000ns_to_et") as mock_ttj2000_to_et,
-            patch("imap_processing.lo.l2.lo_l2.et_to_datetime64") as mock_et_to_dt64,
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
         ):
-            # Mock the time conversion
-            mock_ttj2000_to_et.return_value = 1234567890.0
-            mock_et_to_dt64.return_value = np.datetime64("2025-01-01")
-
-            result = add_efficiency_factors_to_pset(pset, sample_efficiency_data)
-
-            # Check that efficiency was added
-            assert "efficiency" in result.data_vars
-            assert result["efficiency"].dims == ("energy",)
-            assert len(result["efficiency"]) == 7
-
-            # Check efficiency values match expected (first row of sample data)
-            expected_eff = [0.8, 0.82, 0.84, 0.86, 0.88, 0.90, 0.92]
-            np.testing.assert_array_almost_equal(
-                result["efficiency"].values, expected_eff
+            (combined,) = lo_l2(
+                as_dependencies(*pointings_at_every_pivot),
+                anc_dependencies,
+                COMBINED_DESCRIPTOR,
             )
 
-    def test_add_efficiency_factors_no_data(self, minimal_pset):
-        """Test adding efficiency factors when no data is available."""
-        empty_df = pd.DataFrame()
+        expected = sum(
+            pointing["expected_counts"].sum() for pointing in pointings_at_every_pivot
+        )
+        assert combined["ena_count"].values.sum() == pytest.approx(expected)
 
-        result = add_efficiency_factors_to_pset(minimal_pset, empty_df)
-
-        # Should create unity efficiency
-        assert "efficiency" in result.data_vars
-        np.testing.assert_array_equal(result["efficiency"].values, np.ones(7))
-
-    def test_add_efficiency_factors_missing_date(
-        self, minimal_pset, sample_efficiency_data
+    def test_the_combined_map_is_the_sum_of_its_pointings(
+        self, pointings_at_every_pivot, anc_dependencies
     ):
-        """Test error when efficiency factor not found for date."""
-        pset = minimal_pset.copy()
-
-        with (
-            patch("imap_processing.lo.l2.lo_l2.ttj2000ns_to_et") as mock_ttj2000_to_et,
-            patch("imap_processing.lo.l2.lo_l2.et_to_datetime64") as mock_et_to_dt64,
+        """Accumulating together matches accumulating each pointing alone."""
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
         ):
-            # Mock conversion to a date not in sample data
-            mock_ttj2000_to_et.return_value = 1234567890.0
-            mock_et_to_dt64.return_value = np.datetime64("2025-12-31")
+            (combined,) = lo_l2(
+                as_dependencies(*pointings_at_every_pivot),
+                anc_dependencies,
+                COMBINED_DESCRIPTOR,
+            )
+            singly = [
+                lo_l2(as_dependencies(pointing), anc_dependencies, COMBINED_DESCRIPTOR)[
+                    0
+                ]
+                for pointing in pointings_at_every_pivot
+            ]
 
-            with pytest.raises(ValueError, match="No efficiency factor found"):
-                add_efficiency_factors_to_pset(pset, sample_efficiency_data)
+        for variable in ("ena_count", "exposure_factor"):
+            np.testing.assert_allclose(
+                combined[variable].values,
+                sum(single[variable].values for single in singly),
+                rtol=1e-5,
+                err_msg=variable,
+            )
 
-
-class TestCalculateEfficiencyCorrectedQuantities:
-    """Tests for the calculate_efficiency_corrected_quantities function."""
-
-    def test_calculate_efficiency_corrected_quantities(self):
-        """Test calculation of efficiency-corrected quantities."""
-        # Create a dataset with the current generic variable names
-        pset = xr.Dataset(
-            {
-                "counts": (("energy",), np.ones(7) * 10),  # 10 counts
-                "exposure_factor": (("energy",), np.ones(7) * 1.0),  # 1 second
-                "bg_rate": (("energy",), np.ones(7) * 0.1),  # 0.1 counts/s
-                "bg_rate_stat_uncert": (("energy",), np.ones(7) * 0.01),  # uncertainty
-                "efficiency": (
-                    ("energy",),
-                    np.array([0.8, 0.85, 0.9, 0.95, 0.88, 0.92, 0.87]),
-                ),
-            },
-            coords={"energy": list(range(7))},
-        )
-
-        result = calculate_efficiency_corrected_quantities(pset)
-
-        # Check that corrected quantities were added
-        assert "counts_over_eff" in result.data_vars
-        assert "counts_over_eff_squared" in result.data_vars
-        assert "bg_rate_exposure_factor" in result.data_vars
-        assert "bg_rate_stat_uncert_exposure_factor2" in result.data_vars
-
-        # Check dimensions
-        assert result["counts_over_eff"].dims == pset["counts"].dims
-
-        # Check that division by efficiency happened correctly
-        expected_over_eff = pset["counts"] / pset["efficiency"]
-        xr.testing.assert_allclose(result["counts_over_eff"], expected_over_eff)
-
-        # Check that division by efficiency squared happened correctly
-        expected_over_eff_sq = pset["counts"] / (pset["efficiency"] ** 2)
-        xr.testing.assert_allclose(
-            result["counts_over_eff_squared"], expected_over_eff_sq
-        )
-
-        # Check background rate calculations
-        expected_bg_exposure = pset["bg_rate"] * pset["exposure_factor"]
-        xr.testing.assert_allclose(
-            result["bg_rate_exposure_factor"], expected_bg_exposure
-        )
-
-        expected_bg_uncert_exposure = (
-            pset["bg_rate_stat_uncert"] ** 2 * pset["exposure_factor"] ** 2
-        )
-        xr.testing.assert_allclose(
-            result["bg_rate_stat_uncert_exposure_factor2"], expected_bg_uncert_exposure
-        )
-
-
-class TestCalculateRates:
-    """Tests for the calculate_rates function."""
-
-    def test_calculate_rates_basic(self, sample_sky_map_dataset):
-        """Test rate calculation with current implementation."""
-        result = calculate_rates(sample_sky_map_dataset)
-
-        # Check that the expected output variables were created
-        assert "ena_count_rate" in result.data_vars
-        assert "ena_count_rate_stat_uncert" in result.data_vars
-
-        # Check dimensions match input
-        assert result["ena_count_rate"].dims == sample_sky_map_dataset["counts"].dims
-
-        # Check rate calculation (counts / exposure_factor)
-        # With counts=10 and exposure_factor=1, rate should be 10
-        expected_rate = (
-            sample_sky_map_dataset["counts"] / sample_sky_map_dataset["exposure_factor"]
-        )
-        xr.testing.assert_allclose(result["ena_count_rate"], expected_rate)
-
-        # Check uncertainty calculation (sqrt(counts) / exposure_factor)
-        expected_uncert = (
-            np.sqrt(sample_sky_map_dataset["counts"])
-            / sample_sky_map_dataset["exposure_factor"]
-        )
-        xr.testing.assert_allclose(
-            result["ena_count_rate_stat_uncert"], expected_uncert
-        )
-
-    def test_calculate_rates_missing_variables(self):
-        """Rate calculation when required variables are missing."""
-        # Create dataset missing required variables
-        dataset = xr.Dataset(
-            {
-                "counts": (("epoch", "energy"), np.ones((1, 7)) * 5),
-                # Missing exposure_factor
-            }
-        )
-
-        # Should raise KeyError for missing exposure_factor
-        with pytest.raises(KeyError, match="exposure_factor"):
-            calculate_rates(dataset)
-
-
-class TestCalculateIntensities:
-    """Tests for the calculate_intensities function."""
-
-    def test_calculate_intensities_basic(self, sample_dataset_with_geometric_factors):
-        """Test intensity calculation with current implementation."""
-        result = calculate_intensities(sample_dataset_with_geometric_factors)
-
-        # Check that the expected output variables were created
-        assert "ena_intensity" in result.data_vars
-        assert "ena_intensity_stat_uncert" in result.data_vars
-        assert "ena_intensity_sys_err" in result.data_vars
-
-        # Check intensity calculation:
-        # counts_over_eff / (geometric_factor * energy * exposure_factor)
-        # 100 / (1e-4 * 0.1 * 1.0) = 100 / 1e-5 = 1e7
-        expected_intensity = sample_dataset_with_geometric_factors[
-            "counts_over_eff"
-        ] / (
-            sample_dataset_with_geometric_factors["geometric_factor"]
-            * sample_dataset_with_geometric_factors["energy"]
-            * sample_dataset_with_geometric_factors["exposure_factor"]
-        )
-        xr.testing.assert_allclose(result["ena_intensity"], expected_intensity)
-
-        # Check statistical uncertainty calculation
-        expected_stat_uncert = np.sqrt(
-            sample_dataset_with_geometric_factors["counts_over_eff_squared"]
-        ) / (
-            sample_dataset_with_geometric_factors["geometric_factor"]
-            * sample_dataset_with_geometric_factors["energy"]
-            * sample_dataset_with_geometric_factors["exposure_factor"]
-        )
-        xr.testing.assert_allclose(
-            result["ena_intensity_stat_uncert"], expected_stat_uncert
-        )
-
-        # Check systematic uncertainty calculation
-        expected_sys_err = (
-            result["ena_intensity"]
-            * sample_dataset_with_geometric_factors["geometric_factor_stat_uncert"]
-            / sample_dataset_with_geometric_factors["geometric_factor"]
-        )
-        xr.testing.assert_allclose(result["ena_intensity_sys_err"], expected_sys_err)
-
-    def test_calculate_intensities_missing_variables(self):
-        """Test intensity calculation when required variables are missing."""
-        # Create dataset missing geometric_factor
-        dataset = xr.Dataset(
-            {
-                "counts_over_eff": (("energy",), np.ones(7) * 100),
-                "counts_over_eff_squared": (("energy",), np.ones(7) * 100),
-                "exposure_factor": (("energy",), np.ones(7) * 1.0),
-                "energy": (("energy",), np.ones(7) * 0.1),
-                # Missing geometric_factor
-            }
-        )
-
-        # Should raise KeyError for missing geometric_factor
-        with pytest.raises(KeyError, match="geometric_factor"):
-            calculate_intensities(dataset)
-
-
-class TestCalculateBackgrounds:
-    """Tests for the calculate_backgrounds function."""
-
-    def test_calculate_backgrounds_basic(
-        self, sample_dataset_with_background_intermediates
+    def test_a_pointing_is_projected_from_its_own_pivot_angle(
+        self, pointings_at_every_pivot, anc_dependencies
     ):
-        """Test basic background calculations with standard data."""
-        dataset = sample_dataset_with_background_intermediates
+        """The pivot angles of a combined map need not agree with each other.
 
-        result = calculate_backgrounds(dataset)
+        A RAM map keeps the spin-angle bins looking into the RAM direction,
+        which is a function of the pointing's own pivot angle, so the three
+        pointings would not all survive one shared pivot angle.
+        """
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
+        ):
+            (combined,) = lo_l2(
+                as_dependencies(*pointings_at_every_pivot),
+                anc_dependencies,
+                COMBINED_RAM_DESCRIPTOR,
+            )
+            singly = [
+                lo_l2(
+                    as_dependencies(pointing),
+                    anc_dependencies,
+                    COMBINED_RAM_DESCRIPTOR,
+                )[0]
+                for pointing in pointings_at_every_pivot
+            ]
 
-        # Check that background variables were calculated
-        assert "bg_rate" in result.data_vars
-        assert "bg_rate_stat_uncert" in result.data_vars
-        assert "bg_rate_sys_err" in result.data_vars
-
-        # Check background rate calculation
-        # bg_rate_exposure_factor / exposure_factor = 0.2 / 1.0 = 0.2
-        expected_bg_rate = (
-            dataset["bg_rate_exposure_factor"] / dataset["exposure_factor"]
-        )
-        xr.testing.assert_allclose(result["bg_rate"], expected_bg_rate)
-
-        # Check statistical uncertainty calculation
-        # sqrt(bg_rate_stat_uncert_exposure_factor2) / exposure_factor^2
-        expected_stat_uncert = np.sqrt(
-            dataset["bg_rate_stat_uncert_exposure_factor2"]
-            / dataset["exposure_factor"] ** 2
-        )
-        xr.testing.assert_allclose(result["bg_rate_stat_uncert"], expected_stat_uncert)
-
-        # Check systematic uncertainty calculation
-        # (geometric_factor_stat_uncert / geometric_factor) * bg_rate
-        expected_sys_err = (
-            result["bg_rate"]
-            * dataset["geometric_factor_stat_uncert"]
-            / dataset["geometric_factor"]
-        )
-        xr.testing.assert_allclose(result["bg_rate_sys_err"], expected_sys_err)
-
-    def test_calculate_backgrounds_zero_exposure(self):
-        """Test background calculations with zero exposure time."""
-        dataset = xr.Dataset(
-            {
-                "bg_rate_exposure_factor": (
-                    ("epoch", "energy"),
-                    np.ones((1, 7)) * 0.2,
-                ),
-                "bg_rate_stat_uncert_exposure_factor2": (
-                    ("epoch", "energy"),
-                    np.ones((1, 7)) * 0.004,
-                ),
-                "exposure_factor": (("epoch", "energy"), np.zeros((1, 7))),
-                "geometric_factor": (("energy",), np.ones(7) * 1e-4),
-                "geometric_factor_stat_uncert": (("energy",), np.ones(7) * 1e-5),
-            },
-            coords={"epoch": [8.1794907049e17], "energy": list(range(7))},
+        # Each pointing keeps its own RAM half of the spin, and the combined
+        # map is exactly those three halves added together.
+        assert (combined["ena_count"].values > 0).any()
+        np.testing.assert_allclose(
+            combined["ena_count"].values,
+            sum(single["ena_count"].values for single in singly),
+            rtol=1e-5,
         )
 
-        result = calculate_backgrounds(dataset)
-
-        # Should handle division by zero gracefully
-        assert "bg_rate" in result.data_vars
-        assert "bg_rate_stat_uncert" in result.data_vars
-        assert "bg_rate_sys_err" in result.data_vars
-        # Results should be infinite where exposure time is zero
-        assert np.all(np.isinf(result["bg_rate"].values))
-        assert np.all(np.isinf(result["bg_rate_stat_uncert"].values))
-
-
-class TestCalculateFluxCorrections:
-    """Tests for the calculate_flux_corrections function."""
-
-    def test_calculate_flux_corrections_basic(
-        self, sample_dataset_with_intensities, lo_flux_factors_file
+    def test_a_pivot_angle_map_of_the_same_pointings_is_no_larger(
+        self, pointings_at_every_pivot, anc_dependencies
     ):
-        """Test basic flux correction calculation."""
-        # Make a copy to avoid modifying the original fixture
-        original_dataset = sample_dataset_with_intensities.copy(deep=True)
+        """The combined map holds at least what any single-pivot map holds.
 
-        # Run flux correction
-        result = calculate_flux_corrections(original_dataset, lo_flux_factors_file)
+        ``lo_l2`` itself does no pivot filtering, so a single-pivot descriptor
+        given these same pointings accumulates them all too; the point here is
+        that the combined descriptor loses nothing by naming no pivot angle.
+        """
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
+        ):
+            (combined,) = lo_l2(
+                as_dependencies(*pointings_at_every_pivot),
+                anc_dependencies,
+                COMBINED_DESCRIPTOR,
+            )
+            (single_pivot,) = lo_l2(
+                as_dependencies(*pointings_at_every_pivot),
+                anc_dependencies,
+                FULL_DESCRIPTOR,
+            )
 
-        # Verify that the function returns a dataset
-        assert isinstance(result, xr.Dataset)
-
-        # Verify that intensity variables are present
-        assert "ena_intensity" in result.data_vars
-        assert "ena_intensity_stat_uncert" in result.data_vars
-
-        # Verify that data shape is preserved
-        original_shape = sample_dataset_with_intensities["ena_intensity"].shape
-        assert result["ena_intensity"].shape == original_shape
-
-        # Check that corrections were applied by comparing to the original fixture
-        # (not the potentially modified copy)
-        original_intensity = sample_dataset_with_intensities["ena_intensity"].values
-        corrected_intensity = result["ena_intensity"].values
-
-        # Check for meaningful differences
-        relative_diff = np.abs(
-            (corrected_intensity - original_intensity) / original_intensity
-        )
-        max_relative_diff = np.max(relative_diff)
-        # Should have at least 10% change somewhere
-        assert max_relative_diff > 0.1, (
-            f"Max relative difference was only {max_relative_diff}"
+        np.testing.assert_allclose(
+            combined["ena_count"].values, single_pivot["ena_count"].values, rtol=1e-5
         )
 
-        # Verify that uncertainties were also corrected
-        original_uncert = sample_dataset_with_intensities[
-            "ena_intensity_stat_uncert"
-        ].values
-        corrected_uncert = result["ena_intensity_stat_uncert"].values
-        uncert_relative_diff = np.abs(
-            (corrected_uncert - original_uncert) / original_uncert
-        )
-        max_uncert_diff = np.max(uncert_relative_diff)
-        # Should have at least 10% change in uncertainties too
-        assert max_uncert_diff > 0.1, (
-            f"Max uncertainty relative difference was only {max_uncert_diff}"
-        )
-
-    def test_calculate_flux_corrections_preserves_other_vars(
-        self, sample_dataset_with_intensities, lo_flux_factors_file
+    def test_the_isn_mask_reads_the_pivot_angles_off_the_pointings(
+        self, pointings_at_every_pivot, anc_dependencies
     ):
-        """Test that flux correction preserves other variables in the dataset."""
-        # Add an extra variable to the dataset
-        sample_dataset_with_intensities["extra_var"] = (("energy",), np.ones(7))
+        """A combined map is masked with the union of its pivots' tunings.
 
-        result = calculate_flux_corrections(
-            sample_dataset_with_intensities, lo_flux_factors_file
+        The pivot 105 tuning of the test ancillary masks the top half of each
+        ESA level and the pivot 90 one the bright pixels, so a map holding both
+        is masked at least everywhere either of them would mask.
+        """
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
+        ):
+            (combined,) = lo_l2(
+                as_dependencies(*pointings_at_every_pivot),
+                anc_dependencies,
+                COMBINED_MASK_DESCRIPTOR,
+            )
+            (unmasked,) = lo_l2(
+                as_dependencies(*pointings_at_every_pivot),
+                anc_dependencies,
+                COMBINED_DESCRIPTOR,
+            )
+
+        masked = is_fill(combined["ena_intensity"].values)
+        intensity = unmasked["ena_intensity"].values
+        unexposed = is_fill(intensity)
+
+        # The union of the three tunings: the widest band (pivot 75's 1 degree
+        # loses to the 90 degrees of the others), the faintest brightness taken
+        # as bright, and the shortest outlier tail.
+        as_masked = np.where(unexposed, 0.0, intensity)
+        peak = np.max(as_masked, axis=(-2, -1), keepdims=True)
+        median = np.percentile(as_masked, 50, axis=(-2, -1), keepdims=True)
+        expected = (
+            (as_masked >= MASK_THRESHOLD_FRACTION * peak)
+            | (as_masked > median)
+            | unexposed
         )
 
-        # Verify that other variables are preserved
-        assert "extra_var" in result.data_vars
+        assert expected.any(), "the tuning must mask something"
+        np.testing.assert_array_equal(masked, expected)
+
+    def test_a_combined_map_of_one_pivot_angle_uses_that_pivots_tuning(
+        self, one_pointing, anc_dependencies
+    ):
+        """With a single pivot angle in the data the union is that pivot's row."""
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
+        ):
+            # The pointing is at pivot 90, so this must match the map made with
+            # the pivot 90 descriptor.
+            (combined,) = lo_l2(
+                as_dependencies(one_pointing),
+                anc_dependencies,
+                COMBINED_MASK_DESCRIPTOR,
+            )
+            (by_descriptor,) = lo_l2(
+                as_dependencies(one_pointing), anc_dependencies, MASK_DESCRIPTOR
+            )
+
+        assert is_fill(combined["ena_intensity"].values).any()
         np.testing.assert_array_equal(
-            result["extra_var"].values,
-            sample_dataset_with_intensities["extra_var"].values,
+            is_fill(combined["ena_intensity"].values),
+            is_fill(by_descriptor["ena_intensity"].values),
         )
 
-    def test_calculate_flux_corrections_energy_dimension_handling(
-        self, lo_flux_factors_file
+    def test_an_unrecognisable_pivot_angle_cannot_tune_the_mask(
+        self, anc_dependencies, caplog
     ):
-        """Test that flux correction properly handles energy dimension reshaping."""
-        # Create a dataset with different spatial dimensions
-        n_energy = 7
-        n_x, n_y = 12, 8  # Different spatial dimensions
+        """A pivot angle matching no nominal one is dropped, and none is left."""
+        off_nominal = make_pointing(repointing=100, pivot=42.0)
 
-        energy_values = np.array([16.35, 30.56, 56.4, 105, 199.8, 407.5, 795.3])
+        with pytest.raises(ValueError, match="reports a nominal pivot angle"):
+            lo_l2(
+                as_dependencies(off_nominal),
+                anc_dependencies,
+                COMBINED_MASK_DESCRIPTOR,
+            )
+        assert "match none of the nominal pivot angles" in caplog.text
 
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": energy_values,
-            "x": np.arange(n_x),
-            "y": np.arange(n_y),
+    def test_a_pivot_angle_the_mask_has_no_tuning_for_is_refused(
+        self, anc_dependencies
+    ):
+        """A combined map holding an untuned pivot angle cannot be masked."""
+        # 60 is a nominal pivot angle, but the mask ancillary has no row for it.
+        untuned = make_pointing(repointing=100, pivot=60.0)
+
+        with pytest.raises(ValueError, match=r"no mask tuning for the \[60\]"):
+            lo_l2(as_dependencies(untuned), anc_dependencies, COMBINED_MASK_DESCRIPTOR)
+
+
+class TestMapStructure:
+    """The shape and contents of the produced map."""
+
+    expected_variables = (
+        "ena_count",
+        "exposure_factor",
+        "ena_count_rate",
+        "ena_count_rate_stat_uncert",
+        "ena_intensity",
+        "ena_intensity_stat_uncert",
+        "ena_intensity_sys_err",
+        "ena_intensity_sys_err_plus",
+        "ena_intensity_sys_err_minus",
+        "bg_rate",
+        "bg_rate_stat_uncert",
+        "bg_intensity",
+        "bg_intensity_stat_uncert",
+    )
+
+    def test_map_dims_and_source(self, full_map):
+        """The map is a 6 degree rectangular map of the descriptor."""
+        dataset, _ = full_map
+
+        assert dataset.attrs["Logical_source"] == f"imap_lo_l2_{FULL_DESCRIPTOR}"
+        assert dict(dataset.sizes) == {
+            "epoch": 1,
+            "energy": N_ESA,
+            "longitude": 60,
+            "latitude": 30,
         }
 
-        # Create intensity values with energy-dependent structure (power law)
-        intensity_values = np.ones((1, n_energy, n_x, n_y))
-        for i in range(n_energy):
-            intensity_values[0, i, :, :] = 1e6 * (energy_values[i] / 100.0) ** (-2.0)
-        uncert_values = intensity_values * 0.1
+    def test_map_variables(self, full_map):
+        """Every map variable is on the (epoch, energy, sky) grid."""
+        dataset, _ = full_map
 
-        original_dataset = xr.Dataset(coords=coords)
-        original_dataset["ena_intensity"] = (
-            ("epoch", "energy", "x", "y"),
-            intensity_values.copy(),
-        )
-        original_dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "x", "y"),
-            uncert_values.copy(),
-        )
-        original_dataset["bg_intensity"] = original_dataset["ena_intensity"] * 0.5
-        original_dataset["bg_intensity_stat_uncert"] = (
-            original_dataset["bg_intensity"] * 0.1
-        )
-
-        # Run flux correction on a copy
-        dataset_copy = original_dataset.copy(deep=True)
-        result = calculate_flux_corrections(dataset_copy, lo_flux_factors_file)
-
-        # Verify shape is preserved
-        assert result["ena_intensity"].shape == (1, n_energy, n_x, n_y)
-        assert result["ena_intensity_stat_uncert"].shape == (1, n_energy, n_x, n_y)
-
-        # Verify corrections were applied by checking for meaningful differences
-        original_values = original_dataset["ena_intensity"].values
-        corrected_values = result["ena_intensity"].values
-        relative_diff = np.abs((corrected_values - original_values) / original_values)
-        max_relative_diff = np.max(relative_diff)
-        # Should have at least 10% change somewhere (flux corrections are significant)
-        assert max_relative_diff > 0.1, (
-            f"Max relative difference was only {max_relative_diff}"
-        )
-
-
-class TestCalculateSputteringCorrections:
-    """Tests for the calculate_sputtering_corrections function."""
-
-    def test_calculate_sputtering_corrections_basic(
-        self, sample_dataset_with_sputtering_data
-    ):
-        """Test basic sputtering corrections for hydrogen and oxygen intensities."""
-        h_dataset, o_dataset = sample_dataset_with_sputtering_data
-
-        # Test with hydrogen dataset first
-        original_h_intensity = h_dataset["ena_intensity"].copy()
-        original_h_stat_uncert = h_dataset["ena_intensity_stat_uncert"].copy()
-        original_h_sys_err = h_dataset["ena_intensity_sys_err"].copy()
-
-        result_h = calculate_sputtering_corrections(h_dataset, o_dataset)
-
-        # Check that only energy levels 4 and 5 (ESA levels 5 and 6) were modified
-        # for hydrogen
-        for energy_idx in [0, 1, 2, 3, 6]:
-            np.testing.assert_array_equal(
-                result_h["ena_intensity"][0, energy_idx, :, :].values,
-                original_h_intensity[0, energy_idx, :, :].values,
-                err_msg=f"Hydrogen energy level {energy_idx} should not be modified",
+        for variable in self.expected_variables:
+            assert variable in dataset.data_vars, f"missing {variable}"
+            assert dataset[variable].dims == (
+                "epoch",
+                "energy",
+                "longitude",
+                "latitude",
             )
 
-        # Check that energy levels 4 and 5 were modified (should be lower)
-        assert np.all(
-            result_h["ena_intensity"][0, 4, :, :].values
-            < original_h_intensity[0, 4, :, :].values
-        ), (
-            "Hydrogen energy level 4 intensity should be reduced by sputtering "
-            "correction"
-        )
+    def test_energy_coordinate(self, full_map):
+        """The energy coordinate and its widths both come from the ancillary."""
+        dataset, _ = full_map
 
-        assert np.all(
-            result_h["ena_intensity"][0, 5, :, :].values
-            < original_h_intensity[0, 5, :, :].values
-        ), (
-            "Hydrogen energy level 5 intensity should be reduced by sputtering "
-            "correction"
-        )
-
-        # Check that uncertainties were also updated for levels 4 and 5
-        assert not np.array_equal(
-            result_h["ena_intensity_stat_uncert"][0, 4, :, :].values,
-            original_h_stat_uncert[0, 4, :, :].values,
-        ), "Statistical uncertainty should be updated for hydrogen energy level 4"
-
-        assert not np.array_equal(
-            result_h["ena_intensity_sys_err"][0, 4, :, :].values,
-            original_h_sys_err[0, 4, :, :].values,
-        ), "Systematic error should be updated for hydrogen energy level 4"
-
-        # Test with oxygen dataset
-        original_o_intensity = o_dataset["ena_intensity"].copy()
-
-        result_o = calculate_sputtering_corrections(o_dataset, o_dataset)
-
-        # Check that only energy levels 4 and 5 were modified for oxygen
-        for energy_idx in [0, 1, 2, 3, 6]:
-            np.testing.assert_array_equal(
-                result_o["ena_intensity"][0, energy_idx, :, :].values,
-                original_o_intensity[0, energy_idx, :, :].values,
-                err_msg=f"Oxygen energy level {energy_idx} should not be modified",
-            )
-
-        # Check that energy levels 4 and 5 were modified
-        assert np.all(
-            result_o["ena_intensity"][0, 4, :, :].values
-            < original_o_intensity[0, 4, :, :].values
-        ), "Oxygen energy level 4 intensity should be reduced by sputtering correction"
-
-        assert np.all(
-            result_o["ena_intensity"][0, 5, :, :].values
-            < original_o_intensity[0, 5, :, :].values
-        ), "Oxygen energy level 5 intensity should be reduced by sputtering correction"
-
-    def test_calculate_sputtering_corrections_equations(
-        self, sample_dataset_with_sputtering_data
-    ):
-        """Test that sputtering corrections follow the correct equations."""
-        h_dataset, o_dataset = sample_dataset_with_sputtering_data
-
-        # Get the subset that will be processed (energy levels 4 and 5)
-        o_small_dataset = o_dataset.isel(epoch=0, energy=[4, 5])
-
-        # Calculate expected j_o_prime (Equation 9)
-        expected_j_o_prime = (
-            o_small_dataset["ena_intensity"] - o_small_dataset["bg_intensity"]
-        )
-        expected_j_o_prime = expected_j_o_prime.where(expected_j_o_prime >= 0, 0)
-
-        # Expected correction factors from the mapping document table 2
-        sputter_correction_factor = np.array([0.15, 0.01])
-
-        # Calculate expected corrected intensity (Equation 11) for hydrogen
-        h_small_dataset = h_dataset.isel(epoch=0, energy=[4, 5])
-        expected_corrected_intensity = (
-            h_small_dataset["ena_intensity"]
-            - sputter_correction_factor[:, np.newaxis, np.newaxis] * expected_j_o_prime
-        )
-
-        # Run the function
-        result = calculate_sputtering_corrections(h_dataset, o_dataset)
-
-        # Check that the corrected intensities match expected values
+        # The pointings are all in ESA mode 0.
+        np.testing.assert_allclose(dataset["energy"].values, ESA_ENERGIES[0])
         np.testing.assert_allclose(
-            result["ena_intensity"][0, [4, 5], :, :].values,
-            expected_corrected_intensity.values,
-            rtol=1e-10,
-            err_msg="Sputtering-corrected intensities don't match expected calculation",
+            dataset["energy_delta_minus"].values, ESA_ENERGY_DELTAS[0]
         )
-
-    def test_calculate_sputtering_corrections_negative_j_o_prime(self):
-        """Test handling when j_o_prime becomes negative."""
-        # Create dataset where background > intensity (would give negative j_o_prime)
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-            "longitude": np.linspace(0, 360, 5, endpoint=False),
-            "latitude": np.linspace(-90, 90, 3),
-        }
-
-        # Create hydrogen dataset
-        h_dataset = xr.Dataset(coords=coords)
-        h_dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 5, 3)) * 1e6,
-        )
-
-        # Add required uncertainty variables for hydrogen
-        h_dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 5, 3)) * 0.1e6,
-        )
-        h_dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 5, 3)) * 0.05e6,
-        )
-
-        # Create oxygen dataset where background > intensity
-        o_dataset = xr.Dataset(coords=coords)
-        o_dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 5, 3)) * 1e6,
-        )
-        o_dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 5, 3)) * 2e6,  # Higher than signal
-        )
-
-        # Add required uncertainty variables for oxygen
-        o_dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 5, 3)) * 0.1e6,
-        )
-        o_dataset["bg_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 5, 3)) * 0.1e6,
-        )
-        o_dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 5, 3)) * 0.05e6,
-        )
-        o_dataset["geometric_factor"] = (("energy",), np.ones(7))
-
-        result = calculate_sputtering_corrections(h_dataset, o_dataset)
-
-        # Function should handle negative j_o_prime by setting it to zero
-        # This means no sputtering correction should be applied
-        # The corrected intensity should equal the original intensity
         np.testing.assert_allclose(
-            result["ena_intensity"][0, [4, 5], :, :].values,
-            h_dataset["ena_intensity"][0, [4, 5], :, :].values,
-            rtol=1e-10,
-            err_msg=(
-                "When background > signal, no sputtering correction should be applied"
-            ),
+            dataset["energy_delta_plus"].values, ESA_ENERGY_DELTAS[0]
         )
 
-    def test_calculate_sputtering_corrections_only_oxygen(
-        self, sample_dataset_with_sputtering_data
-    ):
-        """Test that sputtering corrections work for different species datasets."""
-        h_dataset, o_dataset = sample_dataset_with_sputtering_data
+    def test_map_writes_to_cdf(self, full_map):
+        """The map can be written out as a valid CDF."""
+        dataset, _ = full_map
+        dataset.attrs["Data_version"] = "001.0001"
+        dataset.attrs["Start_date"] = "20260101"
 
-        # Store original hydrogen values
-        original_h_intensity = h_dataset["ena_intensity"].copy()
-        original_h_stat_uncert = h_dataset["ena_intensity_stat_uncert"].copy()
-        original_h_sys_err = h_dataset["ena_intensity_sys_err"].copy()
+        cdf_path = write_cdf(dataset)
 
-        # Store original oxygen values
-        original_o_intensity = o_dataset["ena_intensity"].copy()
+        assert cdf_path.exists()
+        assert cdf_path.name == f"imap_lo_l2_{FULL_DESCRIPTOR}_20260101_v001.0001.cdf"
+        assert dict(load_cdf(cdf_path).sizes) == dict(dataset.sizes)
 
-        # Test hydrogen dataset with oxygen reference
-        result_h = calculate_sputtering_corrections(h_dataset, o_dataset)
 
-        # Check that hydrogen values changed for energy levels 4 and 5
-        assert not np.array_equal(
-            result_h["ena_intensity"][0, 4, :, :].values,
-            original_h_intensity[0, 4, :, :].values,
-        ), "Hydrogen intensity should be affected by sputtering corrections"
+class TestAccumulation:
+    """What the map accumulates from its inputs."""
 
-        assert not np.array_equal(
-            result_h["ena_intensity_stat_uncert"][0, 4, :, :].values,
-            original_h_stat_uncert[0, 4, :, :].values,
-        ), "Hydrogen stat uncertainty should be updated"
+    def test_counts_are_conserved(self, full_map):
+        """Every in-window count lands somewhere on the map."""
+        dataset, pointing = full_map
 
-        assert not np.array_equal(
-            result_h["ena_intensity_sys_err"][0, 4, :, :].values,
-            original_h_sys_err[0, 4, :, :].values,
-        ), "Hydrogen sys error should be updated"
+        per_energy = dataset["ena_count"].values.sum(axis=(0, 2, 3))
+        np.testing.assert_allclose(per_energy, pointing["expected_counts"])
 
-        # Test oxygen dataset with itself as reference
-        result_o = calculate_sputtering_corrections(o_dataset, o_dataset)
+    def test_exposure_is_conserved(self, full_map):
+        """Every in-window second of exposure lands somewhere on the map."""
+        dataset, pointing = full_map
 
-        # Check that oxygen values also changed
-        assert not np.array_equal(
-            result_o["ena_intensity"][0, 4, :, :].values,
-            original_o_intensity[0, 4, :, :].values,
-        ), "Oxygen intensity should also be affected by sputtering corrections"
+        per_energy = dataset["exposure_factor"].values.sum(axis=(0, 2, 3))
+        np.testing.assert_allclose(per_energy, pointing["expected_exposure"], rtol=1e-6)
 
-    def test_calculate_sputtering_corrections_uncertainty_propagation(
-        self, sample_dataset_with_sputtering_data
-    ):
-        """Test that uncertainties are properly propagated in sputtering corrections."""
-        h_dataset, o_dataset = sample_dataset_with_sputtering_data
+    def test_out_of_goodtime_epochs_are_excluded(self, full_map):
+        """The 999-per-bin epochs outside the good times do not reach the map."""
+        dataset, pointing = full_map
 
-        # Get subset for manual calculation
-        o_small_dataset = o_dataset.isel(epoch=0, energy=[4, 5])
-        h_small_dataset = h_dataset.isel(epoch=0, energy=[4, 5])
+        per_energy = dataset["ena_count"].values.sum(axis=(0, 2, 3))
+        assert per_energy.max() < 999.0 * N_SPIN_BINS
+        np.testing.assert_allclose(per_energy, pointing["expected_counts"])
 
-        # Manual calculation following equations 10, 12
-        j_o_prime = o_small_dataset["ena_intensity"] - o_small_dataset["bg_intensity"]
-        j_o_prime = j_o_prime.where(j_o_prime >= 0, 0)
+    def test_pointings_accumulate(self, one_pointing, anc_dependencies):
+        """Two pointings contribute twice the counts of one."""
+        other = make_pointing(repointing=101, seed=7)
 
-        j_o_prime_var = (
-            o_small_dataset["ena_intensity_stat_uncert"] ** 2
-            + (o_small_dataset["bg_intensity_stat_uncert"]) ** 2
-        )
-
-        sputter_correction_factor = np.array([0.15, 0.01])[:, np.newaxis, np.newaxis]
-
-        expected_corrected_var = (
-            h_small_dataset["ena_intensity_stat_uncert"] ** 2
-            + (sputter_correction_factor**2) * j_o_prime_var
-        )
-
-        result = calculate_sputtering_corrections(h_dataset, o_dataset)
-
-        # Check that statistical uncertainties match expected propagation
-        np.testing.assert_allclose(
-            result["ena_intensity_stat_uncert"][0, [4, 5], :, :].values ** 2,
-            expected_corrected_var.values,
-            rtol=1e-10,
-            err_msg="Statistical uncertainty propagation is incorrect",
-        )
-
-    def test_calculate_sputtering_corrections_energy_levels(self):
-        """Test that sputtering corrections are applied to correct energy levels."""
-        # Create minimal dataset for testing specific energy level targeting
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-            "longitude": [0, 90, 180, 270],
-            "latitude": [-45, 0, 45],
-        }
-
-        # Create hydrogen dataset
-        h_dataset = xr.Dataset(coords=coords)
-        h_intensity_data = np.zeros((1, 7, 4, 3))
-        h_bg_rate_data = np.zeros((1, 7, 4, 3))
-
-        # Set specific values for energy levels 4 and 5 only
-        h_intensity_data[0, 4, :, :] = 200_000_000  # 200M for energy index 4
-        h_intensity_data[0, 5, :, :] = 250_000_000  # 250M for energy index 5
-        h_bg_rate_data[0, 4, :, :] = 20_000_000  # 20M background
-        h_bg_rate_data[0, 5, :, :] = 25_000_000  # 25M background
-
-        h_dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            h_intensity_data,
-        )
-        h_dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            h_bg_rate_data,
-        )
-        h_dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 4, 3)) * 100_000,
-        )
-        h_dataset["bg_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 4, 3)) * 10_000,
-        )
-        h_dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 4, 3)) * 50_000,
-        )
-
-        # Create oxygen dataset with higher values
-        o_dataset = xr.Dataset(coords=coords)
-        o_intensity_data = np.zeros((1, 7, 4, 3))
-        o_bg_rate_data = np.zeros((1, 7, 4, 3))
-
-        # Set specific values for energy levels 4 and 5 only
-        o_intensity_data[0, 4, :, :] = 250_000_000  # 250M for energy index 4
-        o_intensity_data[0, 5, :, :] = 300_000_000  # 300M for energy index 5
-        o_bg_rate_data[0, 4, :, :] = 25_000_000  # 25M background
-        o_bg_rate_data[0, 5, :, :] = 30_000_000  # 30M background
-
-        o_dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            o_intensity_data,
-        )
-        o_dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            o_bg_rate_data,
-        )
-        o_dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 4, 3)) * 100_000,
-        )
-        o_dataset["bg_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 4, 3)) * 10_000,
-        )
-        o_dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 4, 3)) * 50_000,
-        )
-        o_dataset["geometric_factor"] = (("energy",), np.ones(7))
-
-        # Make a copy to preserve original values for comparison
-        original_h_dataset = h_dataset.copy(deep=True)
-        result = calculate_sputtering_corrections(h_dataset, o_dataset)
-
-        # Only energy indices 4 and 5 should be modified
-        modified_indices = [4, 5]
-        unchanged_indices = [0, 1, 2, 3, 6]
-
-        for idx in unchanged_indices:
-            np.testing.assert_array_equal(
-                result["ena_intensity"][0, idx, :, :].values,
-                original_h_dataset["ena_intensity"][0, idx, :, :].values,
-                err_msg=f"Energy index {idx} should not be modified",
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
+        ):
+            (one,) = lo_l2(
+                as_dependencies(one_pointing), anc_dependencies, FULL_DESCRIPTOR
+            )
+            (both,) = lo_l2(
+                as_dependencies(one_pointing, other), anc_dependencies, FULL_DESCRIPTOR
             )
 
-        for idx in modified_indices:
-            # Check that values changed with some tolerance for numerical precision
-            original_values = original_h_dataset["ena_intensity"][0, idx, :, :].values
-            corrected_values = result["ena_intensity"][0, idx, :, :].values
-
-            assert not np.allclose(corrected_values, original_values, rtol=1e-10), (
-                f"Energy index {idx} should be modified"
-            )
-
-
-class TestInitializeGeometricFactorVariables:
-    """Tests for the initialize_geometric_factor_variables function."""
-
-    def test_initialize_geometric_factor_variables(self):
-        """Test initialization of geometric factor variables."""
-        # Create a simple dataset
-        dataset = xr.Dataset(
-            {
-                "test_var": (("energy",), np.ones(7)),
-            },
-            coords={"energy": range(7)},
+        np.testing.assert_allclose(
+            both["ena_count"].values.sum(axis=(0, 2, 3)),
+            one["ena_count"].values.sum(axis=(0, 2, 3)) + other["expected_counts"],
         )
 
-        result = initialize_geometric_factor_variables(dataset)
+    def test_ram_map_keeps_half_the_spin(self, one_pointing, anc_dependencies):
+        """A ram map takes fewer counts than the full spin it is cut from."""
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
+        ):
+            (full,) = lo_l2(
+                as_dependencies(one_pointing), anc_dependencies, FULL_DESCRIPTOR
+            )
+            (ram,) = lo_l2(
+                as_dependencies(one_pointing), anc_dependencies, RAM_DESCRIPTOR
+            )
 
-        # Check that all geometric factor variables were initialized
-        expected_vars = [
-            "energy_delta_minus",
-            "energy_delta_plus",
-            "geometric_factor",
-            "geometric_factor_stat_uncert",
+        full_counts = full["ena_count"].values.sum()
+        ram_counts = ram["ena_count"].values.sum()
+        assert 0 < ram_counts < full_counts
+
+
+class TestRatesAndIntensities:
+    """The maths turning accumulated counts into intensities."""
+
+    def test_rate_and_intensity(self, full_map):
+        """Where exposed, rate = counts/exposure and intensity = rate/(G*E)."""
+        dataset, _ = full_map
+
+        counts = dataset["ena_count"].values
+        exposure = dataset["exposure_factor"].values
+        exposed = exposure > 0
+        assert exposed.any()
+
+        np.testing.assert_allclose(
+            dataset["ena_count_rate"].values[exposed],
+            counts[exposed] / exposure[exposed],
+            rtol=1e-5,
+        )
+        assert np.all(is_fill(dataset["ena_count_rate"].values[~exposed]))
+
+        geometric_factor = GEO_FACTORS[0]
+        energy = ESA_ENERGIES[0]
+        expected = dataset["ena_count_rate"] / xr.DataArray(
+            geometric_factor * energy, dims=["energy"]
+        )
+        np.testing.assert_allclose(
+            dataset["ena_intensity"].values[exposed],
+            expected.values[exposed],
+            rtol=1e-5,
+        )
+
+    def test_statistical_uncertainty_is_poisson(self, full_map):
+        """The rate uncertainty is the Poisson count error over the exposure."""
+        dataset, _ = full_map
+
+        counts = dataset["ena_count"].values
+        exposure = dataset["exposure_factor"].values
+        exposed = exposure > 0
+
+        np.testing.assert_allclose(
+            dataset["ena_count_rate_stat_uncert"].values[exposed],
+            np.sqrt(counts[exposed]) / exposure[exposed],
+            rtol=1e-5,
+        )
+
+    def test_background_rate(self, full_map):
+        """The background rate is the input rate wherever the map was exposed."""
+        dataset, pointing = full_map
+
+        exposure = dataset["exposure_factor"].values
+        for energy_index in range(N_ESA):
+            exposed = exposure[0, energy_index] > 0
+            bg_rate = dataset["bg_rate"].values[0, energy_index]
+            np.testing.assert_allclose(
+                bg_rate[exposed], pointing["background"][energy_index], rtol=1e-5
+            )
+            assert np.all(is_fill(bg_rate[~exposed]))
+
+    def test_systematic_error_bounds(self, full_map):
+        """The systematic error is bracketed by the G-factor excursions."""
+        dataset, _ = full_map
+
+        intensity = dataset["ena_intensity"].values
+        plus = dataset["ena_intensity_sys_err_plus"].values
+        minus = dataset["ena_intensity_sys_err_minus"].values
+        symmetric = dataset["ena_intensity_sys_err"].values
+        lit = intensity > 0
+
+        assert np.all(plus[lit] > 0)
+        assert np.all(minus[lit] > 0)
+        # The symmetric error is the geometric mean of the two excursions
+        np.testing.assert_allclose(
+            symmetric[lit], np.sqrt(plus[lit] * minus[lit]), rtol=1e-4
+        )
+        # The lower G-factor bound gives the bigger flux excursion
+        assert np.all(plus[lit] >= minus[lit])
+
+
+class TestSputterCorrection:
+    """Removing the counts oxygen sputters into the hydrogen channels."""
+
+    @staticmethod
+    def sputtered(counts, target_esa, power=1):
+        """The counts sputtered into a target ESA step, from the source steps.
+
+        ``power`` is 1 for the counts themselves and 2 for their variance,
+        which each source term contributes to scaled by the square of its
+        factor.
+        """
+        return sum(
+            factor**power * counts[:, source - 1]
+            for source, factor in SPUTTER_FACTORS.get(target_esa, {}).items()
+        )
+
+    def test_correction_removes_the_sputtered_counts(self, sputter_maps):
+        """The rate is the counts less the sputtered ones, over the exposure."""
+        corrected, raw = sputter_maps
+
+        counts = raw["ena_count"].values
+        exposure = raw["exposure_factor"].values
+
+        for target_esa in range(1, N_ESA + 1):
+            exposed = exposure[:, target_esa - 1] > 0
+            expected = np.maximum(
+                counts[:, target_esa - 1] - self.sputtered(counts, target_esa), 0.0
+            )
+            np.testing.assert_allclose(
+                corrected["ena_count_rate"].values[:, target_esa - 1][exposed],
+                expected[exposed] / exposure[:, target_esa - 1][exposed],
+                rtol=1e-5,
+            )
+
+    def test_uncorrected_steps_are_untouched(self, sputter_maps):
+        """A step that nothing sputters into keeps the rate it already had."""
+        corrected, raw = sputter_maps
+
+        untouched = [esa for esa in range(1, N_ESA + 1) if esa not in SPUTTER_FACTORS]
+        assert untouched, "the test factors must leave some steps uncorrected"
+
+        for target_esa in untouched:
+            np.testing.assert_allclose(
+                corrected["ena_count_rate"].values[:, target_esa - 1],
+                raw["ena_count_rate"].values[:, target_esa - 1],
+                rtol=1e-6,
+            )
+
+    def test_corrected_steps_lose_intensity(self, sputter_maps):
+        """The corrected steps come out below the uncorrected ones somewhere."""
+        corrected, raw = sputter_maps
+
+        for target_esa in SPUTTER_FACTORS:
+            correction = (
+                raw["ena_intensity"].values[:, target_esa - 1]
+                - corrected["ena_intensity"].values[:, target_esa - 1]
+            )
+            assert np.all(correction >= 0)
+            assert np.any(correction > 0), f"ESA {target_esa} was not corrected"
+
+    def test_uncertainty_gains_the_source_counts(self, sputter_maps):
+        """Subtracting a measured quantity can only add to the variance."""
+        corrected, raw = sputter_maps
+
+        counts = raw["ena_count"].values
+        exposure = raw["exposure_factor"].values
+
+        for target_esa in range(1, N_ESA + 1):
+            exposed = exposure[:, target_esa - 1] > 0
+            variance = counts[:, target_esa - 1] + self.sputtered(
+                counts, target_esa, power=2
+            )
+            np.testing.assert_allclose(
+                corrected["ena_count_rate_stat_uncert"].values[:, target_esa - 1][
+                    exposed
+                ],
+                np.sqrt(variance[exposed]) / exposure[:, target_esa - 1][exposed],
+                rtol=1e-5,
+            )
+
+    def test_rate_is_never_negative(self, sputter_maps):
+        """Over-subtracting a low-count pixel floors it rather than going below 0."""
+        corrected, raw = sputter_maps
+
+        counts = raw["ena_count"].values
+        # The test pointing is sparse enough that some pixel is over-subtracted,
+        # which is the case this floor exists for.
+        over_subtracted = [
+            counts[:, esa - 1] - self.sputtered(counts, esa) < 0
+            for esa in SPUTTER_FACTORS
         ]
+        assert np.any(over_subtracted), "no pixel exercised the floor"
 
-        for var in expected_vars:
-            assert var in result.data_vars
-            assert result[var].dims == ("energy",)
-            assert result[var].shape == (7,)
-            assert np.all(result[var].values == 0)  # Should be initialized to zeros
+        assert np.all(measured(corrected["ena_count_rate"].values) >= 0)
+        assert np.all(measured(corrected["ena_intensity"].values) >= 0)
 
-        # The energy coordinate should also be updated
-        assert "energy" in result.coords
-        assert result.coords["energy"].shape == (7,)
-        assert np.all(result.coords["energy"].values == 0)  # Should be zeros
+    def test_counts_stay_as_observed(self, sputter_maps):
+        """The correction applies from the rate onward, not to the raw counts."""
+        corrected, raw = sputter_maps
 
-
-class TestPopulateGeometricFactors:
-    """Tests for the populate_geometric_factors function."""
-
-    @pytest.mark.parametrize("species", ["h", "o"])
-    @patch("imap_processing.lo.l2.lo_l2.reduce_geometric_factor_dataset")
-    def test_populate_geometric_factors(
-        self, mock_get_geometric_factor_dataset, species, sample_geometric_factor_data
-    ):
-        """Test population of geometric factor values for a specific species."""
-        h_gf_data, o_gf_data = sample_geometric_factor_data
-        gf_data = h_gf_data if species == "h" else o_gf_data
-        mock_get_geometric_factor_dataset.return_value = gf_data.to_xarray()
-
-        # Create initialized dataset
-        dataset = xr.Dataset(coords={"energy": range(7)})
-        dataset = initialize_geometric_factor_variables(dataset)
-
-        result = populate_geometric_factors(dataset, species)
-
-        # Check that values were populated correctly
-        for i in range(7):
-            if species == "h":
-                # Check hydrogen values
-                assert result["energy"].values[i] == 0.01 * (i + 1)
-                assert result["geometric_factor"].values[i] == 1e-4 * (i + 1)
-                assert result["geometric_factor_stat_uncert"].values[i] == (
-                    1e-5 * (i + 1)
-                )
-            else:  # oxygen
-                assert result["energy"].values[i] == 0.015 * (i + 1)
-                assert result["geometric_factor"].values[i] == 1.5e-4 * (i + 1)
-                assert result["geometric_factor_stat_uncert"].values[i] == (
-                    1.5e-5 * (i + 1)
-                )
-        # Ensure that energy_deltas are in units of keV
-        assert np.all(result["energy_delta_plus"].values < 1)
-        assert np.all(result["energy_delta_minus"].values < 1)
-
-    def test_populate_geometric_factors_no_gf_species(self):
-        """Test population for species without geometric factors."""
-        # Create initialized dataset
-        dataset = xr.Dataset(coords={"energy": range(7)})
-        dataset = initialize_geometric_factor_variables(dataset)
-
-        # Test with doubles (no geometric factors)
-        result = populate_geometric_factors(dataset, "doubles")
-
-        # Should return dataset unchanged (all zeros)
-        assert np.all(result["geometric_factor"].values == 0)
-
-
-class TestCleanupIntermediateVariables:
-    """Tests for the cleanup_intermediate_variables function."""
-
-    def test_cleanup_intermediate_variables(self):
-        """Test removal of intermediate variables."""
-        # Create dataset with intermediate variables using current naming
-        dataset = xr.Dataset(
-            {
-                "counts": (("energy",), np.ones(7)),
-                "counts_over_eff": (("energy",), np.ones(7)),
-                "counts_over_eff_squared": (("energy",), np.ones(7)),
-                "bg_rate_exposure_factor": (("energy",), np.ones(7)),
-                "bg_rate_stat_uncert_exposure_factor2": (("energy",), np.ones(7)),
-                "ena_intensity": (("energy",), np.ones(7)),  # Should be kept
-                "exposure_factor": (("energy",), np.ones(7)),  # Should be kept
-            }
+        np.testing.assert_array_equal(
+            corrected["ena_count"].values, raw["ena_count"].values
+        )
+        np.testing.assert_array_equal(
+            corrected["exposure_factor"].values, raw["exposure_factor"].values
         )
 
-        result = cleanup_intermediate_variables(dataset)
 
-        # Should keep these variables
-        assert "counts" in result.data_vars
-        assert "ena_intensity" in result.data_vars
-        assert "exposure_factor" in result.data_vars
+class TestBootstrapCorrection:
+    """Removing the intensity that bled down from the higher ESA steps."""
 
-        # Should remove these intermediate variables
-        assert "counts_over_eff" not in result.data_vars
-        assert "counts_over_eff_squared" not in result.data_vars
-        assert "bg_rate_exposure_factor" not in result.data_vars
-        assert "bg_rate_stat_uncert_exposure_factor2" not in result.data_vars
+    # The ESA steps the test ancillary corrects from steps of the map itself,
+    # rather than from the virtual step above the top of it.
+    MAPPED_SOURCE_STEPS = (2, 6)
 
-    def test_cleanup_partial_variables(self):
-        """Test cleanup when only some intermediate variables exist."""
-        # Create dataset with only some intermediate variables
-        dataset = xr.Dataset(
-            {
-                "counts": (("energy",), np.ones(7)),
-                "counts_over_eff": (("energy",), np.ones(7)),
-                "exposure_factor": (("energy",), np.ones(7)),
-            }
+    @staticmethod
+    def bled(intensity, target_esa, power=1):
+        """The intensity bled into a target ESA step, from the source steps.
+
+        ``power`` is 1 for the intensity itself and 2 for its variance, which
+        each source term contributes to scaled by the square of its
+        coefficient.
+        """
+        return sum(
+            (LoConstants.BOOTSTRAP_SCALE * coefficient) ** power
+            * intensity[:, source - 1]
+            for source, coefficient in BOOTSTRAP_FACTORS.get(target_esa, {}).items()
         )
 
-        result = cleanup_intermediate_variables(dataset)
+    def test_correction_removes_the_bled_intensity(self, bootstrap_maps):
+        """A corrected step loses the scaled intensity of the steps above it."""
+        corrected, raw = bootstrap_maps
 
-        # Should keep these
-        assert "counts" in result.data_vars
-        assert "exposure_factor" in result.data_vars
-
-        # Should remove only the existing intermediate variable
-        assert "counts_over_eff" not in result.data_vars
-
-
-class TestCalculateBootstrapCorrections:
-    """Tests for the calculate_bootstrap_corrections function."""
-
-    def test_calculate_bootstrap_corrections_basic(
-        self, sample_dataset_with_bootstrap_data
-    ):
-        """Test basic bootstrap correction functionality."""
-        dataset = sample_dataset_with_bootstrap_data.copy()
-
-        # Store original values for comparison
-        original_intensity = dataset["ena_intensity"].copy()
-
-        result = calculate_bootstrap_corrections(dataset)
-
-        # Check that bootstrap corrections were applied
-        assert "ena_intensity" in result.data_vars
-        assert "ena_intensity_stat_uncert" in result.data_vars
-        assert "ena_intensity_sys_err" in result.data_vars
-
-        # Check that intermediate bootstrap variables were removed
-        assert "bootstrap_intensity" not in result.data_vars
-        assert "bootstrap_intensity_stat_uncert" not in result.data_vars
-        assert "bootstrap_intensity_sys_err" not in result.data_vars
-
-        # Check that corrected intensities are different from originals
-        # (bootstrap should reduce intensities due to spillover correction)
-        corrected_intensity = result["ena_intensity"]
-        assert not np.allclose(
-            corrected_intensity.values, original_intensity.values, rtol=1e-10
-        ), "Bootstrap corrections should modify intensities"
-
-        # Check that corrected intensities are generally lower
-        # (bootstrap removes spillover from higher to lower energies)
-        for energy_idx in range(5):  # Lower energy channels should be reduced
-            assert np.all(
-                corrected_intensity[0, energy_idx, :, :].values
-                <= original_intensity[0, energy_idx, :, :].values
-            ), f"Bootstrap should reduce intensity at energy index {energy_idx}"
-
-        # This is a spot check value to ensure we are getting actual
-        # corrected intensities. Previously we were missing the application
-        # of the lower energy channels in the summation.
-        np.testing.assert_allclose(corrected_intensity[0, 5, 0, 0], [895.96302438])
-
-    def test_calculate_bootstrap_corrections_equations(
-        self, sample_dataset_with_bootstrap_data
-    ):
-        """Test that bootstrap equations are correctly implemented."""
-        dataset = sample_dataset_with_bootstrap_data.copy()
-
-        # Calculate expected j_c_prime (equation 14)
-        j_c_prime_expected = dataset["ena_intensity"] - dataset["bg_intensity"]
-        j_c_prime_expected = j_c_prime_expected.where(j_c_prime_expected >= 0, 0)
-
-        # Apply bootstrap corrections and check the calculation was done correctly
-        result = calculate_bootstrap_corrections(dataset)
-
-        # Verify the final result makes sense given the bootstrap factors
-        # Higher energy channels should have less correction
-        assert np.all(result["ena_intensity"][0, 6, :, :] >= 0), (
-            "Bootstrap intensities should be non-negative"
+        # The correction runs before the unexposed pixels are filled, so it saw
+        # the zero they were divided down to.
+        intensity = np.where(
+            is_fill(raw["ena_intensity"].values), 0.0, raw["ena_intensity"].values
         )
-
-    def test_calculate_bootstrap_corrections_negative_handling(self):
-        """Test proper handling of negative values during bootstrap calculation."""
-        # Create dataset with some negative j_c_prime values
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-            "longitude": [0, 90],
-            "latitude": [0, 45],
-        }
-
-        dataset = xr.Dataset(coords=coords)
-
-        # Create energy values
-        energy_values = np.array([0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0])
-        dataset["energy"] = (("energy",), energy_values)
-        dataset["geometric_factor"] = (("energy",), np.ones(7))
-
-        # Create intensities where some background > intensity (negative j_c_prime)
-        intensity_values = np.ones((1, 7, 2, 2)) * 1e6
-        bg_intensity_values = np.ones((1, 7, 2, 2)) * 1.5e6  # Higher than intensity
-
-        dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values,
-        )
-        dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            bg_intensity_values,
-        )
-        dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 2, 2)) * 1e5,
-        )
-        dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 2, 2)) * 5e4,
-        )
-
-        result = calculate_bootstrap_corrections(dataset)
-
-        # All corrected intensities should be non-negative
-        assert np.all(result["ena_intensity"].values >= 0), (
-            "Bootstrap corrections should not produce negative intensities"
-        )
-
-    def test_calculate_bootstrap_corrections_energy_dependence(self):
-        """Test that bootstrap corrections show proper energy dependence."""
-        # Create dataset with realistic energy spectrum
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-            "longitude": [0],
-            "latitude": [0],
-        }
-
-        dataset = xr.Dataset(coords=coords)
-
-        # Create energy values
-        energy_values = np.array([0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0])
-        dataset["energy"] = (("energy",), energy_values)
-        dataset["geometric_factor"] = (("energy",), np.ones(7))
-
-        # Create a steep power law spectrum (typical for ENAs)
-        base_intensity = 1e8
-        intensity_values = np.ones((1, 7, 1, 1))
-        for i in range(7):
-            intensity_values[0, i, 0, 0] = base_intensity * (energy_values[i]) ** (-3)
-
-        dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values,
-        )
-
-        # Low background
-        dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values * 0.01,  # 1% background
-        )
-        dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.sqrt(intensity_values) * 0.1,
-        )
-        dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values * 0.05,
-        )
-
-        result = calculate_bootstrap_corrections(dataset)
-
-        # Lower energy channels should show larger corrections
-        # because they receive spillover from higher energy channels
-        original_ratios = []
-        corrected_ratios = []
-
-        for i in range(6):  # Compare adjacent energy channels
-            original_ratio = (
-                dataset["ena_intensity"][0, i, 0, 0].values
-                / dataset["ena_intensity"][0, i + 1, 0, 0].values
+        for target_esa in self.MAPPED_SOURCE_STEPS:
+            expected = np.maximum(
+                intensity[:, target_esa - 1] - self.bled(intensity, target_esa), 0.0
             )
-            corrected_ratio = (
-                result["ena_intensity"][0, i, 0, 0].values
-                / result["ena_intensity"][0, i + 1, 0, 0].values
-            )
-            original_ratios.append(original_ratio)
-            corrected_ratios.append(corrected_ratio)
+            step = corrected["ena_intensity"].values[:, target_esa - 1]
+            keep = ~is_fill(step)
+            assert keep.any()
+            np.testing.assert_allclose(step[keep], expected[keep], rtol=1e-4)
 
-        # Bootstrap should affect the intensities
-        # Check that the bootstrap corrections are actually being applied
+    def test_uncorrected_steps_are_untouched(self, bootstrap_maps):
+        """A step that nothing bleeds into keeps the intensity it already had."""
+        corrected, raw = bootstrap_maps
 
-        # For power law spectra with small backgrounds, corrections may be very small
-        # Let's check that the algorithm at least completes without error
-        # and produces reasonable output
+        untouched = [esa for esa in range(1, N_ESA + 1) if esa not in BOOTSTRAP_FACTORS]
+        assert untouched, "the test coefficients must leave some steps uncorrected"
 
-        # Check that all intensities are finite and positive
-        assert np.all(np.isfinite(result["ena_intensity"].values)), (
-            "All corrected intensities should be finite"
-        )
-        assert np.all(result["ena_intensity"].values >= 0), (
-            "All corrected intensities should be non-negative"
-        )
-
-        # Check that uncertainties are reasonable
-        assert np.all(np.isfinite(result["ena_intensity_stat_uncert"].values)), (
-            "All statistical uncertainties should be finite"
-        )
-        assert np.all(np.isfinite(result["ena_intensity_sys_err"].values)), (
-            "All systematic errors should be finite"
-        )
-
-    def test_calculate_bootstrap_corrections_uncertainty_propagation(self):
-        """Test proper uncertainty propagation in bootstrap corrections."""
-        # Create simple dataset for uncertainty testing
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-            "longitude": [0],
-            "latitude": [0],
-        }
-
-        dataset = xr.Dataset(coords=coords)
-
-        # Create energy values
-        energy_values = np.array([0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0])
-        dataset["energy"] = (("energy",), energy_values)
-        dataset["geometric_factor"] = (("energy",), np.ones(7))
-
-        # Simple flat spectrum for easier uncertainty analysis
-        intensity_values = np.ones((1, 7, 1, 1)) * 1e6
-        dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values,
-        )
-        dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values * 0.1,  # 10% background
-        )
-
-        # Known uncertainties
-        stat_uncert = np.ones((1, 7, 1, 1)) * 1e5
-        sys_err = np.ones((1, 7, 1, 1)) * 5e4
-
-        dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            stat_uncert,
-        )
-        dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            sys_err,
-        )
-
-        result = calculate_bootstrap_corrections(dataset)
-
-        # Check that uncertainties are properly propagated
-        assert np.all(result["ena_intensity_stat_uncert"].values >= 0), (
-            "Statistical uncertainties should be non-negative"
-        )
-        assert np.all(result["ena_intensity_sys_err"].values >= 0), (
-            "Systematic errors should be non-negative"
-        )
-
-        # Uncertainties should be reasonable relative to the intensities
-        relative_stat_uncert = (
-            result["ena_intensity_stat_uncert"] / result["ena_intensity"]
-        )
-        assert np.all(relative_stat_uncert.values < 1.0), (
-            "Relative statistical uncertainty should be reasonable"
-        )
-
-    def test_calculate_bootstrap_corrections_virtual_channel(self):
-        """Test the virtual channel E8 calculation and its impact."""
-        # Create dataset focused on energy channels 5 and 6 for E8 calculation
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-            "longitude": [0],
-            "latitude": [0],
-        }
-
-        dataset = xr.Dataset(coords=coords)
-
-        # Create energy values where E6/E7 ratio is well-defined
-        energy_values = np.array([0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0])
-        dataset["energy"] = (("energy",), energy_values)
-        dataset["geometric_factor"] = (("energy",), np.ones(7))
-
-        # Create intensities with clear power law for gamma calculation
-        intensity_values = np.ones((1, 7, 1, 1))
-        for i in range(7):
-            intensity_values[0, i, 0, 0] = 1e6 * (energy_values[i] / 1.0) ** (-2)
-
-        dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values,
-        )
-        dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values * 0.05,  # 5% background
-        )
-        dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.sqrt(intensity_values) * 0.1,
-        )
-        dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values * 0.03,
-        )
-
-        # Calculate expected E8 and gamma manually
-        j_c_prime = dataset["ena_intensity"] - dataset["bg_intensity"]
-        j_c_prime = j_c_prime.where(j_c_prime >= 0, 0)
-
-        result = calculate_bootstrap_corrections(dataset)
-
-        # E8 should follow the power law relationship
-        # The virtual channel should have meaningful impact on energy channel 6
-        original_e6 = j_c_prime[0, 6, 0, 0].values
-        corrected_e6 = result["ena_intensity"][0, 6, 0, 0].values
-
-        # Energy channel 6 should be reduced due to E8 spillover subtraction
-        assert corrected_e6 < original_e6, (
-            "Energy channel 6 should be reduced by E8 virtual channel correction"
-        )
-
-    def test_calculate_bootstrap_corrections_bootstrap_factors(self):
-        """Test that the bootstrap factor matrix is applied correctly."""
-        # Create a simple dataset to verify bootstrap factor application
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-            "longitude": [0],
-            "latitude": [0],
-        }
-
-        dataset = xr.Dataset(coords=coords)
-
-        energy_values = np.array([0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0])
-        dataset["energy"] = (("energy",), energy_values)
-        dataset["geometric_factor"] = (("energy",), np.ones(7))
-
-        # Use unit intensities to make bootstrap factor effects clear
-        intensity_values = np.ones((1, 7, 1, 1)) * 1.0
-        dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values,
-        )
-        dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.zeros((1, 7, 1, 1)),  # No background
-        )
-        dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 1, 1)) * 0.1,
-        )
-        dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.ones((1, 7, 1, 1)) * 0.05,
-        )
-
-        result = calculate_bootstrap_corrections(dataset)
-
-        # With unit intensities and no background, the corrections should
-        # directly reflect the bootstrap factors
-        # The bootstrap algorithm is complex due to interdependencies
-        # Let's just verify that corrections are applied and reasonable
-        corrected_intensities = result["ena_intensity"][0, :, 0, 0].values
-
-        # All channels should be reduced from their original value of 1.0
-        for i in range(7):
-            assert corrected_intensities[i] < 1.0, (
-                f"Energy {i} should be corrected (reduced from 1.0), "
-                f"got {corrected_intensities[i]}"
+        for target_esa in untouched:
+            np.testing.assert_allclose(
+                corrected["ena_intensity"].values[:, target_esa - 1],
+                raw["ena_intensity"].values[:, target_esa - 1],
+                rtol=1e-6,
             )
 
-        # Energy 6 should have the largest correction due to 0.75 factor
-        assert corrected_intensities[6] < 0.5, (
-            f"Energy 6 should have large correction, got {corrected_intensities[6]}"
+    def test_top_step_is_corrected_against_the_virtual_step(self, bootstrap_maps):
+        """The top step has only the extrapolated step above it to lose to."""
+        corrected, raw = bootstrap_maps
+
+        top = N_ESA
+        assert set(BOOTSTRAP_FACTORS[top]) == {N_ESA + 1}, (
+            "the top step must be fed by the virtual step alone"
         )
 
-    def test_calculate_bootstrap_corrections_edge_cases(self):
-        """Test edge cases in bootstrap correction calculation."""
-        # Test with zero intensities
-        coords = {
-            "epoch": [8.1794907049e17],
-            "energy": list(range(7)),
-            "longitude": [0],
-            "latitude": [0],
-        }
-
-        dataset = xr.Dataset(coords=coords)
-
-        energy_values = np.array([0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0])
-        dataset["energy"] = (("energy",), energy_values)
-        dataset["geometric_factor"] = (("energy",), np.ones(7))
-
-        # Zero intensities
-        intensity_values = np.zeros((1, 7, 1, 1))
-        dataset["ena_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            intensity_values,
+        correction = (
+            raw["ena_intensity"].values[:, top - 1]
+            - corrected["ena_intensity"].values[:, top - 1]
         )
-        dataset["bg_intensity"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.zeros((1, 7, 1, 1)),
-        )
-        dataset["ena_intensity_stat_uncert"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.zeros((1, 7, 1, 1)),
-        )
-        dataset["ena_intensity_sys_err"] = (
-            ("epoch", "energy", "longitude", "latitude"),
-            np.zeros((1, 7, 1, 1)),
-        )
+        assert np.all(correction >= 0)
+        assert np.any(correction > 0), "the virtual step corrected nothing"
 
-        result = calculate_bootstrap_corrections(dataset)
+    def test_uncertainty_gains_the_source_intensities(self, bootstrap_maps):
+        """Subtracting a measured quantity can only add to the variance."""
+        corrected, raw = bootstrap_maps
 
-        # Should handle zero intensities gracefully
-        assert np.all(result["ena_intensity"].values >= 0), (
-            "Zero intensities should remain non-negative"
-        )
-        assert np.all(np.isfinite(result["ena_intensity"].values)), (
-            "All intensities should be finite"
+        uncert = raw["ena_intensity_stat_uncert"].values
+        variance = np.where(is_fill(uncert), 0.0, uncert) ** 2
+        for target_esa in self.MAPPED_SOURCE_STEPS:
+            expected = variance[:, target_esa - 1] + self.bled(
+                variance, target_esa, power=2
+            )
+            step = corrected["ena_intensity_stat_uncert"].values[:, target_esa - 1]
+            keep = ~is_fill(step)
+            assert keep.any()
+            np.testing.assert_allclose(step[keep], np.sqrt(expected[keep]), rtol=1e-4)
+
+    def test_intensity_is_never_negative(self, bootstrap_maps):
+        """The corrected map holds no negative intensity."""
+        corrected, _ = bootstrap_maps
+
+        assert np.all(measured(corrected["ena_intensity"].values) >= 0)
+
+    def test_over_subtraction_is_floored_at_zero(self):
+        """Over-subtracting a pixel floors it rather than going below zero."""
+        calibration = _esa_calibration("h", 0)
+        intensity = np.ones((1, N_ESA, 4))
+        # Every step loses twice its own intensity to the step above it.
+        coefficients = np.zeros((N_ESA, N_ESA + 1))
+        coefficients[np.arange(N_ESA), np.arange(1, N_ESA + 1)] = (
+            2.0 / LoConstants.BOOTSTRAP_SCALE
         )
 
-
-# =============================================================================
-# INTEGRATION TESTS
-# =============================================================================
-
-
-class TestCalculateAllRatesAndIntensities:
-    """Integration tests for the calculate_all_rates_and_intensities function."""
-
-    def test_calculate_all_rates_and_intensities_complete(self):
-        """Test the complete rates and intensities calculation pipeline."""
-        # Create a comprehensive dataset with current naming convention
-        dataset = xr.Dataset(
-            {
-                # Count data (current generic naming)
-                "counts": (("energy",), np.ones(7) * 10),
-                # Efficiency corrected data
-                "counts_over_eff": (("energy",), np.ones(7) * 12),  # 10/0.83 ≈ 12
-                "counts_over_eff_squared": (("energy",), np.ones(7) * 12),
-                # Other required data
-                "exposure_factor": (("energy",), np.ones(7) * 1.0),
-                "geometric_factor": (("energy",), np.ones(7) * 1e-4),
-                "energy": (("energy",), np.ones(7) * 0.1),
-                "geometric_factor_stat_uncert": (("energy",), np.ones(7) * 1e-5),
-                # Background intermediate data
-                "bg_rate_exposure_factor": (("energy",), np.ones(7) * 0.3),
-                "bg_rate_stat_uncert_exposure_factor2": (
-                    ("energy",),
-                    np.ones(7) * 0.009,
-                ),
-            }
+        corrected, _, plus, minus = _bootstrap_correct_intensity(
+            intensity,
+            np.ones_like(intensity),
+            calibration,
+            coefficients,
+            (2, 2),
+            calibration["geometric_factor_low"].values[:, np.newaxis] > 0,
         )
 
-        result = calculate_all_rates_and_intensities(dataset)
+        np.testing.assert_array_equal(corrected, np.zeros_like(corrected))
+        assert np.all(plus >= 0)
+        assert np.all(minus >= 0)
 
-        # Check that rates were calculated
-        assert "ena_count_rate" in result.data_vars
-        assert "ena_count_rate_stat_uncert" in result.data_vars
+    def test_systematic_error_brackets_the_correction(self, bootstrap_maps):
+        """The corrected steps keep a two-sided systematic error."""
+        corrected, _ = bootstrap_maps
 
-        # Check that intensities were calculated
-        assert "ena_intensity" in result.data_vars
-        assert "ena_intensity_stat_uncert" in result.data_vars
-        assert "ena_intensity_sys_err" in result.data_vars
+        plus = corrected["ena_intensity_sys_err_plus"].values
+        minus = corrected["ena_intensity_sys_err_minus"].values
+        symmetric = corrected["ena_intensity_sys_err"].values
+        lit = corrected["ena_intensity"].values > 0
 
-        # Check that background rates were calculated
-        assert "bg_rate" in result.data_vars
-        assert "bg_rate_stat_uncert" in result.data_vars
-        assert "bg_rate_sys_err" in result.data_vars
-
-        # Check that intermediate variables were cleaned up
-        assert "counts_over_eff" not in result.data_vars
-        assert "counts_over_eff_squared" not in result.data_vars
-        assert "bg_rate_exposure_factor" not in result.data_vars
-        assert "bg_rate_stat_uncert_exposure_factor2" not in result.data_vars
-
-    def test_calculate_all_rates_with_cg_correction(
-        self, sample_dataset_with_intensities
-    ):
-        """Test that CG correction is applied when cg_correction=True."""
-        # Add necessary variables for the calculation
-        dataset = sample_dataset_with_intensities.copy(deep=True)
-        dataset["counts"] = (("epoch", "energy"), np.ones((1, 7)) * 10)
-        dataset["counts_over_eff"] = (("epoch", "energy"), np.ones((1, 7)) * 12)
-        dataset["counts_over_eff_squared"] = (("epoch", "energy"), np.ones((1, 7)) * 12)
-        dataset["exposure_factor"] = (("epoch", "energy"), np.ones((1, 7)) * 1.0)
-        dataset["geometric_factor"] = (("energy",), np.ones(7) * 1e-4)
-        dataset["geometric_factor_stat_uncert"] = (("energy",), np.ones(7) * 1e-5)
-        dataset["bg_rate_exposure_factor"] = (
-            ("epoch", "energy"),
-            np.ones((1, 7)) * 0.3,
+        assert np.all(measured(plus) >= 0)
+        assert np.all(measured(minus) >= 0)
+        assert np.all(plus[lit] > 0)
+        np.testing.assert_allclose(
+            symmetric[lit], np.sqrt(plus[lit] * minus[lit]), rtol=1e-4
         )
-        dataset["bg_rate_stat_uncert_exposure_factor2"] = (
-            ("epoch", "energy"),
-            np.ones((1, 7)) * 0.009,
-        )
-        dataset["energy_sc_exposure_factor"] = xr.ones_like(dataset["ena_intensity"])
+        # The correction is bracketed by a smaller and a larger subtraction, so
+        # its systematic error is wider than the G-factor one it starts from.
+        for target_esa in self.MAPPED_SOURCE_STEPS:
+            assert np.any(plus[:, target_esa - 1] > minus[:, target_esa - 1])
 
-        # Mock the interpolation function
+    def test_counts_and_rates_stay_as_observed(self, bootstrap_maps):
+        """The correction applies to the intensities alone."""
+        corrected, raw = bootstrap_maps
+
+        for variable in ("ena_count", "exposure_factor", "ena_count_rate"):
+            np.testing.assert_array_equal(
+                corrected[variable].values, raw[variable].values
+            )
+
+
+class TestVirtualStepExtrapolation:
+    """Extrapolating the ESA step above the top of the map."""
+
+    energy = np.array([0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64])
+    grid_shape = (4, 3)
+
+    def intensity(self, second, top):
+        """A map of the two top ESA steps, one epoch, on a 4x3 sky grid."""
+        values = np.zeros((1, N_ESA, np.prod(self.grid_shape)))
+        values[0, -2] = np.asarray(second, dtype=float).ravel()
+        values[0, -1] = np.asarray(top, dtype=float).ravel()
+        return values
+
+    def test_power_law_between_the_top_two_steps(self):
+        """A pixel with both steps lit extrapolates along its own spectrum."""
+        gamma = 1.4
+        top = np.full(np.prod(self.grid_shape), 3.0)
+        second = top * (self.energy[-1] / self.energy[-2]) ** gamma
+
+        extrapolated = _extrapolate_top_intensity(
+            self.intensity(second, top), self.energy, self.grid_shape
+        )
+
+        np.testing.assert_allclose(
+            extrapolated[0],
+            top * LoConstants.ESA_8_ENERGY_RATIO**-gamma,
+            rtol=1e-6,
+        )
+
+    def test_missing_spectrum_borrows_from_the_neighborhood(self):
+        """A pixel with no spectrum of its own uses its neighbors' median."""
+        gamma = 1.4
+        top = np.full(np.prod(self.grid_shape), 3.0)
+        second = top * (self.energy[-1] / self.energy[-2]) ** gamma
+        # One pixel is dark in the second step, so it has no spectrum, but its
+        # neighbors all share the same one.
+        second[0] = 0.0
+
+        extrapolated = _extrapolate_top_intensity(
+            self.intensity(second, top), self.energy, self.grid_shape
+        )
+
+        np.testing.assert_allclose(
+            extrapolated[0],
+            top * LoConstants.ESA_8_ENERGY_RATIO**-gamma,
+            rtol=1e-6,
+        )
+
+    def test_map_with_no_spectrum_falls_back_to_the_nominal_index(self):
+        """With no pixel to learn a spectrum from, a nominal one stands in."""
+        top = np.full(np.prod(self.grid_shape), 3.0)
+
+        extrapolated = _extrapolate_top_intensity(
+            self.intensity(np.zeros_like(top), top), self.energy, self.grid_shape
+        )
+
+        np.testing.assert_allclose(
+            extrapolated[0],
+            top
+            * LoConstants.ESA_8_ENERGY_RATIO
+            ** -LoConstants.BOOTSTRAP_DEFAULT_SPECTRAL_INDEX,
+            rtol=1e-6,
+        )
+
+
+class TestComptonGettingCorrection:
+    """Moving the intensities into the frame the heliosphere sees them in."""
+
+    def test_the_eta_fit_factors_are_required(self, one_pointing):
+        """A heliospheric frame map cannot be made without the transmission factors."""
+        with pytest.raises(ValueError, match="ESA eta fit factors"):
+            lo_l2(as_dependencies(one_pointing), [], CG_DESCRIPTOR)
+
+    def test_a_spacecraft_frame_map_needs_no_eta_fit_factors(self, one_pointing):
+        """The factors are read for the correction alone, so an sf map goes without."""
         with patch(
-            "imap_processing.lo.l2.lo_l2.interpolate_map_flux_to_helio_frame"
-        ) as mock_interp:
-            # Make the mock return the input dataset
-            mock_interp.side_effect = lambda ds, *args, **kwargs: ds
-
-            # Call with CG correction enabled
-            _ = calculate_all_rates_and_intensities(dataset, cg_correction=True)
-
-            # Verify that interpolation was called
-            mock_interp.assert_called_once()
-
-            # Check the call arguments
-            call_args = mock_interp.call_args
-            assert call_args[0][1].equals(
-                dataset["energy"]
-            )  # spacecraft frame energies
-            assert call_args[0][2].equals(dataset["energy"])  # helio frame energies
-            # Check that s/c energies get computed in keV units
-            expected_sc_energies = (
-                dataset["energy_sc_exposure_factor"] / dataset["exposure_factor"] / 1e3
-            )
-            xr.testing.assert_allclose(
-                call_args[0][0]["energy_sc"], expected_sc_energies
-            )
-            assert "ena_intensity" in call_args[0][3]  # variables to interpolate
-            assert "bg_intensity" in call_args[0][3]
-
-    def test_calculate_all_rates_cg_with_other_corrections(
-        self, sample_dataset_with_intensities, lo_flux_factors_file
-    ):
-        """Test CG correction works alongside other corrections."""
-        # Add necessary variables
-        dataset = sample_dataset_with_intensities.copy(deep=True)
-        dataset["counts"] = (("epoch", "energy"), np.ones((1, 7)) * 10)
-        dataset["counts_over_eff"] = (("epoch", "energy"), np.ones((1, 7)) * 12)
-        dataset["counts_over_eff_squared"] = (("epoch", "energy"), np.ones((1, 7)) * 12)
-        dataset["exposure_factor"] = (("epoch", "energy"), np.ones((1, 7)) * 1.0)
-        dataset["geometric_factor"] = (("energy",), np.ones(7) * 1e-4)
-        dataset["geometric_factor_stat_uncert"] = (("energy",), np.ones(7) * 1e-5)
-        dataset["bg_rate_exposure_factor"] = (
-            ("epoch", "energy"),
-            np.ones((1, 7)) * 0.3,
-        )
-        dataset["bg_rate_stat_uncert_exposure_factor2"] = (
-            ("epoch", "energy"),
-            np.ones((1, 7)) * 0.009,
-        )
-        dataset["energy_sc_exposure_factor"] = xr.ones_like(dataset["ena_intensity"])
-
-        with patch(
-            "imap_processing.lo.l2.lo_l2.interpolate_map_flux_to_helio_frame"
-        ) as mock_interp:
-            mock_interp.side_effect = lambda ds, *args, **kwargs: ds
-
-            # Call with both flux correction and CG correction
-            result = calculate_all_rates_and_intensities(
-                dataset,
-                flux_correction=True,
-                flux_factors=lo_flux_factors_file,
-                cg_correction=True,
-            )
-
-            # Both corrections should be applied
-            assert "ena_intensity" in result.data_vars
-            mock_interp.assert_called_once()
-
-
-@pytest.mark.external_kernel
-class TestIntegrationWithMocks:
-    """Integration tests using mocked external dependencies."""
-
-    def test_lo_l2_integration_minimal(
-        self, minimal_pset_for_species, lo_flux_factors_file
-    ):
-        """Test the main lo_l2 function with minimal mocking."""
-        # Test with hydrogen data
-        sci_dependencies = {"imap_lo_l1c_pset": [minimal_pset_for_species]}
-        anc_dependencies = [lo_flux_factors_file]  # Include flux factors file
-        descriptor = "l090-ena-h-sf-nsp-ram-hae-6deg-3mo"
-
-        # Mock the complex external dependencies to return simple results
-        with (
-            patch(
-                "imap_processing.lo.l2.lo_l2.create_sky_map_from_psets"
-            ) as mock_create_map,
-            patch("imap_processing.lo.l2.lo_l2.add_geometric_factors") as mock_add_gf,
-            patch(
-                "imap_processing.lo.l2.lo_l2.calculate_all_rates_and_intensities"
-            ) as mock_calc_rates,
-            patch("imap_processing.lo.l2.lo_l2.finalize_dataset") as mock_finalize,
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
         ):
-            # Setup mock returns
-            mock_sky_map = Mock()
-            mock_dataset = xr.Dataset({"test_var": (("energy",), np.ones(7))})
-            mock_sky_map.to_dataset.return_value = mock_dataset
-            mock_sky_map.build_cdf_dataset.return_value = mock_dataset
-            mock_create_map.return_value = mock_sky_map
-            mock_add_gf.return_value = mock_dataset
-            mock_calc_rates.return_value = mock_dataset
-            mock_finalize.return_value = mock_dataset
+            (dataset,) = lo_l2(as_dependencies(one_pointing), [], FULL_DESCRIPTOR)
 
-            # Run the function - should not crash
-            result = lo_l2(sci_dependencies, anc_dependencies, descriptor)
+        assert (dataset["ena_intensity"].values > 0).any()
 
-            # Basic validation
-            assert isinstance(result, list)
-            assert len(result) == 1
-            assert isinstance(result[0], xr.Dataset)
+    def test_counts_and_rates_stay_as_observed(self, cg_maps):
+        """The correction applies to the intensities alone."""
+        corrected, raw = cg_maps
 
-            # Mock the rates calculation to return the dataset unchanged
-            mock_calc_rates.side_effect = lambda x, **kwargs: x
+        for variable in ("ena_count", "exposure_factor", "ena_count_rate"):
+            np.testing.assert_array_equal(
+                corrected[variable].values, raw[variable].values
+            )
 
-            # Run the function - should not crash
-            result = lo_l2(sci_dependencies, anc_dependencies, descriptor)
+    def test_intensities_are_corrected(self, cg_maps):
+        """The intensities and the background come out shifted."""
+        corrected, raw = cg_maps
 
-            # Basic validation
-            assert isinstance(result, list)
-            assert len(result) == 1
-            assert isinstance(result[0], xr.Dataset)
+        for variable in ("ena_intensity", "bg_intensity"):
+            lit = raw[variable].values > 0
+            assert lit.any()
+            assert np.any(
+                ~np.isclose(corrected[variable].values[lit], raw[variable].values[lit])
+            ), f"{variable} was not corrected"
 
+    def test_the_correction_leaks_no_nan(self, cg_maps):
+        """A pixel the correction says nothing about comes out at zero, not NaN."""
+        corrected, _ = cg_maps
 
-@pytest.fixture
-def ibex_pset_file():
-    """Path to the LO/IBEX pset test file."""
-    # Use the actual test data file from the ena_maps test data
-    test_data_path = Path(__file__).parent / "test_cdfs"
-    return test_data_path / "imap_lo_l1c_pset_20260101-repoint01261_v001.cdf"
+        for variable in (
+            "ena_intensity",
+            "ena_intensity_stat_uncert",
+            "ena_intensity_sys_err_plus",
+            "ena_intensity_sys_err_minus",
+            "bg_intensity",
+            "bg_intensity_stat_uncert",
+        ):
+            values = corrected[variable].values
+            assert np.isfinite(values).all(), f"{variable} holds NaN or inf"
+            assert np.all(measured(values) >= 0), f"{variable} went negative"
 
+    def test_dark_pixels_stay_dark(self, cg_maps):
+        """A pixel that saw nothing has no spectrum to correct."""
+        corrected, raw = cg_maps
 
-@pytest.mark.external_test_data
-@pytest.mark.external_kernel
-class TestIntegration:
-    """Integration tests using IBEX data and simulated kernels."""
+        intensity = raw["ena_intensity"].values
+        dark = (intensity <= 0) & ~is_fill(intensity)
+        assert dark.any()
+        assert np.all(corrected["ena_intensity"].values[dark] == 0)
 
-    def test_lo_l2_integration_full(
-        self, ibex_pset_file, imap_ena_sim_metakernel, lo_flux_factors_file
-    ):
-        """Test the main lo_l2 function with no mocking."""
-        # Test with oxygen data to reduce test run-time
-        sci_dependencies = {"imap_lo_l1c_pset": [load_cdf(ibex_pset_file)]}
-        anc_dependencies = [lo_flux_factors_file]  # Include flux factors file
-        descriptor = "l090-ena-o-hf-nsp-ram-hae-6deg-3mo"
+    def test_accumulator_is_not_written_out(self, cg_maps):
+        """The projected cos(alpha) is an accumulator, not a map variable."""
+        corrected, _ = cg_maps
 
-        # Run the function - should not crash
-        result = lo_l2(sci_dependencies, anc_dependencies, descriptor)
-
-        # Basic validation
-        assert isinstance(result, list)
-        assert len(result) == 1
-        assert isinstance(result[0], xr.Dataset)
-
-        # Make sure that bg_rate variables are present
-        for var in ["bg_rate", "bg_rate_stat_uncert", "bg_rate_sys_err"]:
-            assert var in result[0].data_vars
+        assert "cos_alpha_exposure" not in corrected.data_vars
 
 
-# =============================================================================
-# ERROR HANDLING TESTS
-# =============================================================================
+class TestSpacecraftFrameEnergy:
+    """The kinematics of an ENA seen from a moving spacecraft."""
+
+    # The energy [eV] an ENA of the top ESA level has in the helio frame.
+    energy = np.array([16.0, 30.0, 56.0, 106.0, 200.0, 404.0, 787.0])
+
+    def spacecraft_energy(self, cos_alpha):
+        """The spacecraft frame energies of one pixel at every ESA level."""
+        alpha = np.full((1, N_ESA, 1), float(cos_alpha))
+        return _spacecraft_frame_energy(alpha, self.energy)[0, :, 0]
+
+    def test_head_on_ena_gains_the_spacecraft_speed(self):
+        """Looking into the ram direction, the speeds add."""
+        energy_u = LoConstants.CG_ENA_ENERGY_AT_SPACECRAFT_SPEED_EV
+
+        np.testing.assert_allclose(
+            self.spacecraft_energy(1.0),
+            (np.sqrt(self.energy) + np.sqrt(energy_u)) ** 2,
+            rtol=1e-12,
+        )
+
+    def test_overtaken_ena_loses_the_spacecraft_speed(self):
+        """Looking away from the ram direction, the speeds subtract."""
+        energy_u = LoConstants.CG_ENA_ENERGY_AT_SPACECRAFT_SPEED_EV
+
+        np.testing.assert_allclose(
+            self.spacecraft_energy(-1.0),
+            (np.sqrt(self.energy) - np.sqrt(energy_u)) ** 2,
+            rtol=1e-12,
+        )
+
+    def test_side_on_ena_loses_the_spacecraft_energy(self):
+        """Looking across the ram direction, the energies subtract."""
+        energy_u = LoConstants.CG_ENA_ENERGY_AT_SPACECRAFT_SPEED_EV
+
+        np.testing.assert_allclose(
+            self.spacecraft_energy(0.0), self.energy - energy_u, rtol=1e-12
+        )
+
+    def test_ram_side_is_the_energetic_one(self):
+        """The shift grows monotonically towards the ram direction."""
+        cosines = np.linspace(-1.0, 1.0, 21)
+        energies = np.array([self.spacecraft_energy(c) for c in cosines])
+
+        assert np.all(np.diff(energies, axis=0) > 0)
 
 
-class TestErrorHandling:
-    """Tests for error handling in various functions."""
+class TestComptonGettingMaths:
+    """The correction applied to a spectrum whose answer is known."""
 
-    def test_lo_l2_no_pset_data(self):
-        """Test error when no pointing set data is provided."""
-        sci_dependencies = {}  # Missing imap_lo_l1c_pset
-        anc_dependencies = []
-        descriptor = "l090-ena-h-sf-nsp-ram-hae-6deg-3mo"
+    energy_kev = np.array([0.016, 0.030, 0.056, 0.106, 0.200, 0.404, 0.787])
+    spectral_index = -1.8
 
-        with pytest.raises(ValueError, match="No pointing set data found"):
-            lo_l2(sci_dependencies, anc_dependencies, descriptor)
-
-    def test_create_sky_map_healpix_not_supported(self, minimal_pset_for_species):
-        """Test error when HEALPix map is requested."""
-        with patch.object(MapDescriptor, "from_string") as mock_from_string:
-            mock_map_desc = Mock()
-            mock_healpix_map = Mock()  # Not a RectangularSkyMap
-            mock_map_desc.to_empty_map.return_value = mock_healpix_map
-            mock_map_desc.species = "h"
-            mock_from_string.return_value = mock_map_desc
-
-            with pytest.raises(
-                NotImplementedError, match="HEALPix map output not supported"
-            ):
-                create_sky_map_from_psets(
-                    [minimal_pset_for_species], mock_map_desc, pd.DataFrame(), False
-                )
-
-
-# =============================================================================
-# PROPERTY-BASED AND EDGE CASE TESTS
-# =============================================================================
-
-
-class TestEdgeCases:
-    """Tests for edge cases and boundary conditions."""
-
-    def test_empty_efficiency_data_handling(self, minimal_pset):
-        """Test handling of empty efficiency data."""
-        empty_df = pd.DataFrame()
-        result = add_efficiency_factors_to_pset(minimal_pset, empty_df)
-
-        # Should create unity efficiency
-        assert "efficiency" in result.data_vars
-        np.testing.assert_array_equal(result["efficiency"].values, np.ones(7))
-
-    def test_zero_exposure_time_handling(self):
-        """Test handling of zero exposure times."""
-        dataset = xr.Dataset(
+    @pytest.fixture
+    def calibration(self):
+        """A calibration carrying only the energies the correction reads."""
+        ones = np.ones(N_ESA)
+        arrays = dict(
+            energy=self.energy_kev,
+            energy_delta_minus=np.zeros(N_ESA),
+            energy_delta_plus=np.zeros(N_ESA),
+            geometric_factor=ones,
+            geometric_factor_low=ones,
+            geometric_factor_high=ones,
+        )
+        return xr.Dataset(
             {
-                "counts": (("energy",), np.ones(7) * 10),
-                "exposure_factor": (("energy",), np.zeros(7)),  # Zero exposure
+                name: xr.DataArray(array, dims=[CoordNames.ENERGY_L2.value])
+                for name, array in arrays.items()
             }
         )
 
-        result = calculate_rates(dataset)
-
-        # Should handle division by zero gracefully
-        assert "ena_count_rate" in result.data_vars
-        # Rates should be infinite where exposure time is zero
-        assert np.all(np.isinf(result["ena_count_rate"].values))
-
-    def test_negative_counts_handling(self):
-        """Test handling of negative count values."""
-        dataset = xr.Dataset(
-            {
-                "counts": (("energy",), np.array([-1, 0, 1, 2, 3, 4, 5])),
-                "exposure_factor": (("energy",), np.ones(7)),
-            }
+    @pytest.fixture
+    def flux_corrector(self):
+        """The ESA transmission factors of the test eta fit ancillary."""
+        return PowerLawFluxCorrector(
+            ANCILLARY_DIR / "imap_lo_esa-eta-fit-factors_20240101_v001.csv"
         )
 
-        result = calculate_rates(dataset)
+    @pytest.fixture
+    def transparent_corrector(self, tmp_path):
+        """A corrector whose every ESA level transmits perfectly.
 
-        # Should calculate rates even with negative counts
-        assert "ena_count_rate" in result.data_vars
-        assert "ena_count_rate_stat_uncert" in result.data_vars
+        With no transmission to undo, the source spectrum is the observed one
+        and the correction is the energy shift alone, which is what makes the
+        expected values here analytic.
+        """
+        coefficients = tmp_path / "imap_lo_esa-eta-fit-factors_20240101_v999.csv"
+        rows = "\n".join(f"{step},1,0,0,0,0,0" for step in range(1, N_ESA + 1))
+        coefficients.write_text(f"esa_step,M0,M1,M2,M3,M4,M5\n{rows}\n")
+        return PowerLawFluxCorrector(coefficients)
 
-        # Uncertainty calculation should handle negative counts
-        # (sqrt of negative gives NaN, which is expected behavior)
-        assert np.isnan(result["ena_count_rate_stat_uncert"].values[0])
+    def power_law(self, n_pixels):
+        """A spectrum of exactly the test spectral index, at every pixel."""
+        spectrum = 1e5 * (self.energy_kev / self.energy_kev[0]) ** self.spectral_index
+        return np.tile(spectrum[np.newaxis, :, np.newaxis], (1, 1, n_pixels))
 
+    def test_correction_follows_the_source_power_law(
+        self, calibration, transparent_corrector
+    ):
+        """A power-law spectrum is scaled by the shift along its own slope."""
+        cos_alpha = np.linspace(-1.0, 1.0, 12)[np.newaxis, np.newaxis, :]
+        cos_alpha = np.tile(cos_alpha, (1, N_ESA, 1))
+        intensity = self.power_law(cos_alpha.shape[-1])
 
-# =============================================================================
-# TESTS FOR CG CORRECTION FUNCTIONALITY
-# =============================================================================
-
-
-class TestPrepareCorrections:
-    """Tests for the _prepare_corrections function."""
-
-    def test_prepare_corrections_hf_frame(self, lo_flux_factors_file):
-        """Test that CG correction is enabled for heliocentric frame (hf)."""
-        # Create a map descriptor with heliocentric frame
-        descriptor = "ilo90-ena-h-hf-nsp-full-hae-6deg-3mo"
-        map_descriptor = MapDescriptor.from_string(descriptor)
-
-        sci_dependencies = {"imap_lo_l1c_pset": []}
-        anc_dependencies = [lo_flux_factors_file]
-
-        with patch("imap_processing.lo.l2.lo_l2.lo_l2") as mock_lo_l2:
-            mock_o_dataset = xr.Dataset()
-            mock_lo_l2.return_value = [mock_o_dataset]
-            result = _prepare_corrections(
-                map_descriptor, descriptor, sci_dependencies, anc_dependencies
-            )
-
-        # Unpack the tuple
-        (
-            sputtering_correction,
-            bootstrap_correction,
-            flux_correction,
-            o_map_dataset,
-            flux_factors,
-            cg_correction,
-        ) = result
-
-        # Check that CG correction is enabled for hf frame
-        assert cg_correction is True, "CG correction should be enabled for 'hf' frame"
-
-        # Check other correction flags
-        assert flux_correction is True  # ENA data should have flux correction
-        assert sputtering_correction is True  # h-ena product, apply sputtering
-        assert bootstrap_correction is True  # h-ena product, apply bootstrap
-        assert o_map_dataset is not None  # oxygen dataset produced
-        assert flux_factors is not None  # Flux factors should be found
-
-    def test_prepare_corrections_sc_frame(self, lo_flux_factors_file):
-        """Test that CG correction is disabled for spacecraft frame (sc)."""
-        # Create a map descriptor with spacecraft frame
-        descriptor = "ilo90-ena-o-sf-nsp-full-hae-6deg-3mo"
-        map_descriptor = MapDescriptor.from_string(descriptor)
-
-        sci_dependencies = {"imap_lo_l1c_pset": []}
-        anc_dependencies = [lo_flux_factors_file]
-
-        result = _prepare_corrections(
-            map_descriptor, descriptor, sci_dependencies, anc_dependencies
+        corrected, _ = _compton_getting_correct_intensity(
+            intensity, (), cos_alpha, calibration, transparent_corrector
         )
 
-        # Unpack the tuple
-        (
-            sputtering_correction,
-            bootstrap_correction,
-            flux_correction,
-            o_map_dataset,
-            flux_factors,
-            cg_correction,
-        ) = result
-
-        # Check that CG correction is disabled for sc frame
-        assert cg_correction is False, (
-            "CG correction should be disabled for non-'hf' frame"
+        # The index of a pure power law is recovered exactly, and a perfectly
+        # transmitting ESA leaves the source intensity as the observed one.
+        energy_ev = self.energy_kev * 1e3
+        energy_sc = _spacecraft_frame_energy(cos_alpha, energy_ev)
+        expected = intensity * (energy_sc / energy_ev[:, np.newaxis]) ** (
+            self.spectral_index + 1.0
         )
 
-    def test_prepare_corrections_with_hydrogen_ena(self, lo_flux_factors_file):
-        """Test corrections for hydrogen ENA data."""
-        descriptor = "ilo90-ena-h-sf-nsp-full-hae-6deg-3mo"
-        map_descriptor = MapDescriptor.from_string(descriptor)
+        np.testing.assert_allclose(corrected, expected, rtol=1e-10)
 
-        # Mock the recursive call to lo_l2 for oxygen
-        with patch("imap_processing.lo.l2.lo_l2.lo_l2") as mock_lo_l2:
-            mock_o_dataset = xr.Dataset({"test": (("energy",), np.ones(7))})
-            mock_lo_l2.return_value = [mock_o_dataset]
+    def test_transmission_is_divided_out(
+        self, calibration, flux_corrector, transparent_corrector
+    ):
+        """An ESA that over-transmits has to be corrected back down."""
+        cos_alpha = np.full((1, N_ESA, 4), 0.5)
+        intensity = self.power_law(4)
 
-            sci_dependencies = {"imap_lo_l1c_pset": []}
-            anc_dependencies = [lo_flux_factors_file]
-
-            result = _prepare_corrections(
-                map_descriptor, descriptor, sci_dependencies, anc_dependencies
-            )
-
-            (
-                sputtering_correction,
-                bootstrap_correction,
-                flux_correction,
-                o_map_dataset,
-                flux_factors,
-                cg_correction,
-            ) = result
-
-            # Check that all corrections are enabled for hydrogen ENA
-            assert sputtering_correction is True
-            assert bootstrap_correction is True
-            assert flux_correction is True
-            assert o_map_dataset is not None
-            assert cg_correction is False  # sf frame, not hf
-
-
-class TestProcessSinglePset:
-    """Tests for the process_single_pset function with CG correction."""
-
-    def test_process_single_pset_hf_frame(self, minimal_pset, sample_efficiency_data):
-        """Test that CG correction is applied for heliocentric frame."""
-        pset = minimal_pset.copy()
-        pset = pset.rename({"esa_energy_step": "energy"})
-        # apply_compton_getting_correction gets mocked out so we need to add the
-        # energy_sc variable to the pset
-        pset["energy_sc"] = xr.ones_like(pset["counts"])
-
-        with (
-            patch(
-                "imap_processing.lo.l2.lo_l2.normalize_pset_coordinates"
-            ) as mock_norm,
-            patch(
-                "imap_processing.lo.l2.lo_l2.add_efficiency_factors_to_pset"
-            ) as mock_add_ef,
-            patch(
-                "imap_processing.lo.l2.lo_l2.calculate_efficiency_corrected_quantities"
-            ) as mock_calc_ef,
-            patch(
-                "imap_processing.lo.l2.lo_l2.add_spacecraft_velocity_to_pset"
-            ) as mock_add_sv,
-            patch(
-                "imap_processing.lo.l2.lo_l2.apply_compton_getting_correction"
-            ) as mock_cg,
-            patch("imap_processing.lo.l2.lo_l2.calculate_ram_mask") as mock_ram_mask,
-        ):
-            mock_norm.return_value = pset
-            mock_add_ef.return_value = pset
-            mock_calc_ef.return_value = pset
-            mock_add_sv.return_value = pset
-            mock_cg.return_value = pset
-            mock_ram_mask.return_value = pset
-
-            # Process with hf frame
-            _ = process_single_pset(pset, sample_efficiency_data, "h", cg_correct=True)
-
-            # Check that add_spacecraft_velocity_to_pset was called
-            mock_add_sv.assert_called_once()
-
-            # Check that CG correction was called
-            mock_cg.assert_called_once()
-            assert mock_cg.call_args[0][0] is pset
-            # Energy should be passed as second argument
-            assert "energy" in mock_cg.call_args[0][1].dims
-
-            # Check that calculate_ram_mask was called
-            mock_ram_mask.assert_called_once()
-
-    def test_process_single_pset_sc_frame(self, minimal_pset, sample_efficiency_data):
-        """Test that CG correction is not applied for spacecraft frame."""
-        pset = minimal_pset.copy()
-        pset = pset.rename({"esa_energy_step": "energy"})
-
-        with (
-            patch(
-                "imap_processing.lo.l2.lo_l2.normalize_pset_coordinates"
-            ) as mock_norm,
-            patch(
-                "imap_processing.lo.l2.lo_l2.add_efficiency_factors_to_pset"
-            ) as mock_add_ef,
-            patch(
-                "imap_processing.lo.l2.lo_l2.calculate_efficiency_corrected_quantities"
-            ) as mock_calc_ef,
-            patch(
-                "imap_processing.lo.l2.lo_l2.apply_compton_getting_correction"
-            ) as mock_cg,
-            patch(
-                "imap_processing.lo.l2.lo_l2.add_spacecraft_velocity_to_pset"
-            ) as mock_sc_vel,
-            patch("imap_processing.lo.l2.lo_l2.calculate_ram_mask") as mock_ram_mask,
-        ):
-            mock_norm.return_value = pset
-            mock_add_ef.return_value = pset
-            mock_calc_ef.return_value = pset
-            mock_cg.return_value = pset
-
-            # Process with sc frame
-            _ = process_single_pset(pset, sample_efficiency_data, "h", cg_correct=False)
-
-            # Check that CG correction was NOT called
-            mock_cg.assert_not_called()
-
-            # Check that spacecraft velocity and ram mask were called instead
-            mock_sc_vel.assert_called_once()
-            mock_ram_mask.assert_called_once()
-
-
-class TestProjectPsetToMap:
-    """Tests for the project_pset_to_map function with directional mask."""
-
-    def test_project_pset_to_map_with_mask(self, minimal_pset_for_species):
-        """Test that directional mask is passed to projection."""
-        # Create a mock sky map
-        mock_map = Mock(spec=RectangularSkyMap)
-
-        # Create a directional mask
-        directional_mask = xr.DataArray(
-            np.ones(7, dtype=bool),
-            dims=["energy"],
-            coords={"energy": list(range(7))},
+        corrected, _ = _compton_getting_correct_intensity(
+            intensity, (), cos_alpha, calibration, flux_corrector
+        )
+        transparent, _ = _compton_getting_correct_intensity(
+            intensity, (), cos_alpha, calibration, transparent_corrector
         )
 
-        # Call project_pset_to_map
-        project_pset_to_map(minimal_pset_for_species, mock_map, directional_mask)
+        # The transmission of a falling spectrum is above one at every level,
+        # so dividing it out leaves less intensity than a perfect ESA would.
+        index = np.full((N_ESA, 1), self.spectral_index)
+        assert np.all(flux_corrector.eta_esa(np.arange(N_ESA) + 1, index) > 1.0)
+        assert np.all(corrected < transparent)
 
-        # Verify that project_pset_values_to_map was called with the mask
-        mock_map.project_pset_values_to_map.assert_called_once()
-        call_kwargs = mock_map.project_pset_values_to_map.call_args[1]
-        assert "pset_valid_mask" in call_kwargs
-        assert call_kwargs["pset_valid_mask"] is directional_mask
+    def test_uncertainties_keep_their_fraction(self, calibration, flux_corrector):
+        """Every uncertainty moves by the same factor as its intensity."""
+        cos_alpha = np.tile(
+            np.linspace(-1.0, 1.0, 12)[np.newaxis, np.newaxis, :], (1, N_ESA, 1)
+        )
+        intensity = self.power_law(cos_alpha.shape[-1])
+        stat_uncert = 0.1 * intensity
+        sys_err = 0.05 * intensity
 
-    def test_project_pset_to_map_value_keys(self, minimal_pset_for_species):
-        """Test that correct value keys are projected."""
-        mock_map = Mock(spec=RectangularSkyMap)
-        directional_mask = xr.DataArray(
-            np.ones(7, dtype=bool),
-            dims=["energy"],
+        corrected, (corrected_stat, corrected_sys) = _compton_getting_correct_intensity(
+            intensity,
+            (stat_uncert, sys_err),
+            cos_alpha,
+            calibration,
+            flux_corrector,
         )
 
-        project_pset_to_map(minimal_pset_for_species, mock_map, directional_mask)
+        np.testing.assert_allclose(corrected_stat, 0.1 * corrected, rtol=1e-10)
+        np.testing.assert_allclose(corrected_sys, 0.05 * corrected, rtol=1e-10)
 
-        # Check that the expected value keys are in the call
-        call_kwargs = mock_map.project_pset_values_to_map.call_args[1]
-        value_keys = call_kwargs["value_keys"]
+    def test_unlit_levels_are_left_at_zero(self, calibration, flux_corrector):
+        """A level with no intensity has no spectrum, and stays empty."""
+        cos_alpha = np.full((1, N_ESA, 4), 0.5)
+        intensity = self.power_law(4)
+        intensity[0, :, 2] = 0.0
 
-        expected_keys = [
+        corrected, (corrected_stat,) = _compton_getting_correct_intensity(
+            intensity, (intensity,), cos_alpha, calibration, flux_corrector
+        )
+
+        np.testing.assert_array_equal(corrected[0, :, 2], np.zeros(N_ESA))
+        np.testing.assert_array_equal(corrected_stat[0, :, 2], np.zeros(N_ESA))
+        assert np.all(corrected[0, :, [0, 1, 3]] > 0)
+
+
+class TestGeometry:
+    """The spin-angle to sky-pixel geometry."""
+
+    def test_dps_spin_angles_carry_the_offset(self):
+        """The hardware spin bins are rotated onto the instrument frame."""
+        angles = _dps_spin_angles()
+
+        assert angles.size == N_SPIN_BINS
+        # IMAP-Lo sits 60 degrees from the spacecraft spin pulse, so bin 0's
+        # center (3 degrees) becomes 63 degrees in the despun frame.
+        np.testing.assert_allclose(angles[0], 63.0)
+        np.testing.assert_allclose(np.diff(np.sort(angles)), 6.0)
+
+    def test_bins_land_in_the_pixel_they_are_nearest(self):
+        """Each spin-angle bin is projected into the pixel it points into."""
+        sky_map = MapDescriptor.from_string(FULL_DESCRIPTOR).to_empty_map()
+        spin_angles = _dps_spin_angles()
+        pointing_set = make_pointing_set(sky_map, spin_angles)
+
+        pixels = match_coords_to_indices(pointing_set, sky_map).values
+
+        # A direction never lands further than half a pixel from its pixel's
+        # center, in either axis.
+        centers = sky_map.az_el_points.values[pixels]
+        directions = pointing_set.az_el_points.values
+        half_pixel = sky_map.spacing_deg / 2
+        assert np.all(np.abs(centers[:, 0] - directions[:, 0]) <= half_pixel)
+        assert np.all(np.abs(centers[:, 1] - directions[:, 1]) <= half_pixel)
+
+    def test_bins_of_a_spin_land_in_distinct_pixels(self):
+        """The 60 six-degree spin bins fill a row of the six-degree map."""
+        sky_map = MapDescriptor.from_string(FULL_DESCRIPTOR).to_empty_map()
+        pointing_set = make_pointing_set(sky_map, _dps_spin_angles())
+
+        pixels = match_coords_to_indices(pointing_set, sky_map).values
+
+        assert len(np.unique(pixels)) == N_SPIN_BINS
+
+    @pytest.mark.parametrize(
+        "spin_phase, expected",
+        [("full", 60), ("ram", 30), ("anti", 30)],
+    )
+    def test_spin_phase_mask(self, spin_phase, expected):
+        """Ram and anti-ram split the spin; a full map keeps all of it."""
+        angles = _dps_spin_angles()
+
+        mask = _spin_phase_mask(angles, PIVOT, spin_phase)
+
+        assert mask.sum() == expected
+
+    def test_spin_phase_mask_rejects_unknown(self):
+        """An unknown spin phase is an error, not a silently empty map."""
+        with pytest.raises(ValueError, match="Invalid spin phase"):
+            _spin_phase_mask(_dps_spin_angles(), PIVOT, "sideways")
+
+
+class TestPointingSelection:
+    """Reducing the grouped inputs to the pointings that can be mapped."""
+
+    def test_complete_pointings_are_kept_in_product_order(self, one_pointing):
+        """Each pointing's products are ordered goodtimes, bgrates, histrates."""
+        other = make_pointing(repointing=101)
+
+        pointings = _complete_pointings(as_dependencies(one_pointing, other))
+
+        assert set(pointings) == {100, 101}
+        assert pointings[100] == (
+            one_pointing["goodtimes"],
+            one_pointing["bgrates"],
+            one_pointing["histrates"],
+        )
+
+    def test_incomplete_pointings_are_dropped(self, one_pointing, caplog):
+        """A pointing missing one of the three products cannot be mapped."""
+        incomplete = make_pointing(repointing=101)
+        dependencies = as_dependencies(one_pointing) | as_dependencies(
+            incomplete, products=("goodtimes", "histrates")
+        )
+
+        pointings = _complete_pointings(dependencies)
+
+        assert set(pointings) == {100}
+        assert "repoint00101" in caplog.text
+        assert "bgrates" in caplog.text
+
+    def test_missing_product_raises(self, one_pointing):
+        """A map cannot be made without all three products."""
+        dependencies = as_dependencies(one_pointing, products=("goodtimes", "bgrates"))
+
+        with pytest.raises(KeyError, match="histrates"):
+            _complete_pointings(dependencies)
+
+
+class TestCorrectionFactors:
+    """Reading the sputter and bootstrap correction ancillaries."""
+
+    def test_sputter_factors_are_selected_by_species_pair(
+        self, shipped_ancillaries, tmp_path
+    ):
+        """Only the rows of the requested pair come back, in ESA step order."""
+        factors = load_sputter_correction_data()
+
+        assert list(factors.columns) == [
+            "source_species",
+            "target_species",
+            "target_esa",
+            "source_esa",
+            "sputter_factor",
+        ]
+        assert not factors.empty
+        assert (factors["source_species"] == "o").all()
+        assert (factors["target_species"] == "h").all()
+
+        with patch("imap_processing.lo.l2.lo_l2.ANCILLARY_DATA_DIR", tmp_path):
+            with pytest.raises(ValueError, match="No sputter correction files"):
+                load_sputter_correction_data()
+
+    def test_bootstrap_factors_relate_lower_steps_to_higher(
+        self, shipped_ancillaries, tmp_path
+    ):
+        """Each factor carries a step pair, the source below the target."""
+        factors = load_bootstrap_correction_data()
+
+        assert list(factors.columns) == [
+            "esa_step_i",
+            "esa_step_k",
+            "bootstrap_factor",
+        ]
+        assert not factors.empty
+        assert (factors["esa_step_i"] < factors["esa_step_k"]).all()
+        # Steps are 1-based, and step 8 is the virtual E8 channel.
+        assert factors["esa_step_i"].min() >= 1
+        assert factors["esa_step_k"].max() <= N_ESA + 1
+        assert (factors["bootstrap_factor"] > 0).all()
+
+        with patch("imap_processing.lo.l2.lo_l2.ANCILLARY_DATA_DIR", tmp_path):
+            with pytest.raises(ValueError, match="No bootstrap correction factor"):
+                load_bootstrap_correction_data()
+
+
+class TestIsnMask:
+    """Blanking out the pixels the interstellar neutral flow dominates."""
+
+    def test_the_bright_pixels_of_every_level_are_masked(self, masked_maps):
+        """A pixel above the level's threshold comes back undefined."""
+        masked, raw = masked_maps
+
+        intensity = raw["ena_intensity"].values
+        # The unexposed pixels are filled in both maps, mask or no mask.
+        unexposed = is_fill(intensity)
+        as_masked = np.where(unexposed, 0.0, intensity)
+        peak = np.max(as_masked, axis=(-2, -1), keepdims=True)
+        expected = (as_masked >= MASK_THRESHOLD_FRACTION * peak) | unexposed
+        assert expected.any(), "the tuning must mask something"
+        assert not expected.all(), "the tuning must leave something unmasked"
+
+        np.testing.assert_array_equal(is_fill(masked["ena_intensity"].values), expected)
+
+    def test_the_unmasked_pixels_keep_their_values(self, masked_maps):
+        """Masking changes nothing about the pixels it does not blank out."""
+        masked, raw = masked_maps
+
+        keep = ~is_fill(masked["ena_intensity"].values)
+        np.testing.assert_allclose(
+            masked["ena_intensity"].values[keep],
+            raw["ena_intensity"].values[keep],
+            rtol=1e-6,
+        )
+
+    def test_every_species_variable_is_masked_together(self, masked_maps):
+        """The counts, rates and uncertainties are blanked with the intensity."""
+        masked, raw = masked_maps
+
+        # What the mask blanked, as opposed to what the unexposed pixels of the
+        # unmasked map are already filled with.
+        expected = is_fill(masked["ena_intensity"].values) & ~is_fill(
+            raw["ena_intensity"].values
+        )
+        assert expected.any(), "the tuning must mask something"
+        for name in ISN_MASKED_VARIABLES:
+            blanked = is_fill(masked[name].values) & ~is_fill(raw[name].values)
+            np.testing.assert_array_equal(blanked, expected, err_msg=name)
+
+    def test_the_exposure_and_background_are_left_alone(self, masked_maps):
+        """The mask says nothing about what the map was pointed at."""
+        masked, raw = masked_maps
+
+        for name in (
             "exposure_factor",
-            "counts",
-            "counts_over_eff",
-            "counts_over_eff_squared",
             "bg_rate",
             "bg_rate_stat_uncert",
-            "bg_rate_exposure_factor",
-            "bg_rate_stat_uncert_exposure_factor2",
-        ]
+            "bg_intensity",
+            "bg_intensity_stat_uncert",
+        ):
+            np.testing.assert_allclose(
+                masked[name].values, raw[name].values, rtol=1e-6, err_msg=name
+            )
 
-        for key in expected_keys:
-            assert key in value_keys, f"Expected key '{key}' not in value_keys"
+    def test_an_unmasked_map_is_left_whole(self, full_map):
+        """A descriptor without the mask code blanks nothing out."""
+        dataset, _ = full_map
+
+        # Only the pixels the map was never exposed in are filled, and the raw
+        # accumulators keep even those.
+        unexposed = dataset["exposure_factor"].values == 0
+        for name in ISN_MASKED_VARIABLES:
+            filled = name in FILLED_VARIABLES
+            expected = unexposed if filled else np.zeros_like(unexposed)
+            np.testing.assert_array_equal(
+                is_fill(dataset[name].values), expected, err_msg=name
+            )
+
+    def test_a_narrow_band_masks_nothing_off_the_ecliptic(
+        self, one_pointing, anc_dependencies
+    ):
+        """A pixel outside the angular width of the band survives its brightness."""
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
+        ):
+            (masked,) = lo_l2(
+                as_dependencies(one_pointing),
+                anc_dependencies,
+                NARROW_MASK_DESCRIPTOR,
+            )
+
+        # The mocked sky pointing puts every pixel of the test map on the
+        # ecliptic, which the pivot 75 tuning is too narrow to reach. The counts
+        # are blanked by the mask alone, never by the exposure.
+        assert not is_fill(masked["ena_count"].values).any()
+
+    def test_the_outlier_tail_of_a_level_is_masked(
+        self, one_pointing, anc_dependencies
+    ):
+        """The pixels above the level's percentile are masked wherever they are."""
+        with patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el",
+            side_effect=identity_pointing,
+        ):
+            (masked,) = lo_l2(
+                as_dependencies(one_pointing),
+                anc_dependencies,
+                OUTLIER_MASK_DESCRIPTOR,
+            )
+            (raw,) = lo_l2(
+                as_dependencies(one_pointing), anc_dependencies, FULL_DESCRIPTOR
+            )
+
+        # The pivot 105 tuning cannot mask a band, so only the top half of each
+        # level's own intensity distribution is masked. The unexposed pixels are
+        # filled either way.
+        intensity = raw["ena_intensity"].values
+        unexposed = is_fill(intensity)
+        as_masked = np.where(unexposed, 0.0, intensity)
+        median = np.percentile(as_masked, 50, axis=(-2, -1), keepdims=True)
+        expected = (as_masked > median) | unexposed
+        assert expected.any(), "the tuning must mask something"
+
+        np.testing.assert_array_equal(is_fill(masked["ena_intensity"].values), expected)
+
+    def test_an_untuned_pivot_angle_is_refused(self, one_pointing, anc_dependencies):
+        """A map cannot be masked at a pivot the ancillary says nothing about."""
+        with pytest.raises(ValueError, match=r"no mask tuning for the \[60\] degree"):
+            lo_l2(
+                as_dependencies(one_pointing),
+                anc_dependencies,
+                UNTUNED_MASK_DESCRIPTOR,
+            )
+
+    def test_mask_parameters_cover_every_level_of_every_tuned_pivot(
+        self, shipped_ancillaries, tmp_path
+    ):
+        """The shipped ancillary tunes all 7 levels of each pivot it carries."""
+        parameters = load_isn_mask_parameters()
+
+        assert list(parameters.columns) == [
+            "pivot_angle",
+            "esa_step",
+            "intensity_threshold_fraction",
+            "angular_width_deg",
+            "outlier_percentile",
+        ]
+        assert not parameters.empty
+        for pivot, tuning in parameters.groupby("pivot_angle"):
+            assert sorted(tuning["esa_step"]) == list(range(1, N_ESA + 1)), pivot
+        assert (parameters["intensity_threshold_fraction"] > 0).all()
+        assert (parameters["angular_width_deg"] > 0).all()
+        assert parameters["outlier_percentile"].between(0, 100).all()
+
+        with patch("imap_processing.lo.l2.lo_l2.ANCILLARY_DATA_DIR", tmp_path):
+            with pytest.raises(ValueError, match="No ISN mask parameter files"):
+                load_isn_mask_parameters()
+
+
+class TestFinalizeDataset:
+    """Attaching the CDF attributes to a finished map."""
+
+    def test_attributes_are_filled_in_from_the_descriptor(self):
+        """The map is labelled with its descriptor and its variables described."""
+        dataset = xr.Dataset(
+            {
+                "ena_intensity": (
+                    ["epoch", "energy"],
+                    np.zeros((1, N_ESA)),
+                ),
+                "not_a_map_variable": ("epoch", np.zeros(1)),
+            },
+            coords={"epoch": [0], "energy": ESA_ENERGIES[0]},
+        )
+
+        finalized = finalize_dataset(dataset, FULL_DESCRIPTOR)
+
+        assert finalized.attrs["Logical_source"] == f"imap_lo_l2_{FULL_DESCRIPTOR}"
+        assert FULL_DESCRIPTOR in finalized.attrs["Data_type"]
+
+        # A known map variable picks up its attributes from the enamaps config.
+        assert finalized["ena_intensity"].attrs["FIELDNAM"] == "Intensity"
+        assert finalized["ena_intensity"].attrs["UNITS"] == "cm -2 s -1 sr -1 keV -1"
+
+        # A variable the config says nothing about is left without attributes,
+        # rather than failing the map.
+        assert finalized["not_a_map_variable"].attrs == {}
+
+
+class TestUnsupported:
+    """Map flavours the Lo pipeline does not make."""
+
+    def test_oxygen_not_supported(self, one_pointing, anc_dependencies):
+        """Only hydrogen geometric factors are defined."""
+        with pytest.raises(NotImplementedError, match="species o"):
+            lo_l2(
+                as_dependencies(one_pointing),
+                anc_dependencies,
+                "l090-ena-o-sf-nsp-full-hae-6deg-3mo",
+            )
+
+    def test_healpix_not_supported(self, one_pointing, anc_dependencies):
+        """Lo makes rectangular maps only."""
+        with pytest.raises(NotImplementedError, match="HEALPix"):
+            lo_l2(
+                as_dependencies(one_pointing),
+                anc_dependencies,
+                "l090-enansnbs-h-sf-nsp-full-hae-nside8-3mo",
+            )

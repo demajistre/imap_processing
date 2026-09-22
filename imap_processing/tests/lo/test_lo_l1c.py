@@ -1,7 +1,6 @@
 from unittest.mock import patch
 
 import numpy as np
-import pandas as pd
 import pytest
 import xarray as xr
 
@@ -10,22 +9,19 @@ from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
 from imap_processing.lo.l1c.lo_l1c import (
     N_ESA_ENERGY_STEPS,
     N_OFF_ANGLE_BINS,
-    N_SAMPLES_PER_SPIN,
     N_SPIN_ANGLE_BINS,
     OFF_ANGLE_BIN_CENTERS,
     PSET_SHAPE,
     FilterType,
-    calculate_bin_weights,
     calculate_exposure_times,
-    create_goodtimes_fraction,
+    compute_pointing_directions,
     create_pset_counts,
     filter_goodtimes,
-    get_representative_spin_times,
     lo_l1c,
-    sample_boresight_bins,
     set_background_rates,
     set_pointing_directions,
 )
+from imap_processing.spice.geometry import SpiceFrame
 from imap_processing.spice.time import met_to_ttj2000ns
 
 
@@ -105,6 +101,7 @@ def l1b_de_spin():
         coords={
             "epoch": met_to_ttj2000ns(np.arange(511000000, 511000000 + 200, 40) + 902),
         },
+        attrs={"Repointing": "repoint00000"},
     )
     return l1b_de
 
@@ -179,50 +176,34 @@ def doubles_counts(counts):
 
 
 @pytest.fixture
-def expected_bg():
-    expected_rates = np.array(
-        [
-            [
-                np.full((3600, 40), 0.0098),
-                np.full((3600, 40), 0.0089),
-                np.full((3600, 40), 0.0118),
-                np.full((3600, 40), 0.0113),
-                np.full((3600, 40), 0.0056),
-                np.full((3600, 40), 0.0008),
-                np.full((3600, 40), 0.0),
-            ]
-        ],
-        dtype=np.float16,
+def l1b_bgrates_ds():
+    h_rates = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07], dtype=np.float32)
+    h_var = np.array(
+        [0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007], dtype=np.float32
     )
-
-    expected_err = np.array(
-        [
-            [
-                np.full((3600, 40), 0.0025),
-                np.full((3600, 40), 0.002),
-                np.full((3600, 40), 0.0015),
-                np.full((3600, 40), 0.0015),
-                np.full((3600, 40), 0.001),
-                np.full((3600, 40), 0.0008),
-                np.full((3600, 40), 0.0),
-            ]
-        ],
-        dtype=np.float16,
+    o_rates = np.array(
+        [0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007], dtype=np.float32
     )
-
-    expected_uncert = np.zeros((1, 7, 3600, 40), dtype=np.float16)
-
-    expected_bg = (expected_rates, expected_uncert, expected_err)
-    return expected_bg
+    o_var = np.array(
+        [0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006, 0.0007], dtype=np.float32
+    )
+    return xr.Dataset(
+        {
+            "h_background_rates": (["epoch", "esa_step"], h_rates[np.newaxis, :]),
+            "h_background_variance": (["epoch", "esa_step"], h_var[np.newaxis, :]),
+            "o_background_rates": (["epoch", "esa_step"], o_rates[np.newaxis, :]),
+            "o_background_variance": (["epoch", "esa_step"], o_var[np.newaxis, :]),
+        }
+    )
 
 
 @patch("imap_processing.lo.l1c.lo_l1c.calculate_exposure_times")
 @patch("imap_processing.lo.l1c.lo_l1c.set_background_rates")
 @patch("imap_processing.lo.l1c.lo_l1c.filter_goodtimes")
 @patch("imap_processing.lo.l1c.lo_l1c.set_pointing_directions")
-@patch("imap_processing.lo.l1c.lo_l1c.add_spacecraft_velocity_to_pset")
+@patch("imap_processing.lo.l1c.lo_l1c.add_spacecraft_position_and_velocity_to_pset")
 def test_lo_l1c(
-    mock_add_spacecraft_velocity,
+    mock_add_spacecraft_position_and_velocity_to_pset,
     mock_set_pointing_directions,
     mock_filter_goodtimes,
     mock_set_background_rates,
@@ -234,9 +215,37 @@ def test_lo_l1c(
     repoint_met,
 ):
     # Arrange
-    data = {"imap_lo_l1b_de": l1b_de_spin}
-    use_fake_spin_data_for_time(511000000)
-    use_fake_repoint_data_for_time(np.arange(511000000, 511000000 + 86400 * 5, 86400))
+    repoint_start_met = 511000000.0
+    repoint_stride_seconds = 86400  # 1 day stride
+    data = {
+        "imap_lo_l1b_de": l1b_de_spin,
+        "imap_lo_l1b_goodtimes": xr.Dataset(
+            {
+                "gt_start_met": ("epoch", [repoint_start_met]),
+                "gt_end_met": ("epoch", [repoint_start_met]),
+                "pivot": ([45.0]),
+                "pivot_de": ([45.0]),
+            },
+            coords={"epoch": met_to_ttj2000ns([repoint_start_met])},
+        ),
+        "imap_lo_l1b_histrates": xr.Dataset(
+            {
+                "exposure_time_6deg": (
+                    ["epoch", "esa_step", "spin_bin_6"],
+                    np.zeros((1, N_ESA_ENERGY_STEPS, 60), dtype=np.float32),
+                )
+            },
+            coords={"epoch": met_to_ttj2000ns([repoint_start_met])},
+        ),
+    }
+    use_fake_spin_data_for_time(repoint_start_met)
+    use_fake_repoint_data_for_time(
+        np.arange(
+            repoint_start_met,
+            repoint_start_met + repoint_stride_seconds * 5,
+            repoint_stride_seconds,
+        )
+    )
     mock_set_background_rates.return_value = (None, None, None)
     mock_filter_goodtimes.return_value = l1b_de_spin
     mock_set_pointing_directions.return_value = (
@@ -248,7 +257,14 @@ def test_lo_l1c(
         np.ones(PSET_SHAPE, dtype=np.float32),
         dims=["epoch", "esa_energy_step", "spin_angle", "off_angle"],
     )
-    mock_add_spacecraft_velocity.side_effect = lambda pset: pset
+
+    # Pass through the pset with sc_position and sc_velocity added
+    def mock_add_sc_pos_vel(pset):
+        pset["sc_position"] = xr.DataArray(np.zeros(3), dims=["x_y_z"])
+        pset["sc_velocity"] = xr.DataArray(np.zeros(3), dims=["x_y_z"])
+        return pset
+
+    mock_add_spacecraft_position_and_velocity_to_pset.side_effect = mock_add_sc_pos_vel
     expected_logical_source = "imap_lo_l1c_pset"
 
     # Act
@@ -256,46 +272,64 @@ def test_lo_l1c(
 
     # Assert
     assert expected_logical_source == output_dataset.attrs["Logical_source"]
-    # Verify that pivot_angle is passed through from l1b_de
+    # Verify that pivot_angle is passed through from l1b_goodtimes
     assert "pivot_angle" in output_dataset
     assert output_dataset["pivot_angle"].values[0] == 45.0
-    # We want sc velocity and direction added to the l1c pointing sets,
-    # not waiting until CG is needed.
-    mock_add_spacecraft_velocity.assert_called_once()
+    mock_add_spacecraft_position_and_velocity_to_pset.assert_called_once()
+    assert "sc_position" in output_dataset
+    assert "sc_velocity" in output_dataset
+    # Verify that set_pointing_directions uses pointing midpoint
+    # Repoint table starts at 511000000, has a 15-minute repoint followed by
+    # a 24-hour - 15-minute pointing. So, pointing midpoint is:
+    expected_pointing_midpoint = (
+        repoint_start_met + 15 * 60 + repoint_start_met + repoint_stride_seconds
+    ) / 2
+    np.testing.assert_almost_equal(
+        mock_set_pointing_directions.call_args[0][0],
+        met_to_ttj2000ns(expected_pointing_midpoint),
+    )
 
 
-def test_filter_goodtimes(l1b_de, anc_dependencies):
+def test_filter_goodtimes():
     # Arrange
+    event_mets = [473389199, 473389200, 473389201, 473389202, 473389203, 473407619]
     l1b_de_all = xr.Dataset(
         {
             "esa_step": ("epoch", [1, 2, 1, 4, 5, 2]),
             "spin_bin": ("epoch", [1900, 2000, 3000, 3000, 3000, 3000]),
         },
-        coords={
-            "epoch": met_to_ttj2000ns(
-                [
-                    473389199,
-                    473389200,
-                    473389201,
-                    473389202,
-                    473389203,
-                    473407619,
-                ]
-            )
-        },
+        coords={"epoch": met_to_ttj2000ns(event_mets)},
     )
-    expected_goodtimes_mask = [False, False, True, False, True, False]
 
-    l1b_goodtimes_onl_expected = l1b_de_all.isel(epoch=expected_goodtimes_mask)
+    # Two goodtime windows: [473389201, 473389203] and [473407619, 473407620]
+    gt_starts = np.array([473389201.0, 473407619.0])
+    goodtimes_ds = xr.Dataset(
+        {
+            "gt_start_met": ("epoch", gt_starts),
+            "gt_end_met": ("epoch", [473389203.0, 473407620.0]),
+        },
+        coords={"epoch": met_to_ttj2000ns(gt_starts)},
+    )
+
+    # Events at MET 473389201-473389203 and 473407619 fall inside goodtime windows;
+    # 473389199 and 473389200 are before the first window.
+    expected_mask = [False, False, True, True, True, True]
+    expected = l1b_de_all.isel(epoch=expected_mask)
 
     # Act
-    l1b_goodtimes_only = filter_goodtimes(l1b_de_all, anc_dependencies)
+    result = filter_goodtimes(l1b_de_all, goodtimes_ds)
 
     # Assert
-    xr.testing.assert_equal(l1b_goodtimes_only, l1b_goodtimes_onl_expected)
+    xr.testing.assert_equal(result, expected)
 
 
+@patch("imap_processing.lo.l1c.lo_l1c.calculate_exposure_times")
+@patch("imap_processing.lo.l1c.lo_l1c.set_pointing_directions")
+@patch("imap_processing.lo.l1c.lo_l1c.add_spacecraft_position_and_velocity_to_pset")
 def test_lo_l1c_no_goodtimes(
+    mock_add_spacecraft_position_and_velocity_to_pset,
+    mock_set_pointing_directions,
+    mock_calculate_exposure_times,
     l1b_de_spin,
     anc_dependencies,
     use_fake_repoint_data_for_time,
@@ -303,28 +337,108 @@ def test_lo_l1c_no_goodtimes(
     repoint_met,
 ):
     # Arrange
-    data = {"imap_lo_l1b_de": l1b_de_spin}
+    # Goodtime window [511000000, 511000900] is within the repoint period
+    # but before all events (which start at 511000902)
+    goodtime_start = 511000000.0
+    goodtime_end = 511000900.0
+    data = {
+        "imap_lo_l1b_de": l1b_de_spin,
+        "imap_lo_l1b_goodtimes": xr.Dataset(
+            {
+                "gt_start_met": ("epoch", [goodtime_start]),
+                "gt_end_met": ("epoch", [goodtime_end]),
+                "pivot": ([45.0]),
+                "pivot_de": ([45.0]),
+            },
+            coords={"epoch": met_to_ttj2000ns([goodtime_start])},
+        ),
+        "imap_lo_l1b_histrates": xr.Dataset(
+            {
+                "exposure_time_6deg": (
+                    ["epoch", "esa_step", "spin_bin_6"],
+                    np.zeros((1, N_ESA_ENERGY_STEPS, 60), dtype=np.float32),
+                )
+            },
+            coords={"epoch": met_to_ttj2000ns([goodtime_start])},
+        ),
+    }
     use_fake_spin_data_for_time(511000000)
     use_fake_repoint_data_for_time(np.arange(511000000, 511000000 + 86400 * 5, 86400))
     expected_logical_source = "imap_lo_l1c_pset"
+
+    # Mock exposure time calculation to return zeros (no events in goodtimes)
+    mock_calculate_exposure_times.return_value = xr.DataArray(
+        np.zeros(PSET_SHAPE, dtype=np.float32),
+        dims=["epoch", "esa_energy_step", "spin_angle", "off_angle"],
+    )
+
+    # Mock pointing directions to return valid non-zero values
+    mock_set_pointing_directions.return_value = (
+        xr.DataArray(
+            np.ones((1, 3600, 40)) * 180.0,
+            dims=["epoch", "spin_angle", "off_angle"],
+        ),
+        xr.DataArray(
+            np.ones((1, 3600, 40)) * 45.0,
+            dims=["epoch", "spin_angle", "off_angle"],
+        ),
+    )
+
+    # Mock spacecraft position/velocity
+    def mock_add_sc_pos_vel(pset):
+        pset["sc_position"] = xr.DataArray(np.array([1.0, 2.0, 3.0]), dims=["x_y_z"])
+        pset["sc_velocity"] = xr.DataArray(np.array([0.1, 0.2, 0.3]), dims=["x_y_z"])
+        return pset
+
+    mock_add_spacecraft_position_and_velocity_to_pset.side_effect = mock_add_sc_pos_vel
 
     # Act
     output_dataset = lo_l1c(data, anc_dependencies)[0]
 
     # Assert
     assert expected_logical_source == output_dataset.attrs["Logical_source"]
-    # Verify that pivot_angle is passed through from l1b_de
+    # Verify that pivot_angle is passed through from l1b_goodtimes
     assert "pivot_angle" in output_dataset
     assert output_dataset["pivot_angle"].values[0] == 45.0
+
+    # Verify that times are valid (not zeros/junk)
+    # Pointing start is repoint start (511000000) + 15 minutes (900 seconds)
+    assert output_dataset["pointing_start_met"].values[0] == 511000900.0
+    assert (
+        output_dataset["pointing_end_met"].values[0]
+        > output_dataset["pointing_start_met"].values[0]
+    )
+
+    # Verify counts are zeros (no events in goodtimes window)
     expected_counts = np.zeros((1, 7, 3600, 40))
     np.testing.assert_array_equal(output_dataset["h_counts"], expected_counts)
     np.testing.assert_array_equal(output_dataset["o_counts"], expected_counts)
     np.testing.assert_array_equal(output_dataset["doubles_counts"], expected_counts)
     np.testing.assert_array_equal(output_dataset["triples_counts"], expected_counts)
+
+    # Verify exposure times are zeros (mocked)
+    np.testing.assert_array_equal(output_dataset["exposure_time"], expected_counts)
+
+    # Verify background rates are zeros (no bgrates dependency provided)
     np.testing.assert_array_equal(output_dataset["h_background_rates"], expected_counts)
     np.testing.assert_array_equal(output_dataset["o_background_rates"], expected_counts)
-    expected = np.zeros((1, 3600, 40))
-    np.testing.assert_array_equal(output_dataset["hae_latitude"], expected)
+
+    # Verify geometry is computed (not zeros) - mocked to return valid values
+    assert "hae_latitude" in output_dataset
+    assert "hae_longitude" in output_dataset
+    # HAE values should be the mocked non-zero values
+    np.testing.assert_array_equal(
+        output_dataset["hae_longitude"].values, np.ones((1, 3600, 40)) * 180.0
+    )
+    np.testing.assert_array_equal(
+        output_dataset["hae_latitude"].values, np.ones((1, 3600, 40)) * 45.0
+    )
+
+    # Verify spacecraft position/velocity are valid (not zeros)
+    assert "sc_position" in output_dataset
+    assert "sc_velocity" in output_dataset
+    np.testing.assert_array_equal(output_dataset["sc_position"].values, [1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(output_dataset["sc_velocity"].values, [0.1, 0.2, 0.3])
 
 
 def test_create_pset_counts(l1b_de):
@@ -379,338 +493,117 @@ def test_create_doubles_pset_counts(l1b_de, doubles_counts):
     np.testing.assert_array_equal(counts, doubles_counts)
 
 
-def test_calculate_exposure_times(use_fake_spin_data_for_time):
-    """Test the statistical exposure time calculation."""
-    # Arrange
-    pointing_start_met = 511000000.0
-    pointing_end_met = 511000100.0  # 100 second pointing
-    use_fake_spin_data_for_time(pointing_start_met)
+def test_calculate_exposure_times():
+    """Test the histrates-based exposure time calculation."""
+    gt_start_met = 500000000.0
+    gt_end_met = 500001000.0
+    n_epochs = 3
 
-    with (
-        patch(
-            "imap_processing.lo.l1c.lo_l1c.lo_instrument_pointing"
-        ) as mock_lo_instrument_pointing,
-        patch(
-            "imap_processing.lo.l1c.lo_l1c.met_to_ttj2000ns"
-        ) as mock_met_to_ttj2000ns,
-        patch("imap_processing.lo.l1c.lo_l1c.ttj2000ns_to_et") as mock_ttj2000ns_to_et,
-    ):
-        # Mock the time conversions to pass through
-        mock_met_to_ttj2000ns.side_effect = lambda x: x * 1e9
-        mock_ttj2000ns_to_et.side_effect = lambda x: x / 1e9
+    epoch_mets = np.linspace(gt_start_met, gt_end_met, n_epochs)
+    exposure_values = np.ones((n_epochs, N_ESA_ENERGY_STEPS, 60), dtype=np.float32)
 
-        # Mock lo_instrument_pointing to return pointing at spin_angle=270, off_angle=0
-        # for all sample times (simulating no off-pointing with 90 degree pivot)
-        def mock_pointing(ets, pivot_angle, to_frame):
-            n_times = len(np.atleast_1d(ets))
-            # Return (longitude, latitude) = (270, 0) for all times
-            return np.column_stack([np.full(n_times, 270.0), np.zeros(n_times)])
+    histrates_ds = xr.Dataset(
+        {"exposure_time_6deg": (["epoch", "esa_step", "spin_bin_6"], exposure_values)},
+        coords={"epoch": met_to_ttj2000ns(epoch_mets)},
+    )
+    goodtimes_ds = xr.Dataset(
+        {
+            "gt_start_met": ("epoch", [gt_start_met]),
+            "gt_end_met": ("epoch", [gt_end_met]),
+        },
+        coords={"epoch": met_to_ttj2000ns([gt_start_met])},
+    )
 
-        mock_lo_instrument_pointing.side_effect = mock_pointing
+    exposure_times = calculate_exposure_times(histrates_ds, goodtimes_ds)
 
-        # Act
-        exposure_times = calculate_exposure_times(
-            pointing_start_met, pointing_end_met, n_representative_spins=3
+    assert exposure_times.shape == PSET_SHAPE
+    # Each of the 3 epochs contributes 1.0 per (esa, spin_6) cell.
+    # Expanding 60 → 3600: divide by 60 per cell; distributing across 40 off-angle bins:
+    # divide by N_OFF_ANGLE_BINS.
+    expected_per_cell = float(n_epochs) / 60 / N_OFF_ANGLE_BINS
+    np.testing.assert_allclose(exposure_times.values, expected_per_cell, rtol=1e-5)
+    # All ESA steps should have equal exposure (uniform input)
+    for i in range(1, N_ESA_ENERGY_STEPS):
+        np.testing.assert_array_equal(
+            exposure_times.values[0, 0, :, :], exposure_times.values[0, i, :, :]
         )
 
-        # Assert
-        # Check shape
-        assert exposure_times.shape == PSET_SHAPE
 
-        # Check that exposure times sum to approximately total pointing duration / 7
-        # Each ESA energy step is only active for 1/7 of the total time
-        # (within tolerance due to binning)
-        total_duration = pointing_end_met - pointing_start_met
-        # Sum over spin_angle and off_angle dimensions for one ESA step
-        exposure_sum = exposure_times.values[0, 0, :, :].sum()
-        np.testing.assert_allclose(
-            exposure_sum, total_duration / N_ESA_ENERGY_STEPS, rtol=0.01
-        )
+def test_calculate_exposure_times_no_goodtimes_overlap():
+    """Test that exposure times are zero when goodtimes don't overlap with histrates."""
+    epoch_met = 500000000.0
+    exposure_values = np.ones((1, N_ESA_ENERGY_STEPS, 60), dtype=np.float32)
 
-        # Check that all ESA steps have the same exposure (geometry-independent)
-        for i in range(1, 7):
-            np.testing.assert_array_equal(
-                exposure_times.values[0, 0, :, :],
-                exposure_times.values[0, i, :, :],
-            )
-
-
-def test_get_representative_spin_times(use_fake_spin_data_for_time):
-    """Test that representative spins are evenly distributed across pointing."""
-    # Arrange
-    pointing_start_met = 511000000.0
-    pointing_end_met = 511001500.0  # ~100 spins at ~15s each
-    use_fake_spin_data_for_time(pointing_start_met)
-
-    # Act
-    representative_spins = get_representative_spin_times(
-        pointing_start_met, pointing_end_met, n_spins=5
+    histrates_ds = xr.Dataset(
+        {"exposure_time_6deg": (["epoch", "esa_step", "spin_bin_6"], exposure_values)},
+        coords={"epoch": met_to_ttj2000ns([epoch_met])},
     )
-
-    # Assert
-    assert len(representative_spins) == 5
-    assert "spin_start_met" in representative_spins.columns
-    assert "actual_spin_period" in representative_spins.columns
-
-    # Check that spins are within the pointing period
-    assert all(representative_spins["spin_start_met"] >= pointing_start_met)
-    assert all(representative_spins["spin_start_met"] < pointing_end_met)
-
-
-def test_get_representative_spin_times_fewer_available(use_fake_spin_data_for_time):
-    """Test that we get all spins when fewer than requested are available."""
-    # Arrange - very short pointing with only a few spins
-    pointing_start_met = 511000000.0
-    pointing_end_met = 511000045.0  # ~3 spins at ~15s each
-    use_fake_spin_data_for_time(pointing_start_met)
-
-    # Act
-    representative_spins = get_representative_spin_times(
-        pointing_start_met, pointing_end_met, n_spins=10
-    )
-
-    # Assert - should get all available spins (less than 10)
-    assert len(representative_spins) <= 10
-    assert len(representative_spins) >= 1
-
-
-def test_sample_boresight_bins():
-    """Test boresight sampling within a single spin."""
-    # Arrange
-    spin_start_met = 511000000.0
-    spin_period = 15.0
-
-    with (
-        patch(
-            "imap_processing.lo.l1c.lo_l1c.lo_instrument_pointing"
-        ) as mock_lo_instrument_pointing,
-        patch(
-            "imap_processing.lo.l1c.lo_l1c.met_to_ttj2000ns"
-        ) as mock_met_to_ttj2000ns,
-        patch("imap_processing.lo.l1c.lo_l1c.ttj2000ns_to_et") as mock_ttj2000ns_to_et,
-    ):
-        # Mock time conversions
-        mock_met_to_ttj2000ns.side_effect = lambda x: x * 1e9
-        mock_ttj2000ns_to_et.side_effect = lambda x: x / 1e9
-
-        # Mock lo_instrument_pointing to simulate rotating boresight
-        def mock_pointing(ets, pivot_angle, to_frame):
-            n_times = len(np.atleast_1d(ets))
-            # Simulate boresight sweeping through spin angles (0-360)
-            # with zero off-angle (latitude)
-            spin_angles = np.linspace(0, 360, n_times, endpoint=False)
-            off_angles = np.zeros(n_times)
-            return np.column_stack([spin_angles, off_angles])
-
-        mock_lo_instrument_pointing.side_effect = mock_pointing
-
-        # Act
-        spin_angles, off_angles = sample_boresight_bins(spin_start_met, spin_period)
-
-        # Assert
-        assert len(spin_angles) == N_SAMPLES_PER_SPIN
-        assert len(off_angles) == N_SAMPLES_PER_SPIN
-
-        # Check spin angles are in valid range [0, 360)
-        assert all(spin_angles >= 0)
-        assert all(spin_angles < 360)
-
-        # Check off angles are near zero (as mocked)
-        np.testing.assert_allclose(off_angles, 0, atol=1e-10)
-
-
-def test_calculate_bin_weights():
-    """Test bin weight calculation from sampled angles."""
-    # Arrange - create samples concentrated in specific bins
-    # All samples at off_angle=0
-    n_samples = 1000
-    off_angles = np.full(n_samples, 0.0)
-
-    # Act
-    bin_weights = calculate_bin_weights(off_angles)
-
-    # Assert
-    assert bin_weights.shape == (N_OFF_ANGLE_BINS,)
-
-    # Weights should sum to 1
-    np.testing.assert_allclose(bin_weights.sum(), 1.0)
-
-    # Find the bin that should have all the weight
-    # off_angle=0 is in bin 20 (center of [-2, 2] range with 40 bins)
-    expected_off_bin = 20  # (0 - (-2)) / 0.1 = 20
-
-    # That bin should have weight close to 1
-    assert bin_weights[expected_off_bin] > 0.9
-
-
-def test_calculate_bin_weights_distributed():
-    """Test bin weights with uniformly distributed samples."""
-    # Arrange - uniform distribution across off_angles
-    np.random.seed(42)
-    n_samples = 100000
-    off_angles = np.random.uniform(-2, 2, n_samples)
-
-    # Act
-    bin_weights = calculate_bin_weights(off_angles)
-
-    # Assert
-    assert bin_weights.shape == (N_OFF_ANGLE_BINS,)
-
-    # Weights should sum to 1
-    np.testing.assert_allclose(bin_weights.sum(), 1.0)
-
-    # With uniform distribution, weights should be approximately equal
-    expected_weight = 1.0 / N_OFF_ANGLE_BINS
-    np.testing.assert_allclose(bin_weights.mean(), expected_weight, rtol=0.1)
-
-
-def test_create_goodtimes_fraction():
-    """Test good-times fractional coverage calculation from ancillary data."""
-    # Arrange - create a simple goodtimes DataFrame
-    # Good-times cover the full pointing duration for all spin bins
-    # bin_start and bin_end are inclusive, 0-indexed (0-59 for 6-degree bins)
-    goodtimes_df = pd.DataFrame(
+    goodtimes_ds = xr.Dataset(
         {
-            "GoodTime_start": [500000000.0, 500000000.0],
-            "GoodTime_end": [500001000.0, 500001000.0],
-            "bin_start": [0, 30],  # 6-degree bins: 0-29 and 30-59
-            "bin_end": [29, 59],  # inclusive: first half bins 0-29, second half 30-59
-            "E-Step1": [1, 1],
-            "E-Step2": [1, 0],  # ESA step 2 only good for first half
-            "E-Step3": [1, 1],
-            "E-Step4": [1, 1],
-            "E-Step5": [1, 1],
-            "E-Step6": [1, 1],
-            "E-Step7": [1, 1],
-        }
+            "gt_start_met": ("epoch", [400000000.0]),
+            "gt_end_met": ("epoch", [400001000.0]),
+        },
+        coords={"epoch": met_to_ttj2000ns([400000000.0])},
     )
 
-    pointing_start_met = 500000000.0
-    pointing_end_met = 500001000.0
+    exposure_times = calculate_exposure_times(histrates_ds, goodtimes_ds)
 
-    # Act
-    fraction = create_goodtimes_fraction(
-        goodtimes_df, pointing_start_met, pointing_end_met
-    )
-
-    # Assert
-    assert fraction.shape == (N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS)
-
-    # ESA step 1 (index 0) should have 100% coverage (fraction = 1.0)
-    np.testing.assert_allclose(fraction[0, :], 1.0)
-
-    # ESA step 2 (index 1) should only have 100% for first half, 0% for second half
-    np.testing.assert_allclose(fraction[1, :1800], 1.0)
-    np.testing.assert_allclose(fraction[1, 1800:], 0.0)
-
-    # ESA steps 3-7 (indices 2-6) should have 100% coverage
-    for i in range(2, 7):
-        np.testing.assert_allclose(fraction[i, :], 1.0)
-
-
-def test_create_goodtimes_fraction_partial_coverage():
-    """Test good-times with partial time coverage of pointing period."""
-    # Arrange - good-times cover only half of the pointing duration
-    goodtimes_df = pd.DataFrame(
-        {
-            "GoodTime_start": [500000000.0],
-            "GoodTime_end": [500000500.0],  # Only first 500s of 1000s pointing
-            "bin_start": [0],
-            "bin_end": [59],  # All spin bins (0-59 inclusive)
-            "E-Step1": [1],
-            "E-Step2": [1],
-            "E-Step3": [1],
-            "E-Step4": [1],
-            "E-Step5": [1],
-            "E-Step6": [1],
-            "E-Step7": [1],
-        }
-    )
-
-    pointing_start_met = 500000000.0
-    pointing_end_met = 500001000.0
-
-    # Act
-    fraction = create_goodtimes_fraction(
-        goodtimes_df, pointing_start_met, pointing_end_met
-    )
-
-    # Assert - all bins should have 50% coverage
-    np.testing.assert_allclose(fraction, 0.5)
-
-
-def test_create_goodtimes_fraction_no_overlap():
-    """Test good-times fraction when no good-times overlap with pointing."""
-    # Arrange - goodtimes outside pointing period
-    goodtimes_df = pd.DataFrame(
-        {
-            "GoodTime_start": [400000000.0],
-            "GoodTime_end": [400001000.0],
-            "bin_start": [0],
-            "bin_end": [59],  # All spin bins (0-59 inclusive)
-            "E-Step1": [1],
-            "E-Step2": [1],
-            "E-Step3": [1],
-            "E-Step4": [1],
-            "E-Step5": [1],
-            "E-Step6": [1],
-            "E-Step7": [1],
-        }
-    )
-
-    pointing_start_met = 500000000.0
-    pointing_end_met = 500001000.0
-
-    # Act
-    fraction = create_goodtimes_fraction(
-        goodtimes_df, pointing_start_met, pointing_end_met
-    )
-
-    # Assert - all zeros since no overlap
-    np.testing.assert_allclose(fraction, 0.0)
+    assert exposure_times.shape == PSET_SHAPE
+    np.testing.assert_array_equal(exposure_times.values, 0.0)
 
 
 @pytest.mark.parametrize("species", [FilterType.HYDROGEN, FilterType.OXYGEN])
-def test_set_background_rates(
-    l1b_de_spin, anc_dependencies, attr_mgr, species, expected_bg
-):
+def test_set_background_rates(l1b_bgrates_ds, attr_mgr, species):
     # Arrange
-    pointing_start_met = 473389200.0
-    pointing_end_met = 473472000.0
+    sci_deps = {"imap_lo_l1b_bgrates": l1b_bgrates_ds}
+    species_key = species.value
+    expected_rates = l1b_bgrates_ds[f"{species_key}_background_rates"].values[0]
+    expected_var = l1b_bgrates_ds[f"{species_key}_background_variance"].values[0]
 
     # Act
-    rates, uncert, err = set_background_rates(
-        pointing_start_met, pointing_end_met, species, anc_dependencies, attr_mgr
-    )
+    rates, uncert, err = set_background_rates(species, sci_deps, attr_mgr)
 
-    # Assert
-    np.testing.assert_array_equal(
-        rates.values,
-        expected_bg[0],
-    )
-    np.testing.assert_array_equal(
-        uncert.values,
-        expected_bg[1],
-    )
-    np.testing.assert_array_equal(
-        err.values,
-        expected_bg[2],
-    )
+    # Assert shape
+    assert rates.shape == (1, N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS)
+    assert uncert.shape == (1, N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS)
+    assert err.shape == (1, N_ESA_ENERGY_STEPS, N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS)
+
+    # Rates and uncertainties must be uniform across spatial bins for each ESA step
+    for i in range(N_ESA_ENERGY_STEPS):
+        np.testing.assert_array_equal(
+            rates.values[0, i, :, :],
+            np.full(
+                (N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS),
+                expected_rates[i],
+                dtype=np.float16,
+            ),
+        )
+        np.testing.assert_array_equal(
+            uncert.values[0, i, :, :],
+            np.full(
+                (N_SPIN_ANGLE_BINS, N_OFF_ANGLE_BINS), expected_var[i], dtype=np.float16
+            ),
+        )
+
+    # Systematic error is always zero
+    np.testing.assert_array_equal(err.values, 0)
 
 
-def test_set_background_rates_species_error(anc_dependencies, attr_mgr):
-    # Arrange
-    pointing_start_met = 473389100.0
-    pointing_end_met = 473472100.0
-    species = FilterType.DOUBLES
+def test_set_background_rates_no_bgrates(attr_mgr):
+    """Returns zeros when imap_lo_l1b_bgrates is absent from sci_dependencies."""
+    rates, uncert, err = set_background_rates(FilterType.HYDROGEN, {}, attr_mgr)
 
+    np.testing.assert_array_equal(rates.values, 0)
+    np.testing.assert_array_equal(uncert.values, 0)
+    np.testing.assert_array_equal(err.values, 0)
+
+
+def test_set_background_rates_species_error(attr_mgr):
     # Act
     with pytest.raises(
         ValueError, match="Species must be 'h' or 'o', but got doubles."
     ):
-        rates, uncert, err = set_background_rates(
-            pointing_start_met, pointing_end_met, species, anc_dependencies, attr_mgr
-        )
+        set_background_rates(FilterType.DOUBLES, {}, attr_mgr)
 
 
 def test_set_pointing_directions(attr_mgr):
@@ -838,3 +731,80 @@ def test_set_pointing_directions_pivot_angle(attr_mgr, pivot_angle):
         # dps_az_el[:, :, 1] should have the adjusted off angles repeated across spin
         actual_off_angles = dps_az_el[0, :, 1]  # Take first spin angle
         np.testing.assert_allclose(actual_off_angles, expected_off_angles, rtol=1e-10)
+
+
+def test_compute_pointing_directions_defaults():
+    """Default grid/frame reproduce the PSET (3600 x 40) IMAP_DPS->IMAP_HAE case."""
+    mock_et = 123456789.0
+    mock_az_el = np.stack(
+        np.meshgrid(np.arange(3600), np.arange(40), indexing="ij"), axis=-1
+    )
+    with (
+        patch("imap_processing.lo.l1c.lo_l1c.ttj2000ns_to_et") as mock_ttj2000ns_to_et,
+        patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el"
+        ) as mock_frame_transform,
+    ):
+        mock_ttj2000ns_to_et.return_value = mock_et
+        mock_frame_transform.return_value = mock_az_el
+
+        result = compute_pointing_directions(1000000000.0, 90)
+
+        # Returns the raw (n_spin, n_off, 2) array, not a DataArray.
+        assert result.shape == (3600, 40, 2)
+        call_args = mock_frame_transform.call_args
+        assert call_args[0][1].shape == (3600, 40, 2)  # dps_az_el grid
+        assert call_args[0][2] == SpiceFrame.IMAP_DPS  # from_frame
+        assert call_args[0][3] == SpiceFrame.IMAP_HAE  # default to_frame
+
+
+def test_compute_pointing_directions_custom_grid_and_frame():
+    """Custom spin/off angles and destination frame are honored."""
+    spin_angles = np.arange(3.0, 360.0, 6.0)  # 60 bins
+    off_angles = np.array([0.0])  # single pivot-cone off-angle
+    pivot_angle = 75.0
+    with (
+        patch("imap_processing.lo.l1c.lo_l1c.ttj2000ns_to_et") as mock_ttj2000ns_to_et,
+        patch(
+            "imap_processing.lo.l1c.lo_l1c.frame_transform_az_el"
+        ) as mock_frame_transform,
+    ):
+        mock_ttj2000ns_to_et.return_value = 123456789.0
+        mock_frame_transform.side_effect = lambda et, az_el, *a, **k: az_el
+
+        result = compute_pointing_directions(
+            1000000000.0,
+            pivot_angle,
+            spin_angles=spin_angles,
+            off_angles=off_angles,
+            to_frame=SpiceFrame.ECLIPJ2000,
+        )
+
+        assert result.shape == (60, 1, 2)
+        # Spin component matches the requested spin angles.
+        np.testing.assert_allclose(result[:, 0, 0], spin_angles)
+        # Off component is the single off-angle offset by (90 - pivot_angle).
+        np.testing.assert_allclose(result[:, 0, 1], 90 - pivot_angle)
+        # Destination frame is forwarded.
+        assert mock_frame_transform.call_args[0][3] == SpiceFrame.ECLIPJ2000
+
+
+def test_set_pointing_directions_delegates(attr_mgr):
+    """set_pointing_directions wraps compute_pointing_directions output unchanged."""
+    mock_az_el = np.stack(
+        np.meshgrid(np.arange(3600), np.arange(40), indexing="ij"), axis=-1
+    ).astype(float)
+    with patch(
+        "imap_processing.lo.l1c.lo_l1c.compute_pointing_directions"
+    ) as mock_compute:
+        mock_compute.return_value = mock_az_el
+
+        hae_longitude, hae_latitude = set_pointing_directions(
+            1000000000.0, attr_mgr, 90
+        )
+
+        mock_compute.assert_called_once_with(1000000000.0, 90)
+        assert hae_longitude.dims == ("epoch", "spin_angle", "off_angle")
+        assert hae_longitude.shape == (1, 3600, 40)
+        np.testing.assert_array_equal(hae_longitude.values[0], mock_az_el[:, :, 0])
+        np.testing.assert_array_equal(hae_latitude.values[0], mock_az_el[:, :, 1])

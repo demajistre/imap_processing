@@ -15,6 +15,25 @@ from imap_processing.hi import hi_l1c, utils
 from imap_processing.hi.utils import HIAPID, HiConstants
 from imap_processing.spice.time import met_to_ttj2000ns, ttj2000ns_to_et
 
+# HV deltas matching the test cal-prod config's gain_config_id=0 reference
+# values (within tolerance). See
+# imap_processing/tests/hi/data/l1/imap_hi_90sensor-cal-prod_20240101_v001.csv
+NOMINAL_HV_DELTAS = {
+    "mcp_delta_v": 875.0,
+    "cem_a_delta_v": 2150.0,
+    "cem_b_delta_v": 2150.0,
+    "tof_v": -8000.0,
+}
+
+
+def _select_gain_config_df(config_df, l1b_de_dataset):
+    """Mirror generate_pset_dataset()'s gain_config_df selection for tests."""
+    hv_deltas = {
+        field: l1b_de_dataset.attrs[field]
+        for field in utils.CalibrationProductConfig.GAIN_MATCH_FIELDS
+    }
+    return config_df.cal_prod_config.select_gain_config(hv_deltas)
+
 
 @pytest.fixture(scope="module")
 def hi_l1b_de_dataset(hi_l1_test_data_path):
@@ -63,7 +82,11 @@ def test_generate_pset_dataset(
 ):
     """Test coverage for generate_pset_dataset function"""
     use_fake_spin_data_for_time(482372987.999)
-    l1b_dataset = hi_l1b_de_dataset
+    l1b_dataset = hi_l1b_de_dataset.copy()
+    # The real fixture CDF predates the HV delta L1B global attributes; add
+    # placeholders so add_pset_geometric_factor() and pset_counts() have
+    # something to look up.
+    l1b_dataset.attrs.update(NOMINAL_HV_DELTAS)
     l1b_met = l1b_dataset["ccsds_met"].values[0]
     # Set repoint start and end times.
     seconds_per_day = 24 * 60 * 60
@@ -132,6 +155,7 @@ def test_generate_pset_dataset_uses_midpoint_time(
         attrs={
             "Logical_file_id": "imap_hi_l1b_45sensor-de_20250415_v999",
             "Logical_source": "imap_hi_l1b_45sensor-de",
+            **NOMINAL_HV_DELTAS,
         },
     )
 
@@ -177,6 +201,120 @@ def test_generate_pset_dataset_uses_midpoint_time(
     # Use approximate comparison for the ET time (floating point)
     np.testing.assert_allclose(actual_et_arg, expected_midpoint_et, rtol=1e-10)
     assert actual_sensor_arg == "45sensor"
+
+
+def _make_pset_ds_for_geometric_factor(esa_energy_steps, calibration_prods):
+    """Build a minimal pset dataset with a spin_angle_bin coordinate.
+
+    The spin_angle_bin coordinate is included (unused by geometric_factor)
+    to guard against it leaking into the geometric_factor variable's shape.
+    """
+    return xr.Dataset(
+        coords={
+            "epoch": xr.DataArray([0], dims=["epoch"]),
+            "esa_energy_step": xr.DataArray(esa_energy_steps, dims=["esa_energy_step"]),
+            "calibration_prod": xr.DataArray(
+                calibration_prods, dims=["calibration_prod"]
+            ),
+            "spin_angle_bin": xr.DataArray(np.arange(5), dims=["spin_angle_bin"]),
+        }
+    )
+
+
+def test_add_pset_geometric_factor_matching_gain_state(hi_test_cal_prod_config_path):
+    """Test add_pset_geometric_factor for a pointing whose gain-match values
+    match the test cal-prod config's gain_config_id=0 reference values
+    (within tolerance). The resulting geometric_factor should record the
+    unique geometric_factor per esa_energy_step and calibration_prod, and
+    should not gain a spin_angle_bin dimension from the pset dataset's other
+    coordinates."""
+    config_df = utils.CalibrationProductConfig.from_csv(hi_test_cal_prod_config_path)
+    pset_ds = _make_pset_ds_for_geometric_factor(np.arange(1, 10), [0, 1])
+    l1b_de_dataset = xr.Dataset(attrs=NOMINAL_HV_DELTAS)
+    gain_config_df = _select_gain_config_df(config_df, l1b_de_dataset)
+
+    result = hi_l1c.add_pset_geometric_factor(pset_ds, gain_config_df)
+
+    assert result is pset_ds
+    assert result["geometric_factor"].dims == (
+        "epoch",
+        "esa_energy_step",
+        "calibration_prod",
+    )
+
+    # geometric_factor per esa_energy_step (1-9) and calibration_prod (0, 1)
+    # for gain_config_id=0. calibration_prod 0 and 1 share identical
+    # geometric_factor values in the fixture. See
+    # imap_processing/tests/hi/data/l1/imap_hi_90sensor-cal-prod_20240101_v001.csv
+    per_step = np.array(
+        [
+            0.00055,
+            0.00085,
+            0.00126,
+            0.00170,
+            0.00340,
+            0.00523,
+            0.00659,
+            0.01301,
+            0.01830,
+        ]
+    )
+    expected = np.stack([per_step, per_step], axis=1)
+    np.testing.assert_allclose(
+        result["geometric_factor"].values[0], expected, rtol=1e-6
+    )
+
+
+def test_add_pset_geometric_factor_nan_gain_match_returns_fillval(
+    hi_test_cal_prod_config_path,
+):
+    """If L1B could not determine reference detector voltages for the
+    pointing (nan HV delta attrs), geometric_factor stays FILLVAL."""
+    config_df = utils.CalibrationProductConfig.from_csv(hi_test_cal_prod_config_path)
+    pset_ds = _make_pset_ds_for_geometric_factor([1, 2, 3], [0, 1])
+    l1b_de_dataset = xr.Dataset(
+        attrs={
+            "mcp_delta_v": float("nan"),
+            "cem_a_delta_v": 2150.0,
+            "cem_b_delta_v": 2150.0,
+            "tof_v": -8000.0,
+        }
+    )
+    gain_config_df = _select_gain_config_df(config_df, l1b_de_dataset)
+
+    result = hi_l1c.add_pset_geometric_factor(pset_ds, gain_config_df)
+
+    fillval = np.float32(result["geometric_factor"].attrs["FILLVAL"])
+    np.testing.assert_array_equal(
+        result["geometric_factor"].values[0],
+        np.full((3, 2), fillval),
+    )
+
+
+def test_add_pset_geometric_factor_no_match_returns_fillval(
+    hi_test_cal_prod_config_path,
+):
+    """If the pointing's gain-match values don't fall within tolerance of any
+    gain_config_id in the cal-prod config, geometric_factor stays FILLVAL."""
+    config_df = utils.CalibrationProductConfig.from_csv(hi_test_cal_prod_config_path)
+    pset_ds = _make_pset_ds_for_geometric_factor([1, 2, 3], [0, 1])
+    l1b_de_dataset = xr.Dataset(
+        attrs={
+            "mcp_delta_v": 0.0,
+            "cem_a_delta_v": 0.0,
+            "cem_b_delta_v": 0.0,
+            "tof_v": 0.0,
+        }
+    )
+    gain_config_df = _select_gain_config_df(config_df, l1b_de_dataset)
+
+    result = hi_l1c.add_pset_geometric_factor(pset_ds, gain_config_df)
+
+    fillval = np.float32(result["geometric_factor"].attrs["FILLVAL"])
+    np.testing.assert_array_equal(
+        result["geometric_factor"].values[0],
+        np.full((3, 2), fillval),
+    )
 
 
 def test_empty_pset_dataset(use_fake_repoint_data_for_time):
@@ -265,17 +403,23 @@ def test_pset_counts(
     hi_test_background_config_path,
 ):
     """Test coverage for pset_counts function."""
+    # The real fixture CDF predates the HV delta L1B global attributes; add
+    # placeholders matching the test cal-prod config's gain_config_id=0
+    # reference values so pset_counts() has a gain_config_id to match.
+    l1b_dataset = hi_l1b_de_dataset.copy()
+    l1b_dataset.attrs.update(NOMINAL_HV_DELTAS)
     cal_config_df = utils.CalibrationProductConfig.from_csv(
         hi_test_cal_prod_config_path
     )
     empty_pset = hi_l1c.empty_pset_dataset(
         100,
-        hi_l1b_de_dataset.esa_energy_step,
+        l1b_dataset.esa_energy_step,
         cal_config_df.cal_prod_config.calibration_product_numbers,
         HIAPID.H90_SCI_DE.sensor,
     )
+    gain_config_df = _select_gain_config_df(cal_config_df, l1b_dataset)
     counts_var = hi_l1c.pset_counts(
-        empty_pset.coords, cal_config_df, hi_l1b_de_dataset, hi_goodtimes_dataset
+        empty_pset.coords, gain_config_df, l1b_dataset, hi_goodtimes_dataset
     )
     assert "counts" in counts_var
 
@@ -294,6 +438,10 @@ def test_pset_counts_empty_l1b(
     # remove all but one event and set its trigger_id to zero
     l1b_dataset = hi_l1b_de_dataset.isel(event_met=[0]).copy(deep=True)
     l1b_dataset["trigger_id"].data[0] = 0
+    # The real fixture CDF predates the HV delta L1B global attributes; add
+    # placeholders matching the test cal-prod config's gain_config_id=0
+    # reference values so pset_counts() has a gain_config_id to match.
+    l1b_dataset.attrs.update(NOMINAL_HV_DELTAS)
     cal_config_df = utils.CalibrationProductConfig.from_csv(
         hi_test_cal_prod_config_path
     )
@@ -303,8 +451,9 @@ def test_pset_counts_empty_l1b(
         cal_config_df.cal_prod_config.calibration_product_numbers,
         HIAPID.H90_SCI_DE.sensor,
     )
+    gain_config_df = _select_gain_config_df(cal_config_df, l1b_dataset)
     counts_var = hi_l1c.pset_counts(
-        empty_pset.coords, cal_config_df, l1b_dataset, hi_goodtimes_dataset
+        empty_pset.coords, gain_config_df, l1b_dataset, hi_goodtimes_dataset
     )
     assert counts_var["counts"].data.sum() == 0
 
@@ -398,14 +547,20 @@ def test_pset_counts_arbitrary_cal_prod_numbers(
     """Test pset_counts with non-sequential calibration product numbers."""
     # Create a test calibration product config with non-sequential numbers
     csv_content = """\
-calibration_prod,esa_energy_step,geometric_factor,coincidence_type_list,tof_ab_low,tof_ab_high,tof_ac1_low,tof_ac1_high,tof_bc1_low,tof_bc1_high,tof_c1c2_low,tof_c1c2_high
-5,1,0.00055,ABC1C2,0,1023,-1023,1023,-1023,1023,0,1023
-5,2,0.00085,ABC1C2,0,1023,-1023,1023,-1023,1023,0,1023
-10,1,0.00055,BC1C2,0,1023,-1023,1023,-1023,1023,0,1023
-10,2,0.00085,BC1C2,0,1023,-1023,1023,-1023,1023,0,1023
+gain_config_id,calibration_prod,esa_energy_step,geometric_factor,coincidence_type_list,tof_ab_low,tof_ab_high,tof_ac1_low,tof_ac1_high,tof_bc1_low,tof_bc1_high,tof_c1c2_low,tof_c1c2_high,mcp_delta_v,mcp_delta_v_tol,cem_a_delta_v,cem_a_delta_v_tol,cem_b_delta_v,cem_b_delta_v_tol,tof_v,tof_v_tol
+0,5,1,0.00055,ABC1C2,0,1023,-1023,1023,-1023,1023,0,1023,875.0,75.0,2150.0,150.0,2150.0,150.0,-8000.0,50.0
+0,5,2,0.00085,ABC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
+0,10,1,0.00055,BC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
+0,10,2,0.00085,BC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
     """
 
     cal_config_df = utils.CalibrationProductConfig.from_csv(io.StringIO(csv_content))
+
+    # The real fixture CDF predates the HV delta L1B global attributes; add
+    # placeholders matching this test's gain_config_id=0 reference values
+    # so pset_counts() has a gain_config_id to match.
+    l1b_dataset = hi_l1b_de_dataset.copy()
+    l1b_dataset.attrs.update(NOMINAL_HV_DELTAS)
 
     # Create PSET with non-sequential calibration product numbers
     l1b_met = 482373065
@@ -415,7 +570,7 @@ calibration_prod,esa_energy_step,geometric_factor,coincidence_type_list,tof_ab_l
 
     empty_pset = hi_l1c.empty_pset_dataset(
         l1b_met,
-        hi_l1b_de_dataset.esa_energy_step,
+        l1b_dataset.esa_energy_step,
         cal_config_df.cal_prod_config.calibration_product_numbers,
         HIAPID.H90_SCI_DE.sensor,
     )
@@ -423,12 +578,14 @@ calibration_prod,esa_energy_step,geometric_factor,coincidence_type_list,tof_ab_l
     # Verify the calibration_prod coordinate has non-sequential values
     np.testing.assert_array_equal(empty_pset.calibration_prod.data, np.array([5, 10]))
 
+    gain_config_df = _select_gain_config_df(cal_config_df, l1b_dataset)
+
     # Mock get_pointing_times to avoid SPICE kernel requirements
     with mock.patch(
         "imap_processing.hi.hi_l1c.get_pointing_times", return_value=(100, 200)
     ):
         counts_var = hi_l1c.pset_counts(
-            empty_pset.coords, cal_config_df, hi_l1b_de_dataset, hi_goodtimes_dataset
+            empty_pset.coords, gain_config_df, l1b_dataset, hi_goodtimes_dataset
         )
 
     # Verify counts array has correct shape based on coordinates
@@ -458,6 +615,131 @@ calibration_prod,esa_energy_step,geometric_factor,coincidence_type_list,tof_ab_l
         np.sum(counts_var["counts"].data[:, :, 1]),
         np.sum(coincidence_7_mask & esa_1_2_mask),
     )
+
+
+@pytest.mark.external_test_data
+def test_pset_counts_restricted_to_matched_gain_config_id(
+    hi_l1b_de_dataset, hi_goodtimes_dataset, use_fake_repoint_data_for_time
+):
+    """Test pset_counts only qualifies events against the pointing's own
+    matched gain_config_id.
+
+    Regression test: with two gain_config_id groups that have identical
+    calibration product definitions, pset_counts must not iterate both
+    groups' rows into the same (esa_energy_step, calibration_prod) counts
+    cell -- doing so would double every count once the ancillary file has
+    more than one gain_config_id.
+    """
+    # Two gain_config_id groups (0 and 1) with identical calibration
+    # product definitions but distinct HV delta reference values.
+    csv_content = """\
+gain_config_id,calibration_prod,esa_energy_step,geometric_factor,coincidence_type_list,tof_ab_low,tof_ab_high,tof_ac1_low,tof_ac1_high,tof_bc1_low,tof_bc1_high,tof_c1c2_low,tof_c1c2_high,mcp_delta_v,mcp_delta_v_tol,cem_a_delta_v,cem_a_delta_v_tol,cem_b_delta_v,cem_b_delta_v_tol,tof_v,tof_v_tol
+0,5,1,0.00055,ABC1C2,0,1023,-1023,1023,-1023,1023,0,1023,875.0,75.0,2150.0,150.0,2150.0,150.0,-8000.0,50.0
+0,5,2,0.00085,ABC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
+0,10,1,0.00055,BC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
+0,10,2,0.00085,BC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
+1,5,1,0.00055,ABC1C2,0,1023,-1023,1023,-1023,1023,0,1023,500.0,50.0,1000.0,100.0,1000.0,100.0,-4000.0,50.0
+1,5,2,0.00085,ABC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
+1,10,1,0.00055,BC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
+1,10,2,0.00085,BC1C2,0,1023,-1023,1023,-1023,1023,0,1023,,,,,,,,
+    """
+
+    cal_config_df = utils.CalibrationProductConfig.from_csv(io.StringIO(csv_content))
+
+    # Match the pointing to gain_config_id=1's reference values.
+    l1b_dataset = hi_l1b_de_dataset.copy()
+    l1b_dataset.attrs.update(
+        {
+            "mcp_delta_v": 500.0,
+            "cem_a_delta_v": 1000.0,
+            "cem_b_delta_v": 1000.0,
+            "tof_v": -4000.0,
+        }
+    )
+
+    l1b_met = 482373065
+    use_fake_repoint_data_for_time(
+        np.asarray([l1b_met - 15 * 60, l1b_met + 24 * 60 * 60])
+    )
+
+    empty_pset = hi_l1c.empty_pset_dataset(
+        l1b_met,
+        l1b_dataset.esa_energy_step,
+        cal_config_df.cal_prod_config.calibration_product_numbers,
+        HIAPID.H90_SCI_DE.sensor,
+    )
+
+    gain_config_df = _select_gain_config_df(cal_config_df, l1b_dataset)
+
+    with mock.patch(
+        "imap_processing.hi.hi_l1c.get_pointing_times", return_value=(100, 200)
+    ):
+        counts_var = hi_l1c.pset_counts(
+            empty_pset.coords, gain_config_df, l1b_dataset, hi_goodtimes_dataset
+        )
+
+    # Expected totals match the single-gain_config_id case exercised by
+    # test_pset_counts_arbitrary_cal_prod_numbers. If pset_counts wrongly
+    # iterated both gain_config_id groups' identical definitions, these
+    # totals would be doubled.
+    esa_1_2_mask = (
+        hi_l1b_de_dataset["esa_step"][hi_l1b_de_dataset["ccsds_index"]] < 3
+    ).values
+    coincidence_15_mask = (hi_l1b_de_dataset["coincidence_type"] == 15).values
+    np.testing.assert_equal(
+        np.sum(counts_var["counts"].data[:, :, 0]),
+        np.sum(coincidence_15_mask & esa_1_2_mask),
+    )
+    coincidence_7_mask = (hi_l1b_de_dataset["coincidence_type"] == 7).values
+    np.testing.assert_equal(
+        np.sum(counts_var["counts"].data[:, :, 1]),
+        np.sum(coincidence_7_mask & esa_1_2_mask),
+    )
+
+
+@pytest.mark.external_test_data
+@mock.patch("imap_processing.hi.hi_l1c.get_pointing_times", return_value=(100, 200))
+def test_pset_counts_no_gain_match_returns_zero_counts(
+    mock_pointing_times,
+    hi_l1b_de_dataset,
+    hi_goodtimes_dataset,
+    hi_test_cal_prod_config_path,
+):
+    """Test pset_counts returns all-zero counts when the pointing's HV
+    deltas don't match any gain_config_id.
+
+    Without a unique gain_config_id match, the correct coincidence-type/TOF
+    window definitions for this pointing are unknown, so no events should
+    be counted (mirrors add_pset_geometric_factor() leaving
+    geometric_factor at FILLVAL in the same situation).
+    """
+    cal_config_df = utils.CalibrationProductConfig.from_csv(
+        hi_test_cal_prod_config_path
+    )
+    l1b_dataset = hi_l1b_de_dataset.copy()
+    l1b_dataset.attrs.update(
+        {
+            "mcp_delta_v": 0.0,
+            "cem_a_delta_v": 0.0,
+            "cem_b_delta_v": 0.0,
+            "tof_v": 0.0,
+        }
+    )
+    empty_pset = hi_l1c.empty_pset_dataset(
+        100,
+        l1b_dataset.esa_energy_step,
+        cal_config_df.cal_prod_config.calibration_product_numbers,
+        HIAPID.H90_SCI_DE.sensor,
+    )
+
+    gain_config_df = _select_gain_config_df(cal_config_df, l1b_dataset)
+    assert gain_config_df is None
+
+    counts_var = hi_l1c.pset_counts(
+        empty_pset.coords, gain_config_df, l1b_dataset, hi_goodtimes_dataset
+    )
+
+    assert counts_var["counts"].data.sum() == 0
 
 
 @mock.patch("imap_processing.hi.hi_l1c.get_pointing_times", return_value=(100, 200))
@@ -523,17 +805,17 @@ def test_pset_counts_goodtimes_filtering(
     mock_config_row = MagicMock()
     mock_config_row.Index = (0, 1)  # (calibration_prod, esa_energy_step)
 
-    def mock_iter(de_ds, config_df, esa_energy_steps):
+    def mock_iter(de_ds, gain_config_df, esa_energy_steps):
         n_remaining = len(de_ds["event_met"])
         yield 1, mock_config_row, np.ones(n_remaining, dtype=bool)
 
     mock_iter_qualified.side_effect = mock_iter
 
-    # Use MagicMock for cal_config since it's not used with our mock
-    mock_cal_config = MagicMock()
+    # Use MagicMock for gain_config_df since it's not used with our mock
+    mock_gain_config_df = MagicMock()
 
     counts_var = hi_l1c.pset_counts(
-        empty_pset.coords, mock_cal_config, l1b_dataset, goodtimes_ds
+        empty_pset.coords, mock_gain_config_df, l1b_dataset, goodtimes_ds
     )
 
     # Only 5 events (METs 100-104) should pass goodtimes filtering
@@ -622,6 +904,21 @@ def test_pset_backgrounds(
         len(empty_pset.coords["spin_angle_bin"]),
     )
 
+    # Verify ESA-dependent backgrounds: different ESA steps should have different
+    # background rates (since scaling factors vary by ESA in the test config).
+    # Check that not all ESA steps have identical background rates for each cal_prod.
+    bg_rates = backgrounds_vars["background_rates"].data
+    for i_cal_prod in range(len(empty_pset.coords["calibration_prod"])):
+        # Get background rates for this cal_prod across all ESA steps
+        # (take first spin bin)
+        rates_by_esa = bg_rates[0, :, i_cal_prod, 0]
+        # If there are any non-zero background counts, rates should vary by ESA
+        if np.any(rates_by_esa > 0):
+            # Verify not all ESA steps have identical rates
+            assert not np.allclose(rates_by_esa, rates_by_esa[0]), (
+                f"Background rates should vary by ESA for cal_prod {i_cal_prod}"
+            )
+
 
 @mock.patch("imap_processing.hi.hi_l1c.good_time_and_phase_mask")
 def test_compute_background_counts_missing_cal_prod_raises_error(
@@ -702,7 +999,7 @@ def test_pset_backgrounds_cal_prod_mismatch_raises_error(
 ):
     """Test pset_backgrounds raises ValueError when cal prods don't match.
 
-    This tests the validation at lines 634-639 of hi_l1c.py that checks
+    This tests the validation in pset_backgrounds that checks
     if calibration products in pset_coords match those in background_config_df.
     """
     # Create pset_coords with calibration products [0, 1]
@@ -723,26 +1020,28 @@ def test_pset_backgrounds_cal_prod_mismatch_raises_error(
 
     # Create a background config DataFrame with DIFFERENT calibration products [5, 6]
     # This simulates a mismatch between pset_coords and background_config_df
+    # Now includes esa_energy_step in the multi-index
     background_config_data = {
-        "coincidence_type_list": ["ABC1C2", "ABC1C2"],
-        "coincidence_type_values": [[15], [15]],
-        "tof_ab_low": [0, 0],
-        "tof_ab_high": [100, 100],
-        "tof_ac1_low": [0, 0],
-        "tof_ac1_high": [100, 100],
-        "tof_bc1_low": [0, 0],
-        "tof_bc1_high": [100, 100],
-        "tof_c1c2_low": [0, 0],
-        "tof_c1c2_high": [100, 100],
-        "scaling_factor": [1.0, 1.0],
-        "uncertainty": [0.1, 0.1],
+        "coincidence_type_list": [("ABC1C2",), ("ABC1C2",), ("ABC1C2",), ("ABC1C2",)],
+        "coincidence_type_values": [(15,), (15,), (15,), (15,)],
+        "tof_ab_low": [0, 0, 0, 0],
+        "tof_ab_high": [100, 100, 100, 100],
+        "tof_ac1_low": [0, 0, 0, 0],
+        "tof_ac1_high": [100, 100, 100, 100],
+        "tof_bc1_low": [0, 0, 0, 0],
+        "tof_bc1_high": [100, 100, 100, 100],
+        "tof_c1c2_low": [0, 0, 0, 0],
+        "tof_c1c2_high": [100, 100, 100, 100],
+        "scaling_factor": [1.0, 1.0, 1.0, 1.0],
+        "uncertainty": [0.1, 0.1, 0.1, 0.1],
     }
     # Use calibration products [5, 6] which don't match pset_coords [0, 1]
-    mismatched_cal_prods = [5, 6]
-    background_indices = [0, 0]
+    mismatched_cal_prods = [5, 5, 6, 6]
+    background_indices = [0, 0, 0, 0]
+    esa_energy_steps = [1, 2, 1, 2]
     multi_index = pd.MultiIndex.from_arrays(
-        [mismatched_cal_prods, background_indices],
-        names=["calibration_prod", "background_index"],
+        [mismatched_cal_prods, background_indices, esa_energy_steps],
+        names=["calibration_prod", "background_index", "esa_energy_step"],
     )
     background_df = pd.DataFrame(background_config_data, index=multi_index)
 
@@ -756,11 +1055,11 @@ def test_pset_backgrounds_cal_prod_mismatch_raises_error(
     # calibration products (simulating what would happen if the earlier check
     # didn't catch the mismatch)
     mock_background_counts = xr.DataArray(
-        np.zeros((n_epoch, len(mismatched_cal_prods), 1)),
+        np.zeros((n_epoch, 2, 1)),
         dims=["epoch", "calibration_prod", "background_index"],
         coords={
             "epoch": pset_coords["epoch"],
-            "calibration_prod": mismatched_cal_prods,
+            "calibration_prod": [5, 6],
             "background_index": [0],
         },
     )
@@ -783,6 +1082,512 @@ def test_pset_backgrounds_cal_prod_mismatch_raises_error(
             goodtimes_ds,
             exposure_times,
         )
+
+
+@mock.patch("imap_processing.hi.hi_l1c._compute_background_counts")
+def test_pset_backgrounds_esa_energy_step_mismatch_raises_error(
+    mock_compute_background_counts,
+):
+    """Test pset_backgrounds raises ValueError when esa_energy_steps don't match.
+
+    This tests the validation in pset_backgrounds that checks
+    if ESA energy steps in pset_coords match those in background_config_df.
+    """
+    # Create pset_coords with ESA energy steps [1, 2]
+    n_epoch = 1
+    n_energy = 2
+    n_spin_bins = 3600
+    pset_coords = {
+        "epoch": xr.DataArray(np.array([0], dtype=np.int64), dims=["epoch"]),
+        "esa_energy_step": xr.DataArray(np.array([1, 2]), dims=["esa_energy_step"]),
+        "calibration_prod": xr.DataArray(
+            np.array([0], dtype=np.int64),
+            dims=["calibration_prod"],
+        ),
+        "spin_angle_bin": xr.DataArray(np.arange(n_spin_bins), dims=["spin_angle_bin"]),
+    }
+
+    # Create a background config DataFrame with DIFFERENT ESA energy steps [3, 4]
+    background_config_data = {
+        "coincidence_type_list": [("ABC1C2",), ("ABC1C2",)],
+        "coincidence_type_values": [(15,), (15,)],
+        "tof_ab_low": [0, 0],
+        "tof_ab_high": [100, 100],
+        "tof_ac1_low": [0, 0],
+        "tof_ac1_high": [100, 100],
+        "tof_bc1_low": [0, 0],
+        "tof_bc1_high": [100, 100],
+        "tof_c1c2_low": [0, 0],
+        "tof_c1c2_high": [100, 100],
+        "scaling_factor": [1.0, 1.0],
+        "uncertainty": [0.1, 0.1],
+    }
+    # Use ESA energy steps [3, 4] which don't match pset_coords [1, 2]
+    cal_prods = [0, 0]
+    background_indices = [0, 0]
+    mismatched_esa_steps = [3, 4]
+    multi_index = pd.MultiIndex.from_arrays(
+        [cal_prods, background_indices, mismatched_esa_steps],
+        names=["calibration_prod", "background_index", "esa_energy_step"],
+    )
+    background_df = pd.DataFrame(background_config_data, index=multi_index)
+
+    # Create mock exposure_times
+    exposure_times = xr.DataArray(
+        np.ones((n_epoch, n_energy, n_spin_bins), dtype=np.float32),
+        dims=["epoch", "esa_energy_step", "spin_angle_bin"],
+    )
+
+    # Mock _compute_background_counts to return a valid DataArray
+    mock_background_counts = xr.DataArray(
+        np.zeros((n_epoch, 1, 1)),
+        dims=["epoch", "calibration_prod", "background_index"],
+        coords={
+            "epoch": pset_coords["epoch"],
+            "calibration_prod": [0],
+            "background_index": [0],
+        },
+    )
+    mock_compute_background_counts.return_value = mock_background_counts
+
+    # Create minimal l1b dataset and goodtimes (not used due to mock)
+    l1b_de_dataset = xr.Dataset()
+    goodtimes_ds = xr.Dataset()
+
+    # Verify that pset_backgrounds raises ValueError with expected message
+    with pytest.raises(
+        ValueError,
+        match="ESA energy steps in pset_coords and background_config_df do not match",
+    ):
+        hi_l1c.pset_backgrounds(
+            pset_coords,
+            background_df,
+            l1b_de_dataset,
+            goodtimes_ds,
+            exposure_times,
+        )
+
+
+@mock.patch("imap_processing.hi.hi_l1c._compute_background_counts")
+def test_pset_backgrounds_applies_offset_correction(mock_compute_background_counts):
+    """Test that pset_backgrounds subtracts EXCESS_BACKGROUND_COUNT_RATE from rates.
+
+    The function should subtract HiConstants.EXCESS_BACKGROUND_COUNT_RATE (0.003/s)
+    from the combined background rates after computing them.
+    """
+    # Create minimal pset_coords
+    n_epoch = 1
+    n_energy = 2
+    n_spin_bins = 3600
+    pset_coords = {
+        "epoch": xr.DataArray(np.array([0], dtype=np.int64), dims=["epoch"]),
+        "esa_energy_step": xr.DataArray(np.array([1, 2]), dims=["esa_energy_step"]),
+        "calibration_prod": xr.DataArray(
+            np.array([0], dtype=np.int64),
+            dims=["calibration_prod"],
+        ),
+        "spin_angle_bin": xr.DataArray(np.arange(n_spin_bins), dims=["spin_angle_bin"]),
+    }
+
+    # Create background config with scaling_factor=1 and uncertainty=0 for simplicity
+    background_config_data = {
+        "coincidence_type_list": [("ABC1C2",), ("ABC1C2",)],
+        "coincidence_type_values": [(15,), (15,)],
+        "tof_ab_low": [0, 0],
+        "tof_ab_high": [100, 100],
+        "tof_ac1_low": [0, 0],
+        "tof_ac1_high": [100, 100],
+        "tof_bc1_low": [0, 0],
+        "tof_bc1_high": [100, 100],
+        "tof_c1c2_low": [0, 0],
+        "tof_c1c2_high": [100, 100],
+        "scaling_factor": [1.0, 1.0],
+        "uncertainty": [0.0, 0.0],
+    }
+    cal_prods = [0, 0]
+    background_indices = [0, 0]
+    esa_steps = [1, 2]
+    multi_index = pd.MultiIndex.from_arrays(
+        [cal_prods, background_indices, esa_steps],
+        names=["calibration_prod", "background_index", "esa_energy_step"],
+    )
+    background_df = pd.DataFrame(background_config_data, index=multi_index)
+
+    # Create exposure times that sum to 1.0 second for easy rate calculation
+    exposure_times = xr.DataArray(
+        np.full((n_epoch, n_energy, n_spin_bins), 1.0 / (n_energy * n_spin_bins)),
+        dims=["epoch", "esa_energy_step", "spin_angle_bin"],
+    )
+
+    # Mock _compute_background_counts to return counts that give a known rate
+    # With 100 counts and total_exposure_time=1.0s, rate = 100/s before offset
+    mock_background_counts = xr.DataArray(
+        np.array([[[100]]]),  # shape: (epoch=1, calibration_prod=1, background_index=1)
+        dims=["epoch", "calibration_prod", "background_index"],
+        coords={
+            "epoch": pset_coords["epoch"],
+            "calibration_prod": [0],
+            "background_index": [0],
+        },
+    )
+    mock_compute_background_counts.return_value = mock_background_counts
+
+    # Create minimal l1b dataset and goodtimes (not used due to mock)
+    l1b_de_dataset = xr.Dataset()
+    goodtimes_ds = xr.Dataset()
+
+    # Call pset_backgrounds
+    result = hi_l1c.pset_backgrounds(
+        pset_coords,
+        background_df,
+        l1b_de_dataset,
+        goodtimes_ds,
+        exposure_times,
+    )
+
+    # Expected rate: 100/s (count rate) * 1.0 (scaling) - 0.003 (offset) = 99.997
+    expected_rate = 100.0 - HiConstants.EXCESS_BACKGROUND_COUNT_RATE
+    # All values should be the same (broadcast across all dimensions)
+    np.testing.assert_allclose(
+        result["background_rates"].values,
+        expected_rate,
+        rtol=1e-6,
+        err_msg="Background rate offset correction not applied correctly",
+    )
+
+
+@mock.patch("imap_processing.hi.hi_l1c._compute_background_counts")
+def test_pset_backgrounds_offset_does_not_go_negative(mock_compute_background_counts):
+    """Test that pset_backgrounds clips rates to 0 after offset subtraction.
+
+    When the background rate is less than the offset (0.003/s), the result
+    should be clipped to 0 rather than going negative.
+    """
+
+    # Create minimal pset_coords
+    n_epoch = 1
+    n_energy = 2
+    n_spin_bins = 3600
+    pset_coords = {
+        "epoch": xr.DataArray(np.array([0], dtype=np.int64), dims=["epoch"]),
+        "esa_energy_step": xr.DataArray(np.array([1, 2]), dims=["esa_energy_step"]),
+        "calibration_prod": xr.DataArray(
+            np.array([0], dtype=np.int64),
+            dims=["calibration_prod"],
+        ),
+        "spin_angle_bin": xr.DataArray(np.arange(n_spin_bins), dims=["spin_angle_bin"]),
+    }
+
+    # Create background config
+    background_config_data = {
+        "coincidence_type_list": [("ABC1C2",), ("ABC1C2",)],
+        "coincidence_type_values": [(15,), (15,)],
+        "tof_ab_low": [0, 0],
+        "tof_ab_high": [100, 100],
+        "tof_ac1_low": [0, 0],
+        "tof_ac1_high": [100, 100],
+        "tof_bc1_low": [0, 0],
+        "tof_bc1_high": [100, 100],
+        "tof_c1c2_low": [0, 0],
+        "tof_c1c2_high": [100, 100],
+        "scaling_factor": [1.0, 1.0],
+        "uncertainty": [0.0, 0.0],
+    }
+    cal_prods = [0, 0]
+    background_indices = [0, 0]
+    esa_steps = [1, 2]
+    multi_index = pd.MultiIndex.from_arrays(
+        [cal_prods, background_indices, esa_steps],
+        names=["calibration_prod", "background_index", "esa_energy_step"],
+    )
+    background_df = pd.DataFrame(background_config_data, index=multi_index)
+
+    # Create exposure times that sum to 1.0 second
+    exposure_times = xr.DataArray(
+        np.full((n_epoch, n_energy, n_spin_bins), 1.0 / (n_energy * n_spin_bins)),
+        dims=["epoch", "esa_energy_step", "spin_angle_bin"],
+    )
+
+    # Mock _compute_background_counts to return very small counts
+    # With 0.001 counts and total_exposure_time=1.0s, rate = 0.001/s before offset
+    # After subtracting 0.003 offset, would be -0.002, but should be clipped to 0
+    mock_background_counts = xr.DataArray(
+        np.array([[[0.001]]]),
+        dims=["epoch", "calibration_prod", "background_index"],
+        coords={
+            "epoch": pset_coords["epoch"],
+            "calibration_prod": [0],
+            "background_index": [0],
+        },
+    )
+    mock_compute_background_counts.return_value = mock_background_counts
+
+    # Create minimal l1b dataset and goodtimes (not used due to mock)
+    l1b_de_dataset = xr.Dataset()
+    goodtimes_ds = xr.Dataset()
+
+    # Call pset_backgrounds
+    result = hi_l1c.pset_backgrounds(
+        pset_coords,
+        background_df,
+        l1b_de_dataset,
+        goodtimes_ds,
+        exposure_times,
+    )
+
+    # Verify rate is 0 (clipped, not negative)
+    assert np.all(result["background_rates"].values >= 0), (
+        "Background rates should not be negative after offset subtraction"
+    )
+    # Since 0.001 - 0.003 = -0.002, should be clipped to 0
+    np.testing.assert_allclose(
+        result["background_rates"].values,
+        0.0,
+        atol=1e-10,
+        err_msg="Background rates should be clipped to 0 when offset exceeds rate",
+    )
+
+
+@mock.patch("imap_processing.hi.hi_l1c._compute_background_counts")
+def test_pset_backgrounds_uncertainty_includes_constant_terms(
+    mock_compute_background_counts,
+):
+    """Test that background uncertainty includes EXCESS_BACKGROUND_COUNT_RATE_UNC.
+
+    The function should add EXCESS_BACKGROUND_COUNT_RATE_UNC (0.001/s) in
+    quadrature to the background rate uncertainty.
+    """
+    # Create minimal pset_coords with ESAs 1 and 2 (which do NOT get the extra
+    # UPPER_ESA_EXTRA_BACKGROUND_UNC)
+    n_epoch = 1
+    n_energy = 2
+    n_spin_bins = 3600
+    pset_coords = {
+        "epoch": xr.DataArray(np.array([0], dtype=np.int64), dims=["epoch"]),
+        "esa_energy_step": xr.DataArray(np.array([1, 2]), dims=["esa_energy_step"]),
+        "calibration_prod": xr.DataArray(
+            np.array([0], dtype=np.int64),
+            dims=["calibration_prod"],
+        ),
+        "spin_angle_bin": xr.DataArray(np.arange(n_spin_bins), dims=["spin_angle_bin"]),
+    }
+
+    # Create background config with scaling_factor=1 and uncertainty=0 for simplicity
+    background_config_data = {
+        "coincidence_type_list": [("ABC1C2",), ("ABC1C2",)],
+        "coincidence_type_values": [(15,), (15,)],
+        "tof_ab_low": [0, 0],
+        "tof_ab_high": [100, 100],
+        "tof_ac1_low": [0, 0],
+        "tof_ac1_high": [100, 100],
+        "tof_bc1_low": [0, 0],
+        "tof_bc1_high": [100, 100],
+        "tof_c1c2_low": [0, 0],
+        "tof_c1c2_high": [100, 100],
+        "scaling_factor": [1.0, 1.0],
+        "uncertainty": [0.0, 0.0],
+    }
+    cal_prods = [0, 0]
+    background_indices = [0, 0]
+    esa_steps = [1, 2]
+    multi_index = pd.MultiIndex.from_arrays(
+        [cal_prods, background_indices, esa_steps],
+        names=["calibration_prod", "background_index", "esa_energy_step"],
+    )
+    background_df = pd.DataFrame(background_config_data, index=multi_index)
+
+    # Create exposure times that sum to 1.0 second for easy rate calculation
+    exposure_times = xr.DataArray(
+        np.full((n_epoch, n_energy, n_spin_bins), 1.0 / (n_energy * n_spin_bins)),
+        dims=["epoch", "esa_energy_step", "spin_angle_bin"],
+    )
+
+    # Mock _compute_background_counts to return 100 counts
+    # With 100 counts and total_exposure_time=1.0s, Poisson uncertainty
+    # = sqrt(100)/1 = 10
+    mock_background_counts = xr.DataArray(
+        np.array([[[100]]]),
+        dims=["epoch", "calibration_prod", "background_index"],
+        coords={
+            "epoch": pset_coords["epoch"],
+            "calibration_prod": [0],
+            "background_index": [0],
+        },
+    )
+    mock_compute_background_counts.return_value = mock_background_counts
+
+    l1b_de_dataset = xr.Dataset()
+    goodtimes_ds = xr.Dataset()
+
+    result = hi_l1c.pset_backgrounds(
+        pset_coords,
+        background_df,
+        l1b_de_dataset,
+        goodtimes_ds,
+        exposure_times,
+    )
+
+    # Expected uncertainty calculation:
+    # Poisson = sqrt(100)/1 * 1 = 10
+    # Scaling = 100 * 0 = 0
+    # Combined = sqrt(10^2 + 0) = 10
+    # After adding constant terms: sqrt(10^2 + 0.001^2 + 0^2) for ESAs 1,2
+    # (UPPER_ESA_EXTRA_BACKGROUND_UNC is 0 for ESAs 1-6)
+    expected_unc = np.sqrt(
+        10.0**2
+        + HiConstants.EXCESS_BACKGROUND_COUNT_RATE_UNC**2
+        + 0**2  # UPPER_ESA_EXTRA_BACKGROUND_UNC=0 for ESAs 1,2
+    )
+    np.testing.assert_allclose(
+        result["background_rates_uncertainty"].values,
+        expected_unc,
+        rtol=1e-6,
+        err_msg="Bg rate uncertainty should include EXCESS_BACKGROUND_COUNT_RATE_UNC",
+    )
+
+
+@mock.patch("imap_processing.hi.hi_l1c._compute_background_counts")
+def test_pset_backgrounds_esa_7_8_9_extra_uncertainty(mock_compute_background_counts):
+    """Test that ESAs 7, 8, 9 get extra uncertainty (UPPER_ESA_EXTRA_BACKGROUND_UNC).
+
+    The function should add 0.0025/s extra uncertainty in quadrature ONLY for
+    ESAs 7, 8, and 9 to account for possible unidentified additional background
+    in these ESA steps.
+    """
+    # Create pset_coords with ESAs 1, 7, and 9 to compare low vs high ESAs
+    n_epoch = 1
+    n_energy = 3
+    n_spin_bins = 3600
+    pset_coords = {
+        "epoch": xr.DataArray(np.array([0], dtype=np.int64), dims=["epoch"]),
+        "esa_energy_step": xr.DataArray(np.array([1, 7, 9]), dims=["esa_energy_step"]),
+        "calibration_prod": xr.DataArray(
+            np.array([0], dtype=np.int64),
+            dims=["calibration_prod"],
+        ),
+        "spin_angle_bin": xr.DataArray(np.arange(n_spin_bins), dims=["spin_angle_bin"]),
+    }
+
+    # Create background config with scaling_factor=1 and uncertainty=0
+    background_config_data = {
+        "coincidence_type_list": [("ABC1C2",), ("ABC1C2",), ("ABC1C2",)],
+        "coincidence_type_values": [(15,), (15,), (15,)],
+        "tof_ab_low": [0, 0, 0],
+        "tof_ab_high": [100, 100, 100],
+        "tof_ac1_low": [0, 0, 0],
+        "tof_ac1_high": [100, 100, 100],
+        "tof_bc1_low": [0, 0, 0],
+        "tof_bc1_high": [100, 100, 100],
+        "tof_c1c2_low": [0, 0, 0],
+        "tof_c1c2_high": [100, 100, 100],
+        "scaling_factor": [1.0, 1.0, 1.0],
+        "uncertainty": [0.0, 0.0, 0.0],
+    }
+    cal_prods = [0, 0, 0]
+    background_indices = [0, 0, 0]
+    esa_steps = [1, 7, 9]
+    multi_index = pd.MultiIndex.from_arrays(
+        [cal_prods, background_indices, esa_steps],
+        names=["calibration_prod", "background_index", "esa_energy_step"],
+    )
+    background_df = pd.DataFrame(background_config_data, index=multi_index)
+
+    # Create exposure times that sum to 1.0 second
+    exposure_times = xr.DataArray(
+        np.full((n_epoch, n_energy, n_spin_bins), 1.0 / (n_energy * n_spin_bins)),
+        dims=["epoch", "esa_energy_step", "spin_angle_bin"],
+    )
+
+    # Mock _compute_background_counts to return 0 counts so that the only
+    # uncertainty is from the constant terms (making the test sensitive to
+    # the ESA-dependent uncertainty difference)
+    mock_background_counts = xr.DataArray(
+        np.array([[[0.0]]]),
+        dims=["epoch", "calibration_prod", "background_index"],
+        coords={
+            "epoch": pset_coords["epoch"],
+            "calibration_prod": [0],
+            "background_index": [0],
+        },
+    )
+    mock_compute_background_counts.return_value = mock_background_counts
+
+    l1b_de_dataset = xr.Dataset()
+    goodtimes_ds = xr.Dataset()
+
+    result = hi_l1c.pset_backgrounds(
+        pset_coords,
+        background_df,
+        l1b_de_dataset,
+        goodtimes_ds,
+        exposure_times,
+    )
+
+    # Get uncertainties for each ESA step from the result
+    # Shape is (epoch, esa_energy_step, calibration_prod, spin_angle_bin)
+    # Use isel for positional indexing since the output doesn't have labeled coords
+    unc_result = result["background_rates_uncertainty"]
+
+    # With 0 counts, Poisson uncertainty is 0, so the only uncertainties are:
+    # - EXCESS_BACKGROUND_COUNT_RATE_UNC = 0.001 (for all ESAs)
+    # - UPPER_ESA_EXTRA_BACKGROUND_UNC = 0.0025 for ESAs 7 and 8, 0.0055 for
+    #   ESA 9
+
+    # Expected uncertainty for ESA 1 (low ESA, no extra uncertainty):
+    # sqrt(0 + 0.001^2 + 0) = 0.001
+    expected_unc_esa1 = np.sqrt(
+        0**2 + HiConstants.EXCESS_BACKGROUND_COUNT_RATE_UNC**2 + 0**2
+    )
+
+    # Expected uncertainty for ESAs 7 and 8 (high ESAs, with extra uncertainty):
+    # sqrt(0 + 0.001^2 + 0.0025^2) = sqrt(0.000001 + 0.00000625) ≈ 0.002693
+    expected_unc_esa7 = np.sqrt(
+        0**2
+        + HiConstants.EXCESS_BACKGROUND_COUNT_RATE_UNC**2
+        + 0.0025**2  # UPPER_ESA_EXTRA_BACKGROUND_UNC
+    )
+    # Expected uncertainty for ESA 9:
+    # sqrt(0 + 0.001^2 + 0.0055^2) = sqrt(0.000001 + 0.00000625) ≈ 0.002693
+    expected_unc_esa9 = np.sqrt(
+        0**2
+        + HiConstants.EXCESS_BACKGROUND_COUNT_RATE_UNC**2
+        + 0.0055**2  # UPPER_ESA_EXTRA_BACKGROUND_UNC
+    )
+
+    # ESA 1 is at index 0, ESA 7 at index 1, ESA 9 at index 2 in the output
+    # Use isel to select by position
+    unc_esa1 = unc_result.isel(esa_energy_step=0).values
+    np.testing.assert_allclose(
+        unc_esa1,
+        expected_unc_esa1,
+        rtol=1e-6,
+        err_msg="ESA 1 uncertainty should NOT include UPPER_ESA_EXTRA_BACKGROUND_UNC",
+    )
+
+    # ESAs 7 and 9 should have larger uncertainty (with extra term)
+    unc_esa7 = unc_result.isel(esa_energy_step=1).values
+    np.testing.assert_allclose(
+        unc_esa7,
+        expected_unc_esa7,
+        rtol=1e-6,
+        err_msg="ESA 7 uncertainty should include UPPER_ESA_EXTRA_BACKGROUND_UNC",
+    )
+
+    unc_esa9 = unc_result.isel(esa_energy_step=2).values
+    np.testing.assert_allclose(
+        unc_esa9,
+        expected_unc_esa9,
+        rtol=1e-6,
+        err_msg="ESA 9 uncertainty should include UPPER_ESA_EXTRA_BACKGROUND_UNC",
+    )
+
+    # Verify that ESAs 7,9 have higher uncertainty than ESA 1
+    assert np.all(unc_esa7 > unc_esa1), (
+        "ESA 7 should have higher uncertainty than ESA 1 due to extra term"
+    )
+    assert np.all(unc_esa9 > unc_esa1), (
+        "ESA 9 should have higher uncertainty than ESA 1 due to extra term"
+    )
 
 
 @mock.patch("imap_processing.hi.hi_l1c.good_time_and_phase_mask")

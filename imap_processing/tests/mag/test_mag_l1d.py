@@ -1,5 +1,8 @@
+import json
+import logging
 from unittest.mock import patch
 
+import cdflib
 import numpy as np
 import pytest
 import xarray as xr
@@ -204,11 +207,21 @@ def test_mag_l1d_attributes(
         # Verify xarray_to_cdf was called for each dataset
         assert mock_xarray_to_cdf.call_count == len(l1d_datasets)
 
-    # Test that Mag.post_processing can be called on the datasets
+    # Test that Mag.post_processing can be called on the datasets.
+    dependency_str = json.dumps(
+        {
+            "dependency": [],
+            "version": {
+                "spin-offsets": {"major_version": 1, "minor_version": 1},
+                "gradiometry-offsets-norm": {"major_version": 1, "minor_version": 1},
+                "gradiometry-offsets-burst": {"major_version": 1, "minor_version": 1},
+            },
+        }
+    )
     mag_processor = Mag(
         data_level="l1d",
         data_descriptor="all",
-        dependency_str="[]",
+        dependency_str=dependency_str,
         start_date="20000101",
         repointing=None,
         version="v001",
@@ -217,7 +230,7 @@ def test_mag_l1d_attributes(
 
     mock_dependencies = ProcessingInputCollection()
 
-    with patch("imap_processing.cdf.utils.xarray_to_cdf"):
+    with patch("imap_processing.cli.xarray_to_cdf"):
         mag_processor.post_processing(l1d_datasets, mock_dependencies)
 
 
@@ -289,6 +302,39 @@ def test_calculate_spin_offsets(
 
     np.testing.assert_allclose(offsets["x_offset"].data, expected_x_avg)
     np.testing.assert_allclose(offsets["y_offset"].data, expected_y_avg)
+
+
+def test_calculate_spin_offsets_empty_chunk(mag_l1d_test_class, caplog):
+    # 166 points with 15-sample spin period produces 11 spin_starts.
+    # With spin_count_calibration=2, the last chunk (index 10) contains only
+    # one spin_start, making chunk_epoch empty and triggering the warning path.
+    n = 166
+    mag_l1d_test_class.vectors = np.ones((n, 3))
+    mag_l1d_test_class.epoch = np.arange(n, dtype=np.float64) * 1e9
+    mag_l1d_test_class.frame = ValidFrames.SRF
+    mag_l1d_test_class.config.spin_count_calibration = 2
+
+    phase = (np.arange(n) % 15) / 15.0
+
+    with (
+        patch(
+            "imap_processing.mag.l1d.mag_l1d_data.ttj2000ns_to_met",
+            side_effect=lambda *args, **kwargs: args[0] / 1e9,
+        ),
+        patch(
+            "imap_processing.mag.l1d.mag_l1d_data.spin.get_spacecraft_spin_phase",
+            return_value=phase,
+        ),
+        patch(
+            "imap_processing.mag.l1d.mag_l1d_data.spin.get_spin_data",
+            return_value={"spin_period_sec": np.array([15.0])},
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        offsets = mag_l1d_test_class.calculate_spin_offsets()
+
+    assert "Skipping empty chunk" in caplog.text
+    assert len(offsets["epoch"]) == 5
 
 
 def test_apply_spin_offsets(mag_l1d_test_class, fake_mag_spin_data, furnish_kernels):
@@ -512,6 +558,30 @@ def test_mago_magi_no_swap_functionality(mag_l1d_test_class):
 
     assert np.array_equal(result[mag_l1d_test_class.frame.var_name].data, mago_vectors)
     assert np.array_equal(result["epoch"].data, mago_epoch)
+
+
+def test_mag_l1d_rtn_direction_label_written_cdf(mag_l1d_test_class):
+    """Test that shared MAG L1D metadata writes RTN component labels."""
+    mag_l1d_test_class.frame = ValidFrames.RTN
+
+    with patch(
+        "imap_processing.mag.l1d.mag_l1d_data.MagL2L1dBase.truncate_to_24h",
+        return_value=None,
+    ):
+        attributes = ImapCdfAttributes()
+        attributes.add_instrument_global_attrs("mag")
+        attributes.add_instrument_variable_attrs("mag", "l2")
+
+        result = mag_l1d_test_class.generate_dataset(
+            attributes, np.datetime64("2000-01-01")
+        )
+
+    result.attrs["Data_version"] = "001"
+    cdf_filepath = write_cdf(result)
+    with cdflib.CDF(cdf_filepath) as cdf_file:
+        direction_label = cdf_file.varget("direction_label")
+
+    np.testing.assert_array_equal(direction_label, np.array(["B_R", "B_T", "B_N"]))
 
 
 def test_enhanced_gradiometry_with_quality_flags_detailed():

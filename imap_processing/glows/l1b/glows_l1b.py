@@ -1,6 +1,7 @@
 """Methods for processing GLOWS L1B data."""
 
 import dataclasses
+import logging
 
 import numpy as np
 import xarray as xr
@@ -14,7 +15,10 @@ from imap_processing.glows.l1b.glows_l1b_data import (
     HistogramL1B,
     PipelineSettings,
 )
+from imap_processing.glows.utils.constants import GlowsConstants
 from imap_processing.spice.time import et_to_datetime64, ttj2000ns_to_et
+
+logger = logging.getLogger(__name__)
 
 
 def glows_l1b(
@@ -79,7 +83,10 @@ def glows_l1b(
         input_dataset, ancillary_exclusions, ancillary_parameters, pipeline_settings
     )
     output_dataset = create_l1b_hist_output(
-        output_dataarrays, input_dataset["epoch"], input_dataset["bins"], cdf_attrs
+        output_dataarrays,
+        output_dataarrays[0].coords["epoch"],
+        input_dataset["bins"],
+        cdf_attrs,
     )
 
     output_dataset.attrs["flight_software_version"] = input_dataset.attrs[
@@ -251,6 +258,36 @@ def process_histogram(
         The DataArrays for each variable in the L1B dataset. These can be assembled
         directly into a DataSet with the appropriate attributes.
     """
+    invalid_mask = l1a["imap_start_time"].values == 0.0
+    if invalid_mask.any():
+        logger.warning(
+            "GLOWS L1B: Skipping %d histogram(s) with imap_start_time=0.0 "
+            "(invalid timing data) at epochs: %s",
+            invalid_mask.sum(),
+            l1a["epoch"].values[invalid_mask],
+        )
+        l1a = l1a.isel(epoch=~invalid_mask)
+
+    # Daily total-counts reference (mean/std) for the is_beyond_daily_statistical_error
+    # flag (Section 12.3.2), computed once. Matches the cbk implementation: built from
+    # daytime blocks only, since day/night exposure conditions differ enough that mixing
+    # them makes the reference meaningless. compute_flags still applies the check to
+    # every block. number_of_events already equals the sum of the histogram's valid
+    # bins, so use it directly rather than summing the histogram.
+    is_night_raw = np.array(
+        [
+            HistogramL1B.deserialize_flags(int(raw))[GlowsConstants.IS_NIGHT_FLAG_IDX]
+            for raw in l1a["flags_set_onboard"].data
+        ]
+    )
+    daytime_total_counts = l1a["number_of_events"].data[~is_night_raw]
+    if daytime_total_counts.size > 0:
+        daily_total_counts_average = np.double(np.mean(daytime_total_counts))
+        daily_total_counts_std_dev = np.double(np.std(daytime_total_counts))
+    else:
+        daily_total_counts_average = np.double(np.nan)
+        daily_total_counts_std_dev = np.double(np.nan)
+
     dataarrays = [l1a[i] for i in l1a.keys()]
 
     input_dims: list = [[] for i in l1a.keys()]
@@ -298,7 +335,12 @@ def process_histogram(
             Tuple of processed L1B data arrays from HistogramL1B.output_data().
         """
         return HistogramL1B(  # type: ignore[call-arg]
-            *args, ancillary_exclusions, ancillary_parameters, pipeline_settings
+            *args,
+            ancillary_exclusions,
+            ancillary_parameters,
+            pipeline_settings,
+            daily_total_counts_average,
+            daily_total_counts_std_dev,
         ).output_data()
 
     l1b_fields = xr.apply_ufunc(
@@ -334,7 +376,7 @@ def create_l1b_hist_output(
         fields in the HistogramL1B dataclass, which also describes each variable.
     epoch : xr.DataArray
         The epoch DataArray to use as a coordinate in the output dataset. Generally
-        equal to the L1A epoch.
+        equal to the L1A epoch, except when values are dropped for no data.
     bin_coord : xr.DataArray
         An arange DataArray for the bins coordinate. Nominally expected to be equal to
         `xr.DataArray(np.arange(number_of_bins_per_histogram), name="bins",

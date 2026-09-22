@@ -7,7 +7,11 @@ import xarray as xr
 
 from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
 from imap_processing.mag import imap_mag_sdc_configuration_v001 as configuration
-from imap_processing.mag.constants import ModeFlags, VecSec
+from imap_processing.mag.constants import (
+    L1C_TIMESTAMP_GAP_TOLERANCE,
+    ModeFlags,
+    VecSec,
+)
 from imap_processing.mag.l1c.interpolation_methods import InterpolationFunction
 from imap_processing.spice.time import et_to_ttj2000ns, str_to_et
 
@@ -18,6 +22,7 @@ def mag_l1c(
     first_input_dataset: xr.Dataset,
     day_to_process: np.datetime64,
     second_input_dataset: xr.Dataset = None,
+    previous_day_dataset: xr.Dataset = None,
 ) -> xr.Dataset:
     """
     Will process MAG L1C data from L1A data.
@@ -36,6 +41,13 @@ def mag_l1c(
         The second input dataset to process. This should be burst if first_input_dataset
         was norm, or norm if first_input_dataset was burst. It should match the
         instrument - both inputs should be mago or magi.
+    previous_day_dataset : xr.Dataset, optional
+        The previous day's L1C dataset for the same sensor. When the current day
+        opens with a gap, timestamps generated for that gap continue the
+        previous day's cadence and phase so the L1C timeline stays continuous across
+        the day boundary. If not provided, or if a usable anchor cannot be taken
+        from it, gaps at the start of the day are filled with timestamps counted
+        from the window boundary, as before.
 
     Returns
     -------
@@ -44,12 +56,7 @@ def mag_l1c(
     """
     # TODO:
     # find missing sequences and output them
-    # Fix gaps at the beginning of the day by going to previous day's file
-    # Fix gaps at the end of the day
-    # Allow for one input to be missing
     # Missing burst file - just pass through norm file
-    # Missing norm file - go back to previous L1C file to find timestamps, then
-    # interpolate the entire day from burst
 
     input_logical_source_1 = first_input_dataset.attrs["Logical_source"]
     if isinstance(first_input_dataset.attrs["Logical_source"], list):
@@ -62,12 +69,17 @@ def mag_l1c(
         first_input_dataset, second_input_dataset
     )
 
+    if previous_day_dataset is not None:
+        previous_day_dataset = _validated_previous_day(previous_day_dataset, sensor)
+
     interp_function = InterpolationFunction[configuration.L1C_INTERPOLATION_METHOD]
     if burst_mode_dataset is not None:
-        # Only use day_to_process if there is no norm data
-        day_to_process_arg = day_to_process if normal_mode_dataset is None else None
         full_interpolated_timeline: np.ndarray = process_mag_l1c(
-            normal_mode_dataset, burst_mode_dataset, interp_function, day_to_process_arg
+            normal_mode_dataset,
+            burst_mode_dataset,
+            interp_function,
+            day_to_process,
+            previous_day_dataset=previous_day_dataset,
         )
     elif normal_mode_dataset is not None:
         full_interpolated_timeline = fill_normal_data(normal_mode_dataset)
@@ -101,7 +113,7 @@ def mag_l1c(
         completed_timeline[:, 0],
         name="epoch",
         dims=["epoch"],
-        attrs=attribute_manager.get_variable_attributes("epoch"),
+        attrs=attribute_manager.get_variable_attributes("epoch", check_schema=False),
     )
 
     direction_label = xr.DataArray(
@@ -273,11 +285,136 @@ def select_datasets(
     return normal_mode_dataset, burst_mode_dataset
 
 
+def _validated_previous_day(
+    previous_day_dataset: xr.Dataset, sensor: str
+) -> xr.Dataset:
+    """
+    Validate the previous day's dataset, raising if it is not usable.
+
+    The previous day's dataset is delivered by sds-data-manager orchestration
+    and must be a MAG L1C dataset for the same sensor as the current day's
+    inputs, with at least one epoch. Anything else means the wrong file was
+    delivered or produced upstream, so it fails the run rather than silently
+    processing the day alone.
+
+    Parameters
+    ----------
+    previous_day_dataset : xr.Dataset
+        The previous day dataset to validate.
+    sensor : str
+        The sensor of the current day's inputs, "o" (mago) or "i" (magi).
+
+    Returns
+    -------
+    xr.Dataset
+        The validated dataset.
+
+    Raises
+    ------
+    ValueError
+        If the dataset is not L1C data for this sensor, or has no epochs.
+    """
+    logical_source = previous_day_dataset.attrs["Logical_source"]
+    if isinstance(logical_source, list):
+        logical_source = logical_source[0]
+
+    if "l1c" not in logical_source or logical_source[-1] != sensor:
+        raise ValueError(
+            f"Previous day dataset has logical source {logical_source}; "
+            f"expected L1C data for sensor mag{sensor}. The wrong file was "
+            f"delivered as the previous-day input."
+        )
+    if (
+        "epoch" not in previous_day_dataset
+        or previous_day_dataset["epoch"].data.size == 0
+    ):
+        raise ValueError(
+            "Previous day L1C dataset has no epochs; a MAG L1C file always "
+            "carries a full-day timeline, so this file is malformed."
+        )
+    return previous_day_dataset
+
+
+def _expected_day_ns(day_to_process: np.datetime64) -> tuple[int, int]:
+    """
+    Return the expected L1C processing window in TTJ2000 nanoseconds.
+
+    The window is the 24-hour day extended by 30 minutes on each side.
+
+    Parameters
+    ----------
+    day_to_process : np.datetime64
+        The day to process, in np.datetime64[D] format.
+
+    Returns
+    -------
+    tuple[int, int]
+        The (start, end) of the processing window in TTJ2000 nanoseconds.
+    """
+    day_start = day_to_process.astype("datetime64[s]") - np.timedelta64(30, "m")
+    day_end = (
+        day_to_process.astype("datetime64[s]")
+        + np.timedelta64(1, "D")
+        + np.timedelta64(30, "m")
+    )
+    return (
+        int(et_to_ttj2000ns(str_to_et(str(day_start)))),
+        int(et_to_ttj2000ns(str_to_et(str(day_end)))),
+    )
+
+
+def _get_last_timestamp_and_rate_from_previous_day_in_ns(
+    previous_day_dataset: xr.Dataset, midnight_ns: int
+) -> tuple[int, int] | None:
+    """
+    Get the previous day's last vector timestamp and its vector rate.
+
+    Only samples within the previous 24-hour day count: the last timestamp is the
+    last one before ``midnight_ns``, and the rate is the sample spacing there,
+    matched against the known MAG rates.
+
+    Parameters
+    ----------
+    previous_day_dataset : xr.Dataset
+        The previous day's L1C dataset.
+    midnight_ns : int
+        Start of the current 24-hour day in TTJ2000 nanoseconds.
+
+    Returns
+    -------
+    tuple[int, int] or None
+        ``(last_timestamp_ns, rate)``, or None when the previous day has fewer than
+        two samples before midnight or its final spacing matches no known MAG rate.
+    """
+    previous_epochs = previous_day_dataset["epoch"].data
+    last_index = int(np.searchsorted(previous_epochs, midnight_ns, side="left")) - 1
+    if last_index < 1:
+        logger.warning(
+            "Previous day dataset has fewer than two samples before the current day; "
+            "not continuing its timeline."
+        )
+        return None
+
+    last_timestamp_ns = int(previous_epochs[last_index])
+    spacing = float(previous_epochs[last_index] - previous_epochs[last_index - 1])
+
+    for vecsec in VecSec:
+        if _is_expected_rate(spacing, vecsec.value):
+            return last_timestamp_ns, vecsec.value
+
+    logger.warning(
+        f"Previous day dataset ends with sample spacing {spacing} ns, which matches "
+        f"no known MAG rate; not continuing its timeline."
+    )
+    return None
+
+
 def process_mag_l1c(
     normal_mode_dataset: xr.Dataset | None,
     burst_mode_dataset: xr.Dataset,
     interpolation_function: InterpolationFunction,
     day_to_process: np.datetime64 | None = None,
+    previous_day_dataset: xr.Dataset | None = None,
 ) -> np.ndarray:
     """
     Create MAG L1C data from L1B datasets.
@@ -308,6 +445,12 @@ def process_mag_l1c(
         The day to process, in np.datetime64[D] format. This is used to fill
         gaps at the beginning or end of the day if needed. If not included, these
         gaps will not be filled.
+    previous_day_dataset : xr.Dataset, optional
+        The previous day's L1C dataset. When the current day opens with a gap, the
+        timestamps generated for that gap continue the previous day's cadence
+        and phase instead of counting from the window boundary, keeping the timeline
+        continuous across the day boundary. Requires day_to_process; ignored without
+        it.
 
     Returns
     -------
@@ -316,20 +459,34 @@ def process_mag_l1c(
     """
     day_start_ns = None
     day_end_ns = None
+    continued_gap_start_ns = None
+    previous_day_rate = None
 
     if day_to_process is not None:
-        day_start = day_to_process.astype("datetime64[s]") - np.timedelta64(30, "m")
+        day_start_ns, day_end_ns = _expected_day_ns(day_to_process)
 
-        # get the end of the day plus 30 minutes
-        day_end = (
-            day_to_process.astype("datetime64[s]")
-            + np.timedelta64(1, "D")
-            + np.timedelta64(30, "m")
-        )
+        previous_day_timeline = None
+        if previous_day_dataset is not None:
+            # The previous day's 24-hour day ends at the current day's midnight,
+            # which is the window start without its 30 minute buffer.
+            midnight_ns = int(
+                et_to_ttj2000ns(str_to_et(str(day_to_process.astype("datetime64[s]"))))
+            )
+            previous_day_timeline = (
+                _get_last_timestamp_and_rate_from_previous_day_in_ns(
+                    previous_day_dataset, midnight_ns
+                )
+            )
+        if previous_day_timeline is not None:
+            last_timestamp_ns, previous_day_rate = previous_day_timeline
+            period_ns = int(1e9 // previous_day_rate)
+            # One period before the first continued timestamp at or after the window
+            # start: interpolate_gaps only fills points strictly inside a gap, and
+            # this extra leading point is removed after generate_timeline.
+            steps = max(1, -((last_timestamp_ns - day_start_ns) // period_ns))
+            continued_gap_start_ns = last_timestamp_ns + (steps - 1) * period_ns
 
-        day_start_ns = et_to_ttj2000ns(str_to_et(str(day_start)))
-        day_end_ns = et_to_ttj2000ns(str_to_et(str(day_end)))
-
+    inherited_gap_start_ns = None
     if normal_mode_dataset:
         norm_epoch = normal_mode_dataset["epoch"].data
         if "vectors_per_second" in normal_mode_dataset.attrs:
@@ -340,6 +497,34 @@ def process_mag_l1c(
             normal_vecsec_dict = None
 
         gaps = find_all_gaps(norm_epoch, normal_vecsec_dict, day_start_ns, day_end_ns)
+        if (
+            continued_gap_start_ns is not None
+            and gaps.shape[0] > 0
+            and gaps[0][0] == day_start_ns
+        ):
+            logger.info(
+                f"MAG L1C filling the gap at the start of the day by continuing the "
+                f"previous day's timeline (rate {previous_day_rate} vectors/second)."
+            )
+            inherited_gap_start_ns = continued_gap_start_ns
+            gaps[0] = [inherited_gap_start_ns, gaps[0][1], previous_day_rate]
+    elif continued_gap_start_ns is not None:
+        logger.info(
+            f"MAG L1C has no normal mode data; generating the full timeline by "
+            f"continuing the previous day's timeline (rate {previous_day_rate} "
+            f"vectors/second)."
+        )
+        inherited_gap_start_ns = continued_gap_start_ns
+        norm_epoch = [inherited_gap_start_ns, day_end_ns]
+        gaps = np.array(
+            [
+                [
+                    inherited_gap_start_ns,
+                    day_end_ns,
+                    previous_day_rate,
+                ]
+            ]
+        )
     else:
         norm_epoch = [day_start_ns, day_end_ns]
         gaps = np.array(
@@ -353,6 +538,10 @@ def process_mag_l1c(
         )
 
     new_timeline = generate_timeline(norm_epoch, gaps)
+
+    if inherited_gap_start_ns is not None:
+        # Drop the extra leading point; see the continued gap start computation above.
+        new_timeline = new_timeline[new_timeline > inherited_gap_start_ns]
 
     if normal_mode_dataset:
         norm_filled: np.ndarray = fill_normal_data(normal_mode_dataset, new_timeline)
@@ -461,6 +650,8 @@ def interpolate_gaps(
         6-7 - compression flags.
     """
     burst_epochs = burst_dataset["epoch"].data
+    filled_timeline_epochs = filled_norm_timeline[:, 0]
+    has_norm_context = np.any(filled_norm_timeline[:, 5] == ModeFlags.NORM.value)
     # Exclude range values
     burst_vectors = burst_dataset["vectors"].data
     # Default to two vectors per second
@@ -497,14 +688,20 @@ def interpolate_gaps(
         burst_buffer = int(required_seconds * burst_rate.value)
 
         burst_start = max(0, burst_gap_start - burst_buffer)
-        burst_end = min(len(burst_epochs) - 1, burst_gap_end + burst_buffer)
+        burst_end = min(len(burst_epochs), burst_gap_end + burst_buffer + 1)
 
-        gap_timeline = filled_norm_timeline[
-            (filled_norm_timeline > gap[0]) & (filled_norm_timeline < gap[1])
+        gap_timeline = filled_timeline_epochs[
+            (filled_timeline_epochs > gap[0]) & (filled_timeline_epochs < gap[1])
         ]
 
+        usable_burst_end_epoch = burst_epochs[burst_end - 1]
+        if not has_norm_context:
+            # In the burst-only fallback, CIC delay compensation shortens the usable
+            # filtered range at the trailing edge by roughly one output cadence.
+            usable_burst_end_epoch -= int(1e9 / norm_rate.value)
+
         short = (gap_timeline >= burst_epochs[burst_start]) & (
-            gap_timeline <= burst_epochs[burst_end]
+            gap_timeline <= usable_burst_end_epoch
         )
         num_short = int(short.sum())
 
@@ -524,7 +721,7 @@ def interpolate_gaps(
 
         # gaps should not have data in timeline, still check it
         for index, timestamp in enumerate(adjusted_gap_timeline):
-            timeline_index = np.searchsorted(filled_norm_timeline[:, 0], timestamp)
+            timeline_index = np.searchsorted(filled_timeline_epochs, timestamp)
             if sum(
                 filled_norm_timeline[timeline_index, 1:4]
             ) == 0 and burst_gap_start + index < len(burst_vectors):
@@ -542,13 +739,12 @@ def interpolate_gaps(
         missing_timeline = np.setdiff1d(gap_timeline, adjusted_gap_timeline)
 
         for timestamp in missing_timeline:
-            timeline_index = np.searchsorted(filled_norm_timeline[:, 0], timestamp)
+            timeline_index = np.searchsorted(filled_timeline_epochs, timestamp)
             if filled_norm_timeline[timeline_index, 5] != ModeFlags.MISSING.value:
                 raise RuntimeError(
                     "Self-inconsistent data. "
                     "Gaps not included in final timeline should be missing."
                 )
-            np.delete(filled_norm_timeline, timeline_index)
 
     return filled_norm_timeline
 
@@ -557,8 +753,8 @@ def generate_timeline(epoch_data: np.ndarray, gaps: np.ndarray) -> np.ndarray:
     """
     Generate a new timeline from existing, gap-filled timeline and gaps.
 
-    The gaps are generated at a .5 second cadence, regardless of the cadence of the
-    existing data.
+    The gaps are generated at the cadence implied by the gap rate. If no rate is
+    provided, a default cadence of 0.5 seconds is used.
 
     Parameters
     ----------
@@ -573,7 +769,8 @@ def generate_timeline(epoch_data: np.ndarray, gaps: np.ndarray) -> np.ndarray:
     numpy.ndarray
         The new timeline, filled with the existing data and the generated gaps.
     """
-    full_timeline: np.ndarray = np.array([])
+    epoch_data = np.asarray(epoch_data)
+    full_timeline: np.ndarray = np.array([], dtype=epoch_data.dtype)
     last_index = 0
     for gap in gaps:
         epoch_start_index = np.searchsorted(epoch_data, gap[0], side="left")
@@ -582,6 +779,7 @@ def generate_timeline(epoch_data: np.ndarray, gaps: np.ndarray) -> np.ndarray:
         )
         generated_timestamps = generate_missing_timestamps(gap)
         if generated_timestamps.size == 0:
+            last_index = int(np.searchsorted(epoch_data, gap[1], side="left"))
             continue
 
         # Remove any generated timestamps that are already in the timeline
@@ -639,37 +837,48 @@ def find_all_gaps(
         specified as (start, end, vector_rate) where start and end both exist in the
         timeline.
     """
-    gaps: np.ndarray = np.zeros((0, 3))
+    gaps: np.ndarray = np.empty((0, 3), dtype=np.int64)
 
     # TODO: when we go back to the previous file, also retrieve expected
     #  vectors per second
 
     vecsec_dict = {0: VecSec.TWO_VECS_PER_S.value} | (vecsec_dict or {})
 
-    end_index = epoch_data.shape[0]
+    rate_segments = _find_rate_segments(epoch_data, vecsec_dict)
+    if rate_segments:
+        first_rate = rate_segments[0][1]
+        last_rate = rate_segments[-1][1]
+    else:
+        default_rate = next(iter(vecsec_dict.values()))
+        first_rate = default_rate
+        last_rate = default_rate
 
     if start_of_day_ns is not None and epoch_data[0] > start_of_day_ns:
         # Add a gap from the start of the day to the first timestamp
         gaps = np.concatenate(
-            (gaps, np.array([[start_of_day_ns, epoch_data[0], vecsec_dict[0]]]))
-        )
-
-    for start_time in reversed(sorted(vecsec_dict.keys())):
-        # Find the start index that is equal to or immediately after start_time
-        start_index = np.searchsorted(epoch_data, start_time, side="left")
-        gaps = np.concatenate(
             (
-                find_gaps(
-                    epoch_data[start_index : end_index + 1], vecsec_dict[start_time]
-                ),
                 gaps,
+                np.array(
+                    [[start_of_day_ns, epoch_data[0], first_rate]], dtype=np.int64
+                ),
             )
         )
-        end_index = start_index
+
+    for index, (start_index, vectors_per_second) in enumerate(rate_segments):
+        next_start_index = (
+            rate_segments[index + 1][0]
+            if index + 1 < len(rate_segments)
+            else epoch_data.shape[0] - 1
+        )
+        epoch_slice = epoch_data[start_index : next_start_index + 1]
+        gaps = np.concatenate((gaps, find_gaps(epoch_slice, vectors_per_second)))
 
     if end_of_day_ns is not None and epoch_data[-1] < end_of_day_ns:
         gaps = np.concatenate(
-            (gaps, np.array([[epoch_data[-1], end_of_day_ns, vecsec_dict[start_time]]]))
+            (
+                gaps,
+                np.array([[epoch_data[-1], end_of_day_ns, last_rate]], dtype=np.int64),
+            )
         )
 
     return gaps
@@ -696,14 +905,19 @@ def find_gaps(timeline_data: np.ndarray, vectors_per_second: int) -> np.ndarray:
         end_gap, as well as vectors_per_second. Start_gap and end_gap both correspond
         to points in timeline_data.
     """
+    if timeline_data.shape[0] < 2:
+        return np.empty((0, 3), dtype=np.int64)
+
     # Expected difference between timestamps in nanoseconds.
     expected_gap = 1 / vectors_per_second * 1e9
 
     diffs = abs(np.diff(timeline_data))
 
     # Gap can be up to 7.5% larger than expected vectors per second due to clock drift
-    gap_index = np.asarray(diffs - expected_gap > expected_gap * 0.075).nonzero()[0]
-    output: np.ndarray = np.zeros((len(gap_index), 3))
+    gap_index = np.asarray(
+        diffs - expected_gap > expected_gap * L1C_TIMESTAMP_GAP_TOLERANCE
+    ).nonzero()[0]
+    output: np.ndarray = np.zeros((len(gap_index), 3), dtype=np.int64)
 
     for index, gap in enumerate(gap_index):
         output[index, :] = [
@@ -719,8 +933,8 @@ def generate_missing_timestamps(gap: np.ndarray) -> np.ndarray:
     """
     Generate a new timeline from input gaps.
 
-    Any gaps specified in gaps will be filled with timestamps that are 0.5 seconds
-    apart.
+    Any gaps specified in gaps will be filled with timestamps at the gap rate. If the
+    gap rate is not included, the default cadence is 0.5 seconds.
 
     Parameters
     ----------
@@ -733,11 +947,96 @@ def generate_missing_timestamps(gap: np.ndarray) -> np.ndarray:
     -------
     full_timeline: numpy.ndarray
         Completed timeline.
+
+    Raises
+    ------
+    ValueError
+        If the gap bounds are not integers.
     """
-    # Generated timestamps should always be 0.5 seconds apart
-    difference_ns = 0.5 * 1e9
-    output: np.ndarray = np.arange(gap[0], gap[1], difference_ns)
+    if not np.issubdtype(np.asarray(gap).dtype, np.integer):
+        # float64 cannot represent TTJ2000 nanoseconds exactly.
+        raise ValueError(f"Gap bounds must be integer nanoseconds, got {gap}.")
+    difference_ns = int(0.5 * 1e9)
+    # Support both legacy (start, end) gaps, which use the historical 0.5 s cadence,
+    # and newer (start, end, rate) gaps, which use the declared cadence.
+    if len(gap) > 2:
+        difference_ns = int(1e9 / int(gap[2]))
+    output: np.ndarray = np.arange(
+        int(gap[0]),
+        int(gap[1]),
+        difference_ns,
+        dtype=np.int64,
+    )
     return output
+
+
+def _is_expected_rate(timestamp_difference: float, vectors_per_second: int) -> bool:
+    """
+    Determine whether a timestamp spacing matches an expected cadence.
+
+    Parameters
+    ----------
+    timestamp_difference : float
+        The observed spacing between adjacent timestamps, in nanoseconds.
+    vectors_per_second : int
+        The expected number of vectors per second for the cadence being checked.
+
+    Returns
+    -------
+    bool
+        True when the observed spacing is within `L1C_TIMESTAMP_GAP_TOLERANCE`
+        of the expected cadence.
+    """
+    expected_gap = 1 / vectors_per_second * 1e9
+    return (
+        abs(timestamp_difference - expected_gap)
+        <= expected_gap * L1C_TIMESTAMP_GAP_TOLERANCE
+    )
+
+
+def _find_rate_segments(
+    epoch_data: np.ndarray, vecsec_dict: dict[int, int]
+) -> list[tuple[int, int]]:
+    """
+    Build contiguous rate segments using observed cadence near each transition.
+
+    Walk each configured transition backward while the observed cadence already matches
+    the new rate so gaps stay attached to the correct segment instead of producing
+    spurious single-sample micro-gaps at delayed Config boundaries.
+
+    Parameters
+    ----------
+    epoch_data : numpy.ndarray
+        The sorted epoch timestamps for the current timeline, in nanoseconds.
+    vecsec_dict : dict[int, int]
+        Mapping of transition start time to expected vectors-per-second rate.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        Pairs of `(start_index, vectors_per_second)` describing contiguous rate
+        segments in `epoch_data`.
+    """
+    if epoch_data.shape[0] == 0:
+        return []
+
+    segments: list[tuple[int, int]] = []
+    for start_time, vectors_per_second in sorted(vecsec_dict.items()):
+        start_index = int(np.searchsorted(epoch_data, start_time, side="left"))
+        start_index = min(start_index, epoch_data.shape[0] - 1)
+        lower_bound = segments[-1][0] if segments else 0
+
+        while start_index > lower_bound and _is_expected_rate(
+            epoch_data[start_index] - epoch_data[start_index - 1], vectors_per_second
+        ):
+            start_index -= 1
+
+        if segments and start_index == segments[-1][0]:
+            segments[-1] = (start_index, vectors_per_second)
+        else:
+            segments.append((start_index, vectors_per_second))
+
+    return segments
 
 
 def vectors_per_second_from_string(vecsec_string: str) -> dict:

@@ -31,6 +31,7 @@ from scipy.stats import exponnorm
 from imap_processing import imap_module_directory
 from imap_processing.idex import idex_constants
 from imap_processing.idex.idex_constants import SPICE_ARRAYS
+from imap_processing.idex.idex_event_flags import ALL_FLAG_NAMES
 from imap_processing.idex.idex_utils import get_idex_attrs, setup_dataset
 
 logger = logging.getLogger(__name__)
@@ -70,10 +71,10 @@ def load_calibration_files(ancillary_files: dict) -> tuple[NDArray, NDArray]:
     """
     # Load calibration coefficients from ancillary files
     t_rise_params = pd.read_csv(
-        ancillary_files["l2a-calibration-curve-yield-params"], skiprows=1, header=None
+        ancillary_files["l2a-calibration-curve-t-rise"], skiprows=1, header=None
     ).values.flatten()[:8]
     yield_params = pd.read_csv(
-        ancillary_files["l2a-calibration-curve-t-rise"], skiprows=1, header=None
+        ancillary_files["l2a-calibration-curve-yield-params"], skiprows=1, header=None
     ).values.flatten()[:8]
     return t_rise_params, yield_params
 
@@ -185,6 +186,13 @@ def idex_l2a(l1b_dataset: xr.Dataset, ancillary_files: dict) -> xr.Dataset:
         l1b_dataset, prefixes + SPICE_ARRAYS, idex_attrs, data_vars
     )
 
+    # Preserve event classification and saturation flags for the event-level L2A
+    # products.  Fits remain available for every event, including non-dust events.
+    for flag_name in ALL_FLAG_NAMES:
+        if flag_name in l1b_dataset:
+            l2a_dataset[flag_name] = l1b_dataset[flag_name].copy()
+            l2a_dataset[flag_name].attrs = idex_attrs.get_variable_attributes(flag_name)
+
     for waveform in ["Target_Low", "Target_High", "Ion_Grid"]:
         # Get the dust mass estimates and fit results
         fit_results = xr.apply_ufunc(
@@ -205,18 +213,35 @@ def idex_l2a(l1b_dataset: xr.Dataset, ancillary_files: dict) -> xr.Dataset:
             vectorize=True,
             output_dtypes=[np.float64] * 6,
             keep_attrs=True,
+            kwargs={"waveform_name": waveform},
         )
         # Calculate mass and velocity estimates
-        velocity_mass_results = xr.apply_ufunc(
-            calculate_velocity_and_mass,
-            fit_results[1],  # signal amplitude
-            fit_results[0].data[:, 3],  # fit params
-            output_core_dims=[[], []],
-            vectorize=True,
-            output_dtypes=[np.float64, np.float64],
-            keep_attrs=True,
-            kwargs={"t_rise_params": t_rise_params, "yield_params": yield_params},
-        )
+        if waveform == "Ion_Grid":
+            velocity_mass_results = xr.apply_ufunc(
+                calculate_ion_grid_velocity_and_mass,
+                fit_results[1],
+                l2a_dataset["target_high_impact_charge"],
+                l2a_dataset["target_low_impact_charge"],
+                l2a_dataset["target_high_saturation_flag"],
+                l2a_dataset["target_low_saturation_flag"],
+                l2a_dataset["ion_grid_saturation_flag"],
+                output_core_dims=[[], []],
+                vectorize=True,
+                output_dtypes=[np.float64, np.float64],
+                keep_attrs=True,
+                kwargs={"yield_params": yield_params},
+            )
+        else:
+            velocity_mass_results = xr.apply_ufunc(
+                calculate_velocity_and_mass,
+                fit_results[1],  # signal amplitude
+                fit_results[0].data[:, 3],  # fit params
+                output_core_dims=[[], []],
+                vectorize=True,
+                output_dtypes=[np.float64, np.float64],
+                keep_attrs=True,
+                kwargs={"t_rise_params": t_rise_params, "yield_params": yield_params},
+            )
 
         waveform_name = waveform.lower()
         output_vars = {
@@ -235,6 +260,7 @@ def idex_l2a(l1b_dataset: xr.Dataset, ancillary_files: dict) -> xr.Dataset:
             l2a_dataset[name].attrs = idex_attrs.get_variable_attributes(name)
 
     l2a_dataset["mass"] = mass_scales_da
+    l2a_dataset["mass"].attrs = idex_attrs.get_variable_attributes("mass")
 
     l2a_dataset["tof_peak_kappa"] = xr.DataArray(
         kappa,
@@ -299,9 +325,96 @@ def idex_l2a(l1b_dataset: xr.Dataset, ancillary_files: dict) -> xr.Dataset:
             "target_fit_parameter_labels", check_schema=False
         ),
     )
+
+    _mask_saturated_derived_estimates(l2a_dataset)
+
+    _mask_non_science_derived_estimates(l2a_dataset)
+
+    # TOF / Mass-spec Fitting
+    l2a_dataset["tof_peak_area_under_fit"].data = np.full(
+        l2a_dataset["tof_peak_area_under_fit"].shape, np.nan
+    )
+
+    l2a_dataset["tof_peak_chi_square"].data = np.full(
+        l2a_dataset["tof_peak_chi_square"].shape, np.nan
+    )
+
+    l2a_dataset["tof_peak_fit_parameters"].data = np.full(
+        l2a_dataset["tof_peak_fit_parameters"].shape, np.nan
+    )
+
+    l2a_dataset["tof_peak_kappa"].data = np.full(
+        l2a_dataset["tof_peak_kappa"].shape, np.nan
+    )
+
+    l2a_dataset["tof_peak_reduced_chi_square"].data = np.full(
+        l2a_dataset["tof_peak_reduced_chi_square"].shape, np.nan
+    )
+
+    l2a_dataset["tof_snr"].data = np.full(l2a_dataset["tof_snr"].shape, np.nan)
+
+    l2a_dataset["mass"].data = np.full(l2a_dataset["mass"].shape, np.nan)
+
+    l2a_dataset["mass_scale"].data = np.full(l2a_dataset["mass_scale"].shape, np.nan)
+    # End NaN block
+
     logger.info("IDEX L2A science data processing completed.")
     l2a_dataset.attrs.update(idex_attrs.get_global_attributes("imap_idex_l2a_sci"))
     return l2a_dataset
+
+
+def _mask_non_science_derived_estimates(l2a_dataset: xr.Dataset) -> None:
+    """Mask velocity and mass estimates for non-science events.
+
+    Fits and fitted charges remain available for diagnostics in all instrument
+    modes. The six derived velocity and mass estimates are only valid for
+    events classified as Science Events.
+
+    Parameters
+    ----------
+    l2a_dataset : xarray.Dataset
+        L2A dataset containing the Science Event flag and derived estimates.
+    """
+    if "science_event_flag" not in l2a_dataset:
+        logger.debug(
+            "Science event flag is not present; skipping non-science estimate masking."
+        )
+        return
+
+    science_event = l2a_dataset["science_event_flag"] == 1
+    for waveform_name in ("target_low", "target_high", "ion_grid"):
+        for estimate_name in (
+            f"{waveform_name}_velocity_estimate",
+            f"{waveform_name}_dust_mass_estimate",
+        ):
+            l2a_dataset[estimate_name] = l2a_dataset[estimate_name].where(science_event)
+
+
+def _mask_saturated_derived_estimates(l2a_dataset: xr.Dataset) -> None:
+    """Mask fitted charges and derived estimates for saturated waveforms.
+
+    Fit parameters remain available for diagnostics. Impact charge, velocity,
+    and mass estimates are not scientifically valid when their source waveform
+    is saturated.
+
+    Parameters
+    ----------
+    l2a_dataset : xarray.Dataset
+        L2A dataset containing waveform saturation flags and derived estimates.
+    """
+    for waveform_name in ("target_low", "target_high", "ion_grid"):
+        saturation_flag = f"{waveform_name}_saturation_flag"
+        if saturation_flag not in l2a_dataset:
+            raise KeyError(
+                f"Required L2A saturation flag is missing: {saturation_flag}"
+            )
+        invalid = l2a_dataset[saturation_flag] == 1
+        for estimate_name in (
+            f"{waveform_name}_impact_charge",
+            f"{waveform_name}_velocity_estimate",
+            f"{waveform_name}_dust_mass_estimate",
+        ):
+            l2a_dataset[estimate_name] = l2a_dataset[estimate_name].where(~invalid)
 
 
 def calculate_velocity_and_mass(
@@ -318,11 +431,11 @@ def calculate_velocity_and_mass(
     Parameters
     ----------
     sig_amp : float
-        Signal amplitude.
+        Signal amplitude (pC).
     t_rise : float
-        T_rise fit parameter from the target fit.
+        T_rise fit parameter from the target fit (us).
     t_rise_params : np.ndarray
-        Calibration parameters for rise time.
+        Calibration parameters for rise time (us).
     yield_params : np.ndarray
         Calibration parameters for yield.
 
@@ -333,57 +446,197 @@ def calculate_velocity_and_mass(
     mass_est : float
         Estimated mass.
     """
-    log_a_t: float = np.log10(t_rise_params[0])
-    try:
-        root = root_scalar(
-            lambda lv: log_smooth_powerlaw(lv, log_a_t, t_rise_params[1:])
-            - np.log10(t_rise),
-            bracket=[-1, 2],
-        )
-        v_est = 10**root.root
-    except Exception:
-        logger.error(
-            "Unable to calculate velocity and mass estimate. "
-            "The root finding failed for power law function. "
-            "Returning nans for the estimate."
-        )
+    v_est = invert_rise_time_to_velocity(t_rise, t_rise_params)
+    if not np.isfinite(v_est):
         return np.nan, np.nan
 
-    log_a_y: float = np.log10(yield_params[0])
-    yield_val = 10 ** log_smooth_powerlaw(np.log10(v_est), log_a_y, yield_params[1:])
-    mass_est = sig_amp / yield_val
-
-    return v_est, mass_est
+    return v_est, calculate_mass_from_velocity(sig_amp, v_est, yield_params)
 
 
-def log_smooth_powerlaw(log_v: float, log_a: float, params: np.ndarray) -> float:
-    """
-    Define a smoothly transitioning power law to fit the calibration curve to.
+def calculate_ion_grid_velocity_and_mass(
+    ion_grid_charge: float,
+    target_high_charge: float,
+    target_low_charge: float,
+    target_high_saturated: int,
+    target_low_saturated: int,
+    ion_grid_saturated: int,
+    yield_params: np.ndarray,
+) -> tuple[float, float]:
+    """Estimate Ion Grid velocity and mass from the best target charge.
+
+    Target High is preferred when it is unsaturated. Target Low is used only
+    when Target High is saturated or has no finite fitted charge. If both
+    target channels are saturated, or Ion Grid is saturated, both estimates
+    are invalid. Fractional Ion Grid-to-target charge ratios outside the
+    inclusive range [0.01, 1.0] also invalidate both estimates. The velocity
+    calibration uses the charge ratio expressed as a percentage.
 
     Parameters
     ----------
-    log_v : float
-        Velocity.
-    log_a : float
-        Scale factor.
-    params : np.ndarray
-        Calibration parameters for the power law.
+    ion_grid_charge : float
+        Fitted Ion Grid impact charge in pC.
+    target_high_charge, target_low_charge : float
+        Fitted target impact charges in pC.
+    target_high_saturated, target_low_saturated, ion_grid_saturated : int
+        Saturation flags for the corresponding channels.
+    yield_params : numpy.ndarray
+        Charge-yield calibration parameters.
+
+    Returns
+    -------
+    tuple[float, float]
+        Ion Grid velocity in km/s and mass in kg.
+    """
+    if int(ion_grid_saturated) == 1:
+        return np.nan, np.nan
+
+    target_charge = np.nan
+    if int(target_high_saturated) == 0 and np.isfinite(target_high_charge):
+        target_charge = float(target_high_charge)
+    elif int(target_low_saturated) == 0 and np.isfinite(target_low_charge):
+        target_charge = float(target_low_charge)
+
+    if not (np.isfinite(ion_grid_charge) and np.isfinite(target_charge)):
+        return np.nan, np.nan
+    target_charge = abs(target_charge)
+    ion_grid_charge = abs(float(ion_grid_charge))
+    if target_charge <= 0.0 or ion_grid_charge <= 0.0:
+        return np.nan, np.nan
+
+    charge_ratio = ion_grid_charge / target_charge
+    if not 0.01 <= charge_ratio <= 1.0:
+        return np.nan, np.nan
+
+    # The empirical velocity calibration expects percent, not a fractional ratio.
+    velocity_estimate = (
+        idex_constants.ION_GRID_VELOCITY_SCALE
+        * (100.0 * charge_ratio) ** idex_constants.ION_GRID_VELOCITY_EXPONENT
+        + idex_constants.ION_GRID_VELOCITY_OFFSET
+    )
+    mass_estimate = calculate_mass_from_velocity(
+        target_charge, velocity_estimate, yield_params
+    )
+    return velocity_estimate, mass_estimate
+
+
+def calculate_mass_from_velocity(
+    sig_amp: float, velocity_estimate: float, yield_params: np.ndarray
+) -> float:
+    """Calculate dust mass from fitted charge and an estimated velocity.
+
+    Parameters
+    ----------
+    sig_amp : float
+        Fitted signal amplitude in pC.
+    velocity_estimate : float
+        Estimated impact velocity in km/s.
+    yield_params : numpy.ndarray
+        Charge-yield calibration parameters.
 
     Returns
     -------
     float
-        The value of the power law at the given velocity.
+        Estimated dust mass in kg.
+    """
+    if not np.isfinite(sig_amp) or not np.isfinite(velocity_estimate):
+        return np.nan
+
+    log_a_y: float = float(yield_params[0])
+    yield_val = 10 ** log_smooth_powerlaw(
+        np.log10(velocity_estimate), log_a_y, yield_params[1:]
+    )
+    sig_amp_coulombs = sig_amp * idex_constants.PICOCOULOMB_TO_COULOMB
+    mass_est = sig_amp_coulombs / yield_val
+
+    return mass_est
+
+
+def invert_rise_time_to_velocity(t_rise: float, t_rise_params: np.ndarray) -> float:
+    """
+    Invert the rise-time calibration to estimate impact velocity.
+
+    The rise-time calibration is defined in the forward direction as
+    rise_time = f(velocity). This helper numerically inverts that relation to recover
+    velocity from a fitted rise time.
+
+    Parameters
+    ----------
+    t_rise : float
+        Fitted target rise time in microseconds.
+    t_rise_params : np.ndarray
+        Calibration parameters for the forward rise-time curve
+        [A, a1, a2, a3, vb, vc, k, m].
+
+    Returns
+    -------
+    float
+        Estimated impact velocity in km/s, or NaN if the inversion fails.
+    """
+    if not np.isfinite(t_rise) or t_rise <= 0.0:
+        logger.error(
+            "Unable to calculate velocity estimate from rise time %.6g. "
+            "Rise time must be finite and positive. Returning nan.",
+            t_rise,
+        )
+        return np.nan
+
+    log_a_t: float = float(t_rise_params[0])
+    target_log_t_rise = np.log10(t_rise)
+    try:
+        root = root_scalar(
+            lambda log_v: (
+                log_smooth_powerlaw(log_v, log_a_t, t_rise_params[1:])
+                - target_log_t_rise
+            ),
+            bracket=[-1, 2],
+            method="brentq",
+        )
+        return 10**root.root
+    except Exception:
+        logger.error(
+            "Unable to calculate velocity estimate from rise time %.6g. "
+            "The rise-time calibration inversion failed. Returning nan.",
+            t_rise,
+        )
+        return np.nan
+
+
+def log_smooth_powerlaw(log_v: float, log_a: float, params: np.ndarray) -> float:
+    """
+    Define a smoothly transitioning power law used by the IDEX calibration curves.
+
+    This helper is used in two ways:
+    - rise-time calibration: log10(velocity [km/s]) to log10(rise_time [us])
+    - yield calibration: log10(velocity [km/s]) to log10(charge_yield [C/kg])
+
+    Parameters
+    ----------
+    log_v : float
+        The log10 input to the calibration curve.
+        This is log10(velocity [km/s]) for both the rise-time and yield cases.
+    log_a : float
+        Log10 of the calibration scale factor A.
+    params : np.ndarray
+        Calibration parameters for the power law
+        [a1, a2, a3, vb, vc, k, m].
+
+    Returns
+    -------
+    float
+        The calibrated log10 output.
+        This is either log10(rise_time [us]) for the rise-time case or
+        log10(charge_yield [C/kg]) for the yield case.
     """
     # Unpack the rest of the calibration parameters
     # a1, a2, and a3 are the power law exponents for the low, medium, and high-velocity
     # segments.
     # vb and vc are the characteristic speeds where the slope transition happens, and k
     # setting the sharpness of the transitions.
-    a1, a2, a3, vb, vc, _k, m = params
+    a1, a2, a3, vb, vc, k, _m = params
     v = 10**log_v
     base = log_a + a1 * log_v
-    transition1 = (1 + (v / vb) ** m) ** ((a2 - a1) / m)
-    transition2 = (1 + (v / vc) ** m) ** ((a3 - a2) / m)
+    transition1 = (1 + (v / vb) ** k) ** ((a2 - a1) / k)
+    transition2 = (1 + (v / vc) ** k) ** ((a3 - a2) / k)
     return base + np.log10(transition1 * transition2)
 
 
@@ -748,7 +1001,8 @@ def calculate_area_under_emg(time_slice: np.ndarray, param: np.ndarray) -> float
 def estimate_dust_mass(
     low_sampling_time: xr.DataArray,
     target_signal: xr.DataArray,
-    remove_noise: bool = True,
+    remove_noise: bool = False,
+    waveform_name: str = "",
 ) -> tuple[NDArray, float, float, float, NDArray]:
     """
     Filter and fit the target or ion grid signals to get the total dust impact charge.
@@ -756,12 +1010,14 @@ def estimate_dust_mass(
     Parameters
     ----------
     low_sampling_time : xarray.DataArray
-        The low sampling time array.
+        The low sampling time array in microseconds.
     target_signal : xarray.DataArray
         Target signal data.
     remove_noise : bool
         If true, attempt to remove background noise, otherwise fit on the unfiltered
         signal.
+    waveform_name : str
+        Channel name used to select channel-specific fit bounds.
 
     Returns
     -------
@@ -781,34 +1037,62 @@ def estimate_dust_mass(
     """
     signal = np.array(target_signal.data)
     time = np.array(low_sampling_time.data)
-    good_mask = np.logical_and(
-        time >= BaselineNoiseTime.START,
-        time <= BaselineNoiseTime.STOP,
-    )
+    # window_start = float(np.min(time))
+    window_stop = float(np.min(time)) + 5.0
+    # good_mask = np.logical_and(time >= window_start, time <= window_stop)
+    good_mask = time <= window_stop
     if not np.any(good_mask):
         logger.warning(
             "Unable to find baseline noise. "
-            f"There is no signal from {BaselineNoiseTime.START} to "
-            f"{BaselineNoiseTime.STOP} ns."
+            f"There is no signal in the first 5 microseconds of the waveform "
+            f"(Beginning to {window_stop} us)."
         )
     if remove_noise:
-        # Remove noise due to "microphonics"
-        signal = remove_signal_noise(time, signal, good_mask)
-    # Time before image charge
-    pre = -2.0
-    # Get signal values where the time is before the image charge
-    signal_before_imapact = signal[time < pre]
-    # Center the baseline signal around zero
-    signal_baseline = signal_before_imapact - np.mean(signal_before_imapact)
+        logger.debug(
+            "estimate_dust_mass fits the raw low-rate waveform directly; "
+            "remove_noise is ignored for this fit path."
+        )
+    signal_before_impact = signal[good_mask]
+    baseline_mean = float(np.mean(signal_before_impact))
+    channel_name = waveform_name or str(getattr(target_signal, "name", ""))
 
     # Initial Guess for the parameters of the ion grid signal
     time_of_impact = 0.0  # Time of dust hit
-    constant_offset = 0.0  # Initial baseline
-    amplitude: float = np.max(signal)  # Signal height
-    rise_time = 0.371  # How fast the signal rises (s)
-    discharge_time = 0.371  # How fast signal decays (s)
+    constant_offset = baseline_mean
+    signal_relative_to_baseline = np.asarray(signal - baseline_mean, dtype=float)
+    if np.any(np.isfinite(signal_relative_to_baseline)):
+        amplitude = float(
+            signal_relative_to_baseline[
+                np.nanargmax(np.abs(signal_relative_to_baseline))
+            ]
+        )
+    else:
+        amplitude = float("nan")
+    if channel_name != "Ion_Grid" and (not np.isfinite(amplitude) or amplitude <= 0.0):
+        amplitude = float(np.max(signal) - baseline_mean)
+    if not np.isfinite(amplitude):
+        amplitude = float(np.max(signal))
+    if channel_name != "Ion_Grid" and amplitude <= 0.0:
+        amplitude = float(np.max(signal))
 
-    p0 = [time_of_impact, constant_offset, amplitude, rise_time, discharge_time]
+    rise_time_0 = 0.371  # How fast the signal rises (us)
+    discharge_time_0 = 37.1  # How fast signal decays (us)
+
+    p0 = [time_of_impact, constant_offset, amplitude, rise_time_0, discharge_time_0]
+    positive_min = float(np.finfo(float).eps)
+    amplitude_lower_bound: float = positive_min
+    amplitude_upper_bound: float = float(np.inf)
+    if channel_name == "Ion_Grid":
+        if np.isfinite(amplitude) and amplitude < 0.0:
+            amplitude_lower_bound = float(-np.inf)
+            amplitude_upper_bound = -positive_min
+        else:
+            amplitude_lower_bound = positive_min
+            amplitude_upper_bound = float(np.inf)
+    bounds = (
+        [-np.inf, -np.inf, amplitude_lower_bound, positive_min, positive_min],
+        [np.inf, np.inf, amplitude_upper_bound, np.inf, np.inf],
+    )
 
     try:
         with np.errstate(invalid="ignore", over="ignore"):
@@ -817,6 +1101,7 @@ def estimate_dust_mass(
                 time,
                 signal,
                 p0=p0,
+                bounds=bounds,
                 maxfev=100_000,  # , epsfcn=1e-10
             )
     except RuntimeError as e:
@@ -835,8 +1120,11 @@ def estimate_dust_mass(
         )
 
     impact_fit = fit_impact(time, *param)
-    # Calculate the resulting signal amplitude after removing baseline noise
-    sig_amp = max(impact_fit) - np.mean(signal_baseline)
+    # Evaluate the analytic extremum of the fitted pulse instead of relying on the
+    # discrete sample grid.
+    t_max = param[0] + param[3] * np.log((param[4] / param[3]) + 1.0)
+    y_max = float(fit_impact(np.asarray([t_max], dtype=float), *param)[0])
+    sig_amp = abs(float(y_max - param[1]))
     chisqr, redchi = chi_square(signal, impact_fit, len(p0))
 
     return param, float(sig_amp), chisqr, redchi, impact_fit
@@ -856,13 +1144,13 @@ def fit_impact(
     Parameters
     ----------
     time : np.ndarray
-        Time values for the signal.
+        Time values for the signal (us).
     time_of_impact : float
-        Time of dust impact.
+        Time of dust impact (us).
     constant_offset : float
         Initial baseline noise.
     amplitude : float
-        Signal height.
+        Signal height (pC).
     rise_time : float
         How fast the signal rises (s).
     discharge_time : float
