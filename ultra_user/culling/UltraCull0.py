@@ -6,22 +6,32 @@ import ultra_user.data_access.MyUltraFile as MyUltraFile
 import numpy.typing as npt
 import imap_processing.spice.time as spiceTime
 import ultra_user.planets.ENA_planets as ENA_planets
+import ultra_user.instrumentConfig.calPointings as calPointings
 
 
 class UltraCull0():
     def __init__(self, repoint: int, energy_ranges: npt.NDArray, spin_range=20, rootDir='data/imap',
-                 sensor='90', earthAng45=np.radians(20), sep_threshold_per_spin=None):
+                 sensor='90', earthAng45=np.radians(20), sep_threshold_per_spin=None, useRawOnly=False):
+        cp = calPointings.CalPointings(sensor=sensor)
+        self.calPeriod = cp.getCalPeriod(repoint)
         if sep_threshold_per_spin is None:
-            sep_threshold_per_spin = np.array([4., 2., 1.20, 0.45, 0.1, .1])
+            thresholds = cp.get_cull_thresholds_from_pointing(repoint)
+            threshPerSpin = thresholds/spin_range
+            sep_threshold_per_spin = np.append(threshPerSpin,threshPerSpin[-1])
+            #superceded by cal file
+            #sep_threshold_per_spin = np.array([4., 2., 1.20, 0.45, 0.1, .1])
             # revised 3/31/26
             #sep_threshold_per_spin = np.array([4., 2., 1.25, 0.9, 0.2,.2])
         self.sep_threshold_per_spin = sep_threshold_per_spin
+        self.useRawOnly = useRawOnly
         self.currentMask = None
         self.repoint = repoint
+        self.priConfig = cp.get_priority_config_from_pointing(repoint)
         self.energy_ranges = energy_ranges
         self.sensor = sensor
         self.earthAng45 = earthAng45
         self.de = MyUltraFile.L1Bde(repoint, rootDir=rootDir,sensor=sensor).data
+        self.p1de = MyUltraFile.L1Bp1de(repoint, rootDir=rootDir,sensor=sensor).data
         self.xspin = MyUltraFile.L1Bxspin(repoint, rootDir=rootDir,sensor=sensor).data
         self.status = MyUltraFile.L1Bstatus(repoint, rootDir=rootDir,sensor=sensor).data
         self.spin_range = spin_range
@@ -41,6 +51,13 @@ class UltraCull0():
                 self.binTimes[kc, 1] = self.xspin['spin_start_time'][lastInd] + self.xspin['spin_period'][lastInd]
             kc = kc + 1
 
+    def de_for_iebin(self,iebin:int):
+        #assumes highest energy bin is sometimes not included in p1
+        if ((iebin == len(self.energy_ranges[:, 0])-1) and self.priConfig == 'p0') or self.useRawOnly:
+            return self.de
+        return self.p1de
+
+
     def get_count_summary(self) -> npt.NDArray[int]:
         cnts = np.ndarray((self.n_spinbin, len(self.energy_ranges[:, 0])))
         for ic in range(len(self.energy_ranges[:, 0])):
@@ -53,27 +70,56 @@ class UltraCull0():
                 cnts[jc, ic] = len(jj0[0])
         return cnts
 
-    def goodEventMet(self, ieBin:int) -> npt.NDArray:
+    def goodEventIndex(self, ieBin:int):
         ebin_range = [1, 19]
+        myDe = self.de_for_iebin(ieBin)
         ii = np.nonzero(np.logical_and(np.logical_and(
             np.logical_and(
                 np.logical_and(np.logical_and(
-                    np.logical_and(self.de['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
-                                   self.de['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
-                    self.de['quality_outliers'] == 0), self.de['quality_scattering'] == 0),
-                self.de['ebin'] >= ebin_range[0]), self.de['ebin'] <= ebin_range[1]),self.de['event_times']>0))[0]
+                    np.logical_and(myDe['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
+                                   myDe['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
+                    myDe['quality_outliers'] == 0), myDe['quality_scattering'] == 0),
+                myDe['ebin'] >= ebin_range[0]), myDe['ebin'] <= ebin_range[1]),myDe['event_times']>0))[0]
         if self.sensor == '45' and len(ii)>0:
-            t0 = np.mean(self.de['event_times'][ii])
+            t0 = np.mean(myDe['event_times'][ii])
             try:
                 earth = ENA_planets.ENA_planets(t0)
-                local_uv = earth.local_uvec(self.de['velocity_dps_sc'][ii, :])
+                local_uv = earth.local_uvec(myDe['velocity_dps_sc'][ii, :])
                 coslim = np.cos(self.earthAng45)
                 jj = np.nonzero(np.abs(local_uv[0, :] < coslim))[0]
                 ii = ii[jj]
             except:
                 print(f"No DPS frame data for {self.repoint}, t0 = {spiceTime.et_to_utc(t0)} ({t0})")
                 ii = []
-        return self.de['de_event_met'][ii]
+        return ii
+
+    def goodEventMet(self, ieBin: int) -> npt.NDArray:
+        ii = self.goodEventIndex(ieBin)
+        myDe = self.de_for_iebin(ieBin)
+        return myDe['de_event_met'][ii]
+
+    def goodEventMetOld(self, ieBin:int) -> npt.NDArray:
+        ebin_range = [1, 19]
+        myDe = self.de_for_iebin(ieBin)
+        ii = np.nonzero(np.logical_and(np.logical_and(
+            np.logical_and(
+                np.logical_and(np.logical_and(
+                    np.logical_and(myDe['energy_spacecraft'] > self.energy_ranges[ieBin, 0],
+                                   myDe['energy_spacecraft'] < self.energy_ranges[ieBin, 1]),
+                    myDe['quality_outliers'] == 0), myDe['quality_scattering'] == 0),
+                myDe['ebin'] >= ebin_range[0]), myDe['ebin'] <= ebin_range[1]), myDe['event_times']>0))[0]
+        if self.sensor == '45' and len(ii)>0:
+            t0 = np.mean(myDe['event_times'][ii])
+            try:
+                earth = ENA_planets.ENA_planets(t0)
+                local_uv = earth.local_uvec(myDe['velocity_dps_sc'][ii, :])
+                coslim = np.cos(self.earthAng45)
+                jj = np.nonzero(np.abs(local_uv[0, :] < coslim))[0]
+                ii = ii[jj]
+            except:
+                print(f"No DPS frame data for {self.repoint}, t0 = {spiceTime.et_to_utc(t0)} ({t0})")
+                ii = []
+        return myDe['de_event_met'][ii]
 
     def get_dvolt_summary(self) -> (npt.NDArray[float], npt.NDArray[float], npt.NDArray[float]):
         dvMean = np.full(self.n_spinbin, np.nan)
@@ -198,6 +244,7 @@ class UltraCull0():
         result["iterations"] = nit
         result["mask"] = mask
         result["std_diff"] = std_diff
+
         if apply:
             self.add_mask(mask, f"statistical: converged={conv}, thresh={std_thresh}")
         return result
@@ -269,7 +316,7 @@ class UltraCull0():
             weights[ii] += 1
         kk = np.nonzero(weights > 0)[0]
         totalScaled = sumScaled_cnts[kk]
-        totalMean = np.mean(totalScaled)
+        totalMean = np.mean(totalScaled) if len(totalScaled) > 0 else 0
         thresh = totalMean + sigThreshold * np.sqrt(totalMean)
         jj = np.nonzero(totalScaled > thresh)[0]
         for ic in range(len(mask[:,0])):
@@ -282,33 +329,21 @@ class UltraCull0():
         result['thresh'] = thresh
         return result
 
+    def getSpinCull(self,eChan:int,spins:np.ndarray):
+        mask = self.currentMask['bin_mask'][eChan,:]
+        bin_edges = np.append(self.spinbins[:, 0], self.spinbins[-1, 1])
+        bini = np.digitize(spins, bin_edges)-1
+        kk = np.nonzero(bini >= np.size(mask))[0]
+        bini[kk] = np.size(mask)-1
+        return mask[bini]
 
-#
-#        for ic in range(nch):
-#            ii = np.nonzero(mask[channels[ic], :])[0]
-#            cntmean[ic] = np.mean(csum[ii, ic])
-#            cntstd[ic] = np.std(csum[ii, ic])
-#            scaled_cnt[ii, ic] = (csum[ii, ic] - cntmean[ic]) / cntstd[ic]
-#            #sumScaled_cnts[ii] += scaled_cnt[ii, ic] * cntstd[ic]
-#            #weights[ii] += cntstd[ic]
-#            sumScaled_cnts[ii] += scaled_cnt[ii, ic]
-#            weights[ii] += 1
-#            sumScaled_cnts0[ii] += scaled_cnt[ii, ic] * np.sqrt(cntmean[ic])
-#        kk = np.nonzero(weights > 0)[0]
-#        totalScaled = sumScaled_cnts[kk] / weights[kk]
-#        totalMean = np.mean(totalScaled)
-#        totalStd = np.std(totalScaled)
-#        thresh = totalMean + sigThreshold*totalStd
-#        jj = np.nonzero(totalScaled > thresh)[0]
-#        for ic in range(len(mask[:,0])):
-#            mask[ic,jj] = False
-#        result["mask"] = mask
-#        if apply is True:
-#            self.add_mask(mask, opName="Upstream ion cull")
-#        result['totalScaled'] = totalScaled
-#        result['scaled_counts'] = scaled_cnt
-#        result['thresh'] = thresh
-#        return result
+    def culledDE_indices(self,eChan:int):
+        myDe = self.de_for_iebin(eChan)
+        mask = np.full(np.size(myDe['spin']),False)
+        ii = self.goodEventIndex(eChan)
+        spinMask = self.getSpinCull(eChan,myDe['spin'][ii])
+        mask[ii] = spinMask
+        return np.nonzero(mask)[0]
 
 
     def currentCullFraction(self) -> npt.NDArray[float]:

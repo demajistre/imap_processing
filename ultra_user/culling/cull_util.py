@@ -4,7 +4,9 @@ import ultra_user.culling.UltraCull0 as UltraCull0
 import spiceypy
 import matplotlib.pyplot as plt
 import imap_processing.spice.time as spiceTime
-
+import ultra_user.instrumentConfig.calPointings as calPointings
+import traceback
+from scipy.stats import binned_statistic
 
 def l1c_energy_ranges_old(repoint=47, base_ebin=3, n_1cbins=8, set_maxbin: bool = True,
                           maxbin_lim: float = 100) -> np.ndarray:
@@ -45,18 +47,35 @@ def l1c_energy_ranges(repoint=47, base_ebin=0, n_1cbins=8, maxbin_lim: float = 1
     return energy_ranges
 
 
-def get_pointings(start_pointing, end_pointing, sensor='90') -> list:
+def get_pointings(start_pointing, end_pointing, sensor='90', bailat=10) -> list:
     result = list()
+    nEmpty=0;
     for pointing in range(start_pointing, end_pointing):
         files = MyUltraFile.L1Bde(pointing, silent=True, sensor=sensor).fileCandidates()
         if len(files) > 0:
+            nEmpty=0
             result.append(pointing)
+        else:
+            nEmpty+=1
+            if nEmpty > bailat:
+                return result
     return result
+
+def get_pointings_from_calPeriods(calPointing:str,calRoot:str="resource/",sensor:str="90",calPointingFile:str=None,
+                                  bailat=10) -> list:
+    cp = calPointings.CalPointings()
+    if calPointing not in cp.calPeriodList():
+        print(f"{calPointing} not in list of calibration periods ({traceback.format_stack()})")
+    pointingRange = cp.getCalPointings(calPointing)
+    return get_pointings(pointingRange[0], pointingRange[1]+1, sensor=sensor)
+
+
 
 
 def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20,
              n_iter=5,upstream_chans1=None, upstream_chans2=None, spec_chans=None,
-             sep_threshold_per_spin=None, nAddChans=5,cullPackage="serial_hiEnergy_stat",vthresh=3400):
+             sep_threshold_per_spin=None, nAddChans=5,cullPackage="serial_hiEnergy_stat",vthresh=3400,
+             useRawOnly=False,removeBadPointings=True):
     if upstream_chans1 is None:
         upstream_chans1 = [0,1,2]
     if upstream_chans2 is None:
@@ -74,49 +93,107 @@ def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45
     cullFrac = dict()
     for repoint in pointings:
         print(repoint)
-        cullData[repoint] = UltraCull0.UltraCull0(repoint, energy_ranges, sensor=sensor, spin_range=spin_range,
-                                                  earthAng45=earthAng45, sep_threshold_per_spin=sep_threshold_per_spin)
-        cnt_sum[repoint] = cullData[repoint].get_count_summary()
-        vcull[repoint] = cullData[repoint].voltage_cull(v_threshold=vthresh)
-        match cullPackage:
-            case "serial_hiEnergy_stat":
-                ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans)
-                scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
-            case "hiEnergy_upstream_stat_v1":
-                ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans, apply=False)
-                upcull1[repoint] = cullData[repoint].upstream_cull(apply=False,channels=upstream_chans1)
-                upcull2[repoint] = cullData[repoint].upstream_cull(apply=False, channels=upstream_chans2)
-                cullData[repoint].add_mask(ecull[repoint]["mask"], opName="Energy cull - non-serial")
-                cullData[repoint].add_mask(upcull1[repoint]["mask"],
-                                           opName=f"upstream cull - non-serial - channels {upstream_chans1}")
-                cullData[repoint].add_mask(upcull2[repoint]["mask"],
-                                           opName=f"upstream cull - non-serial - channels {upstream_chans2}")
-                scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
-            case "hiEnergy_upstream_spectral_stat_v1":
-                ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans, apply=False)
-                upcull1[repoint] = cullData[repoint].upstream_cull(apply=False,channels=upstream_chans1)
-                upcull2[repoint] = cullData[repoint].upstream_cull(apply=False, channels=upstream_chans2)
-                speccull[repoint] = cullData[repoint].spectral_cull(apply=False, channels=spec_chans)
-                cullData[repoint].add_mask(ecull[repoint]["mask"], opName="Energy cull - non-serial")
-                cullData[repoint].add_mask(upcull1[repoint]["mask"],
-                                           opName=f"upstream cull - non-serial - channels {upstream_chans1}")
-                cullData[repoint].add_mask(upcull2[repoint]["mask"],
-                                           opName=f"upstream cull - non-serial - channels {upstream_chans2}")
-                cullData[repoint].add_mask(speccull[repoint]["mask"], opName="spectral cull - non-serial")
-                scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
-            case "independent_hiEnergy_stat":
-                ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans, apply=False)
-                scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter, apply=False)
-                cullData[repoint].add_mask(ecull[repoint]["mask"], opName="Energy cull - non-serial")
-                cullData[repoint].add_mask(scull[repoint]["mask"], opName="Statistical cull - non-serial")
-        cullFrac[repoint] = cullData[repoint].currentCullFraction()
+        try:
+            cullData[repoint] = UltraCull0.UltraCull0(repoint, energy_ranges, sensor=sensor, spin_range=spin_range,
+                                                  earthAng45=earthAng45, sep_threshold_per_spin=sep_threshold_per_spin,
+                                                  useRawOnly=useRawOnly)
+            cnt_sum[repoint] = cullData[repoint].get_count_summary()
+            vcull[repoint] = cullData[repoint].voltage_cull(v_threshold=vthresh)
+            match cullPackage:
+                case "serial_hiEnergy_stat":
+                    ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans)
+                    scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
+                case "hiEnergy_upstream_stat_v1":
+                    ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans, apply=False)
+                    upcull1[repoint] = cullData[repoint].upstream_cull(apply=False, channels=upstream_chans1)
+                    upcull2[repoint] = cullData[repoint].upstream_cull(apply=False, channels=upstream_chans2)
+                    cullData[repoint].add_mask(ecull[repoint]["mask"], opName="Energy cull - non-serial")
+                    cullData[repoint].add_mask(upcull1[repoint]["mask"],
+                                               opName=f"upstream cull - non-serial - channels {upstream_chans1}")
+                    cullData[repoint].add_mask(upcull2[repoint]["mask"],
+                                               opName=f"upstream cull - non-serial - channels {upstream_chans2}")
+                    scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
+                case "hiEnergy_upstream_spectral_stat_v1":
+                    ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans, apply=False)
+                    upcull1[repoint] = cullData[repoint].upstream_cull(apply=False, channels=upstream_chans1)
+                    upcull2[repoint] = cullData[repoint].upstream_cull(apply=False, channels=upstream_chans2)
+                    speccull[repoint] = cullData[repoint].spectral_cull(apply=False, channels=spec_chans)
+                    cullData[repoint].add_mask(ecull[repoint]["mask"], opName="Energy cull - non-serial")
+                    cullData[repoint].add_mask(upcull1[repoint]["mask"],
+                                               opName=f"upstream cull - non-serial - channels {upstream_chans1}")
+                    cullData[repoint].add_mask(upcull2[repoint]["mask"],
+                                               opName=f"upstream cull - non-serial - channels {upstream_chans2}")
+                    cullData[repoint].add_mask(speccull[repoint]["mask"], opName="spectral cull - non-serial")
+                    scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter)
+
+                case "independent_hiEnergy_stat":
+                    ecull[repoint] = cullData[repoint].high_energy_cull(nAddChans=nAddChans, apply=False)
+                    scull[repoint] = cullData[repoint].statistical_cull(n_iter=n_iter, apply=False)
+                    cullData[repoint].add_mask(ecull[repoint]["mask"], opName="Energy cull - non-serial")
+                    cullData[repoint].add_mask(scull[repoint]["mask"], opName="Statistical cull - non-serial")
+            cullFrac[repoint] = cullData[repoint].currentCullFraction()
+        except:
+            print(f"data for repoint {repoint} not found, repoint ignored")
+            if removeBadPointings:
+                pointings.remove(repoint)
 
     return {'cullData': cullData, 'ecull': ecull, 'scull': scull, 'vcull': vcull,'upcull1': upcull1,'upcull2': upcull2,
             'speccull':speccull,'cnt_sum': cnt_sum,
             'cullFrac': cullFrac, 'cullPackage': cullPackage}
 
+def cntSummary(cull:dict,repointings:list = None,loud=False)->dict:
+    cullData = cull['cullData']
+    if repointings is None:
+        repointings = list(cullData.keys())
+    cntsum = 0
+    spinbins = 0
+    bintimes = 0
+    lvMask = 0
+    for ic, rp in enumerate(repointings):
+        if loud: print(f"{rp} : {ic} of {len(repointings)}")
+        ii = np.where(cull['cullData'][rp].voltage_cull()['binMask'])[0]
+        if ic == 0:
+            cntsum = cull['cullData'][rp].get_count_summary()[ii, :]
+            spinbins = np.array(cull['cullData'][rp].spinbins)[ii, :]
+            bintimes = cull['cullData'][rp].binTimes[ii, :]
+            lvMask = cull['cullData'][rp].voltage_cull()['binMask']
+        else:
+            cntsum = np.concatenate((cntsum, cull['cullData'][rp].get_count_summary()[ii, :]), axis=0)
+            spinbins = np.concatenate((spinbins, np.array(cull['cullData'][rp].spinbins)[ii, :]), axis=0)
+            bintimes = np.concatenate((bintimes, cull['cullData'][rp].binTimes[ii, :]), axis=0)
+            lvMask = np.concatenate((lvMask, cull['cullData'][rp].voltage_cull()['binMask']))
+    return {'cntsum':cntsum, 'spinbins':spinbins, 'bintimes':bintimes,'lvMask':lvMask, 'repointings':repointings}
 
-def cullplot(cull: dict,repointings:list = None, echans: list = None,
+def sepStats(cull:dict, repointings:list = None, loud=False, binsize=None, maxval= None)->dict:
+    if binsize is None:
+        binsize = [20,5,5,2,1]
+    if maxval is None:
+        maxval = [700, 150, 80, 80, 80]
+
+    cullCounts= cntSummary(cull, repointings, loud = loud)
+    cntShape = np.shape(cullCounts['cntsum'])
+    sepStat = dict()
+    for ic in range(0, cntShape[1] - 1):
+        bavg, bedge, bn0 = binned_statistic(cullCounts['cntsum'][:, cntShape[1] - 1], cullCounts['cntsum'][:, ic],
+                                            bins=range(0, maxval[ic], binsize[ic]))
+        bstd, bedge, bn0 = binned_statistic(cullCounts['cntsum'][:, cntShape[1] - 1], cullCounts['cntsum'][:, ic],
+                                            statistic='std', bins=range(0, maxval[ic], binsize[ic]))
+        bcount, bedge, bn0 = binned_statistic(cullCounts['cntsum'][:, cntShape[1] - 1], cullCounts['cntsum'][:, ic],
+                                              statistic='count', bins=range(0, maxval[ic], binsize[ic]))
+        sepStat[ic] = {'avg': bavg, 'std': bstd, 'count': bcount, 'errMean': bstd / np.sqrt(bcount),
+                       'bedge': bedge, 'bcen': (bedge[0:-1] + bedge[1:]) * .5, 'bn0': bn0}
+    cumfrac = np.ndarray(1000)
+    cumbin = range(1, 1001)
+    btot = np.size(cullCounts['spinbins']) / 2
+    for ic in range(1, 1001):
+        cumfrac[ic - 1] = np.size(np.nonzero(cullCounts['cntsum'][:, 5] < ic)[0]) / btot
+    cullCounts['sepStat'] = sepStat
+    cullCounts['sepCumfrac']= cumfrac
+    cullCounts['sepCumbin']= cumbin
+    return cullCounts
+
+
+def cullplot(cull: dict,repointings:list = None, echans: list = None,addTitle='',
              loud=False, start_utc="2026-01-01T00", chan_lims=False,rawOnly=False,saveFile=None):
     if echans is None:
         echans = [0, 1, 2, 3, 4]
@@ -147,7 +224,7 @@ def cullplot(cull: dict,repointings:list = None, echans: list = None,
         axs[ech].set_ylim(0, chan_lims[ech])
         axs[ech].set_ylabel(f"counts ({ech})")
     axs[nch - 1].set_xlabel(f"days since {start_utc}")
-    fig.suptitle(f"Ultra {cull['cullData'][repointings[0]].sensor}")
+    fig.suptitle(f"Ultra {cull['cullData'][repointings[0]].sensor}{addTitle}")
     if saveFile is not None:
         plt.savefig(saveFile)
     plt.show()

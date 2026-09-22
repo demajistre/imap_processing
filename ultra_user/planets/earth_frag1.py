@@ -77,6 +77,15 @@ for ip in repointings45:
 sum1d = np.sum(cnt1d,axis=0)
 sum2d = np.sum(cnt2d,axis=0)
 
+plt.imshow(sum2d[7,:,:],extent=(-45,45,-45,45),aspect='auto')
+title=f"Earth Image {energy_ranges[7,0]:.2f}-{energy_ranges[7,1]:.2f} kev"
+plt.title(title)
+plt.colorbar(label='Counts')
+plt.xlabel('Azimuth (deg)')
+plt.ylabel('Elevation (deg)')
+plt.savefig('/Users/demajr1/files/imap_ultra/culling/cullpaper/earth_image.png')
+plt.show()
+
 epower = np.zeros_like(sum1d)
 scale1d = 1./np.sin(np.radians(angGrid+0.5))
 
@@ -90,6 +99,18 @@ plt.xlabel("Angle from Earth (degrees)")
 plt.ylabel("Normalized Counts")
 plt.legend()
 plt.show()
+
+for ie in range(nen):
+    plt.plot(angGrid + .5, epower[ie, :],label=f"{energy_ranges[ie,0]:.2f}-{energy_ranges[ie,1]:.2f} kev")
+plt.xlabel("Angle from Earth (degrees)")
+plt.ylabel("Normalized Counts")
+plt.yscale('log')
+title=f"Earth Image {energy_ranges[7,0]:.2f}-{energy_ranges[7,1]:.2f} kev"
+plt.title(title)
+plt.legend()
+plt.savefig('/Users/demajr1/files/imap_ultra/culling/cullpaper/earth_plot.png')
+plt.show()
+
 
 for ie in range(nen):
     plt.plot((angGrid + .5)/.25, epower[ie, :],label=f"{energy_ranges[ie,0]:.2f}-{energy_ranges[ie,1]:.2f} kev")

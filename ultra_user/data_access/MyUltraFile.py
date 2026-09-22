@@ -42,10 +42,22 @@ class MyUltraFile:
         verNames = list()
         vers = list()
         for candidate in candidates:
-            vName = candidate.split('_')[-1].split('.')[0].lstrip('v')
-            verNames.append(vName)
-            v = int(vName)
-            vers.append(v)
+            #vName = candidate.split('_')[-1].split('.')[0].lstrip('v')
+            #verNames.append(vName)
+            #v = int(vName)
+            #vers.append(v)
+            vNames = candidate.split('_')[-1].split('.')
+            v0 = vNames[0].lstrip('v')
+            if np.size(vNames) ==2:
+                vName = v0
+                verNames.append(vName)
+                v = int(vName)
+                vers.append(v)
+            else:
+                v1 = vNames[1]
+                verNames.append(f"{v0}.{v1}")
+                v = int(v0)*10000+int(v1)
+                vers.append(v)
         fileName = candidates[np.argsort(vers)[-1]]
         if self.version != 'Latest':
             try:
