@@ -5,10 +5,10 @@ import pytest
 import xarray as xr
 
 from imap_processing import imap_module_directory
-from imap_processing.cdf.utils import load_cdf
 from imap_processing.idex.idex_constants import SPICE_ARRAYS
 from imap_processing.idex.idex_l1a import PacketParser
 from imap_processing.idex.idex_l1b import idex_l1b
+from imap_processing.idex.idex_l2a import idex_l2a
 
 TEST_DATA_PATH = imap_module_directory / "tests" / "idex" / "test_data"
 
@@ -17,10 +17,8 @@ TEST_L0_FILE_MSG = TEST_DATA_PATH / "imap_idex_l0_raw_20250108_v001.pkts"  # 141
 TEST_L0_FILE_CATLST = TEST_DATA_PATH / "imap_idex_l0_raw_20241206_v001.pkts"  # 1419
 
 L1A_EXAMPLE_FILE = TEST_DATA_PATH / "idex_l1a_validation_file.h5"
-L1B_EXAMPLE_FILE = TEST_DATA_PATH / "imap_idex_l1b_sci_20231218_v002.h5"
-
-L2A_CDF = TEST_DATA_PATH / "imap_idex_l2a_sci-1week_20251017_v001.cdf"
-L1B_MSG_CDF = TEST_DATA_PATH / "imap_idex_l1b_msg_20250108_v001.cdf"
+L1B_EXAMPLE_FILE = TEST_DATA_PATH / "imap_idex_l1b_sci_20231218_v004.h5"
+L1B_MSG_CDF = TEST_DATA_PATH / "imap_idex_l1b_msg-10days_20250108_v001.cdf"
 
 pytestmark = pytest.mark.external_test_data
 
@@ -34,11 +32,11 @@ def decom_test_data_sci() -> xr.Dataset:
     dataset : xarray.Dataset
         A ``xarray`` dataset containing the science test data
     """
-    return PacketParser(TEST_L0_FILE_SCI).data[0]
+    return PacketParser(TEST_L0_FILE_SCI).data["l1a_sci-10days"]
 
 
 @pytest.fixture
-def decom_test_data_catlst() -> xr.Dataset:
+def decom_test_data_catlst() -> list[xr.Dataset]:
     """List of ``xarray`` datasets containing the raw and derived catalog list data.
 
     Returns
@@ -46,7 +44,8 @@ def decom_test_data_catlst() -> xr.Dataset:
     dataset : list[xarray.Dataset]
         A list of ``xarray`` dataset containing the catalog list summary datasets.
     """
-    return PacketParser(TEST_L0_FILE_CATLST).data
+    data = PacketParser(TEST_L0_FILE_CATLST).data
+    return [data["l1a_catlst-10days"], data["l1b_catlst-10days"]]
 
 
 @pytest.fixture
@@ -58,7 +57,7 @@ def decom_test_data_msg() -> xr.Dataset:
     dataset : xarray.Dataset
         ``xarray`` dataset containing the event log data.
     """
-    return PacketParser(TEST_L0_FILE_MSG).data[0]
+    return PacketParser(TEST_L0_FILE_MSG).data["l1a_msg-10days"]
 
 
 @pytest.fixture
@@ -70,7 +69,7 @@ def test_l1b_msg(decom_test_data_msg) -> xr.Dataset:
     dataset : xarray.Dataset
         ``xarray`` dataset containing the event log data.
     """
-    return idex_l1b(decom_test_data_msg, "msg")
+    return idex_l1b(decom_test_data_msg, "msg-10days")
 
 
 @pytest.fixture
@@ -87,7 +86,7 @@ def l1a_example_data(_download_test_data):
 
 
 @pytest.fixture
-def l2a_dataset(l1b_dataset: xr.Dataset) -> xr.Dataset:
+def l2a_dataset(l1b_dataset: xr.Dataset, ancillary_files: dict) -> xr.Dataset:
     """Return a ``xarray`` dataset containing test data.
 
     Returns
@@ -95,8 +94,7 @@ def l2a_dataset(l1b_dataset: xr.Dataset) -> xr.Dataset:
     dataset : xr.Dataset
         A ``xarray`` dataset containing the test data
     """
-    l2a_dataset = load_cdf(L2A_CDF)
-    return l2a_dataset
+    return idex_l2a(l1b_dataset.copy(deep=True), ancillary_files)
 
 
 @pytest.fixture
@@ -124,7 +122,7 @@ def l1b_dataset(mock_get_spice_data, decom_test_data_sci: xr.Dataset) -> xr.Data
     """
 
     mock_get_spice_data.side_effect = get_spice_data_side_effect_func
-    dataset = idex_l1b(decom_test_data_sci, "sci-1week")
+    dataset = idex_l1b(decom_test_data_sci, "sci-10days")
     return dataset
 
 
@@ -143,7 +141,7 @@ def get_spice_data_side_effect_func(l1a_ds, idex_attrs):
     spin_phase_angles = xr.DataArray(
         name="spin_phase",
         dims=["epoch"],
-        data=np.random.randint(0, 360, len(l1a_ds.epoch)),
+        data=np.random.uniform(0.0, 360.0, len(l1a_ds.epoch)),
         attrs=idex_attrs.get_variable_attributes("spin_phase"),
     )
     longitude = xr.DataArray(
@@ -214,5 +212,5 @@ def ancillary_files():
         "l2a-calibration-curve-yield-params": path
         / "imap_idex_l2a-calibration-curve-yield-params_20250101_v001.csv",
         "l2a-calibration-curve-t-rise": path
-        / "imap_idex_l2a-calibration-curve-t-rise_20250101_v001.csv",
+        / "imap_idex_l2a-calibration-curve-t-rise_20250101_v002.csv",
     }

@@ -6,13 +6,16 @@ other CoDICE processing modules.
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 
 import numpy as np
+import xarray as xr
 
 from imap_processing.codice import constants
+from imap_processing.codice.constants import CODICEAPID
 
 
 @dataclass
@@ -42,45 +45,6 @@ class ViewTabInfo:
     sensor: int
     three_d_collapsed: int
     view_id: int
-
-
-class CODICEAPID(IntEnum):
-    """Create ENUM for CoDICE APIDs."""
-
-    COD_AUT = 1120
-    COD_BOOT_HK = 1121
-    COD_BOOT_MEMDMP = 1122
-    COD_COUNTS_COMMON = 1135
-    COD_NHK = 1136
-    COD_EVTMSG = 1137
-    COD_MEMDMP = 1138
-    COD_SHK = 1139
-    COD_RTS = 1141
-    COD_DIAG_CDHFPGA = 1144
-    COD_DIAG_SNSR_HV = 1145
-    COD_DIAG_OPTC_HV = 1146
-    COD_DIAG_APDFPGA = 1147
-    COD_DIAG_SSDFPGA = 1148
-    COD_DIAG_FSW = 1149
-    COD_DIAG_SYSVARS = 1150
-    COD_LO_IAL = 1152
-    COD_LO_PHA = 1153
-    COD_LO_SW_PRIORITY_COUNTS = 1155
-    COD_LO_SW_SPECIES_COUNTS = 1156
-    COD_LO_NSW_SPECIES_COUNTS = 1157
-    COD_LO_SW_ANGULAR_COUNTS = 1158
-    COD_LO_NSW_ANGULAR_COUNTS = 1159
-    COD_LO_NSW_PRIORITY_COUNTS = 1160
-    COD_LO_INST_COUNTS_AGGREGATED = 1161
-    COD_LO_INST_COUNTS_SINGLES = 1162
-    COD_HI_IAL = 1168
-    COD_HI_PHA = 1169
-    COD_HI_INST_COUNTS_AGGREGATED = 1170
-    COD_HI_INST_COUNTS_SINGLES = 1171
-    COD_HI_OMNI_SPECIES_COUNTS = 1172
-    COD_HI_SECT_SPECIES_COUNTS = 1173
-    COD_HI_INST_COUNTS_PRIORITIES = 1174
-    COD_CSTOL_CONFIG = 2457
 
 
 class CoDICECompression(IntEnum):
@@ -153,6 +117,108 @@ def get_view_tab_info(json_data: dict, view_id: int, apid: int) -> dict:
     # 'compression':0}
     view_tab = json_data.get("view_tab").get(f"({view_id}, {apid_hex})")
     return view_tab
+
+
+def get_view_tab_obj(
+    lut_file: Path, table_id: str, view_id: int, apid: int
+) -> tuple[dict, "ViewTabInfo"]:
+    """
+    Read the SCI-LUT and build a ViewTabInfo for the given table ID.
+
+    Parameters
+    ----------
+    lut_file : pathlib.Path
+        Path to the SCI-LUT JSON file.
+    table_id : str
+        Table identifier to extract from the JSON.
+    view_id : int
+        The view ID from the packet.
+    apid : int
+        The APID from the packet.
+
+    Returns
+    -------
+    tuple[dict, ViewTabInfo]
+        The SCI-LUT data dict and a populated ViewTabInfo for the given table ID.
+    """
+    sci_lut_data = read_sci_lut(lut_file, table_id)
+    view_tab_info = get_view_tab_info(sci_lut_data, view_id, apid)
+    view_tab_obj = ViewTabInfo(
+        apid=apid,
+        view_id=view_id,
+        sensor=view_tab_info["sensor"],
+        three_d_collapsed=view_tab_info["3d_collapse"],
+        collapse_table=view_tab_info["collapse_table"],
+        compression=view_tab_info["compression"],
+    )
+    return sci_lut_data, view_tab_obj
+
+
+def process_by_table_id(
+    unpacked_dataset: xr.Dataset,
+    lut_file: Path,
+    process_fn: Callable[..., xr.Dataset],
+) -> xr.Dataset:
+    """
+    Split dataset by unique table_id values, process each group, and recombine.
+
+    This is the shared wrapper logic used by all non-DE/NHK L1A processing
+    functions. It extracts the fields that are uniform across a packet stream
+    (``view_id``, ``apid``, ``plan_id``, ``plan_step``), iterates over every
+    unique ``table_id`` found in the dataset, filters to that group via
+    ``isel``, calls *process_fn* for each group, and finally concatenates the
+    results sorted by epoch.
+
+    Parameters
+    ----------
+    unpacked_dataset : xarray.Dataset
+        Full unpacked dataset from the L0 packet file.
+    lut_file : pathlib.Path
+        Path to the SCI-LUT JSON file passed through to *process_fn*.
+    process_fn : Callable
+        The private ``_process_xxx`` function to call for each table_id group.
+        It must accept the signature
+        ``(group_ds, lut_file, table_id, view_id, apid, plan_id, plan_step)``
+        and return an ``xr.Dataset``.
+
+    Returns
+    -------
+    xarray.Dataset
+        Combined L1A dataset sorted by epoch.
+    """
+    view_id = unpacked_dataset["view_id"].values[0]
+    apid = unpacked_dataset["pkt_apid"].values[0]
+    plan_id = unpacked_dataset["plan_id"].values[0]
+    plan_step = unpacked_dataset["plan_step"].values[0]
+
+    unique_table_ids = np.unique(unpacked_dataset["table_id"].values)
+    processed = [
+        process_fn(
+            unpacked_dataset.isel(
+                epoch=unpacked_dataset["table_id"].values == table_id
+            ),
+            lut_file,
+            table_id,
+            view_id,
+            apid,
+            plan_id,
+            plan_step,
+        )
+        for table_id in unique_table_ids
+    ]
+    if len(processed) == 1:
+        return processed[0]
+    # Keep non-epoch support variables as it is, 1-D arrays,
+    # instead of expanding them along the epoch dimension.
+    # Eg. voltage_table and k_factor are 1-D arrays that apply to all
+    # epochs in the same way.
+    return xr.concat(
+        processed,
+        dim="epoch",
+        data_vars="minimal",
+        coords="minimal",
+        compat="equals",
+    ).sortby("epoch")
 
 
 def get_collapse_pattern_shape(
@@ -335,7 +401,8 @@ def get_codice_epoch_time(
     -------
     tuple[np.ndarray, np.ndarray]
         (center_times (s), delta_times (ns)). center_times is converted to
-        nanoseconds at CDF write time.
+        nanoseconds at CDF write time. delta_times is returned as integer
+        nanoseconds.
     """
     # If Lo sensor
     if view_tab_obj.sensor == 0:
@@ -343,20 +410,21 @@ def get_codice_epoch_time(
         # 32 half spins makes full 16 spins for all non direct event products.
         # But Lo direct event's spins is also 16 spins. Because of that, we can use
         # the same calculation for all Lo products.
-        num_spins = 16.0
+        num_spins = 16
     # If Hi sensor and Direct Event product
     elif view_tab_obj.sensor == 1 and view_tab_obj.apid == CODICEAPID.COD_HI_PHA:
         # Use constant 16 spins for Hi PHA
-        num_spins = 16.0
+        num_spins = 16
     # If Non-Direct Event Hi product
     else:
         # Use 3d_collapsed value from LUT for other Hi products
-        num_spins = view_tab_obj.three_d_collapsed
+        num_spins = int(view_tab_obj.three_d_collapsed)
 
     # Units of 'spin ticks', where one 'spin tick' equals 320 microseconds.
-    # It takes multiple spins to collect data for a view.
-    spin_period_ns = spin_period.astype(np.float64) * 320 * 1e3  # Convert to ns
-    delta_times = (num_spins * spin_period_ns) / 2
+    # It takes multiple spins to collect data for a view. Keep the full delta
+    # calculation in integer nanoseconds so the written CDF type is CDF_INT8.
+    spin_period_ns: np.ndarray = spin_period.astype(np.int64) * 320_000
+    delta_times: np.ndarray = (num_spins * spin_period_ns) // 2
     # subseconds need to converted to seconds using this formula per CoDICE team:
     #   subseconds / 65536 gives seconds
     center_times_seconds = (
@@ -384,16 +452,6 @@ def calculate_acq_time_per_step(
     np.ndarray
         Array of acquisition times per step of shape (num_esa_steps,).
     """
-    # TODO: Handle time-varying num_steps_data length
-    #   The num_steps_data length can change over time (e.g., 6 → 3 steps) and is not
-    #   constant. E.g. at a day where the LUT changes we need to handle that. Update the
-    #   computation to:
-    #   Use the actual length of num_steps_data at each point in time instead of
-    #   assuming a constant value
-    #   - Make the calculation time-varying with epoch dependency
-    #   - Ensure values are divided by their corresponding epoch in L1B processing
-    #   - These tunable values are used to calculate acquisition time per step
-
     # These tunable values are used to calculate acquisition time per step
     tunable_values = low_stepping_tab["tunable_values"]
 

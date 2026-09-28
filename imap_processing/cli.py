@@ -15,10 +15,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import sys
 from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
 from pathlib import Path
+from time import sleep
 from typing import final
 
 import imap_data_access
@@ -27,6 +28,7 @@ import spiceypy
 import xarray as xr
 from cdflib.xarray import xarray_to_cdf
 from cdflib.xarray.xarray_to_cdf import ISTPError
+from imap_data_access.file_validation import Version
 from imap_data_access.io import IMAPDataAccessError, download
 from imap_data_access.processing_input import (
     ProcessingInputCollection,
@@ -37,7 +39,6 @@ from imap_data_access.processing_input import (
 )
 
 import imap_processing
-from imap_processing._version import __version__, __version_tuple__  # noqa: F401
 from imap_processing.ancillary.ancillary_dataset_combiner import (
     GlowsAncillaryCombiner,
     MagAncillaryCombiner,
@@ -53,6 +54,7 @@ from imap_processing.cdf.utils import load_cdf, write_cdf
 # In code:
 #   call cdf.utils.write_cdf
 from imap_processing.codice import codice_l1a, codice_l1b, codice_l2
+from imap_processing.ena_maps.utils.naming import MapDescriptor
 from imap_processing.glows.l1a.glows_l1a import glows_l1a
 from imap_processing.glows.l1b.glows_l1b import glows_l1b, glows_l1b_de
 from imap_processing.glows.l2.glows_l2 import glows_l2
@@ -60,10 +62,11 @@ from imap_processing.hi import hi_goodtimes, hi_l1a, hi_l1b, hi_l1c, hi_l2
 from imap_processing.hit.l1a.hit_l1a import hit_l1a
 from imap_processing.hit.l1b.hit_l1b import hit_l1b
 from imap_processing.hit.l2.hit_l2 import hit_l2
-from imap_processing.idex.idex_l1a import PacketParser
+from imap_processing.idex.idex_l1a import idex_l1a
 from imap_processing.idex.idex_l1b import idex_l1b
 from imap_processing.idex.idex_l2a import idex_l2a
 from imap_processing.idex.idex_l2b import idex_l2b
+from imap_processing.lo.constants import LoConstants
 from imap_processing.lo.l1a import lo_l1a
 from imap_processing.lo.l1b import lo_l1b
 from imap_processing.lo.l1c import lo_l1c
@@ -86,8 +89,16 @@ from imap_processing.ultra.l1a import ultra_l1a
 from imap_processing.ultra.l1b import ultra_l1b
 from imap_processing.ultra.l1c import ultra_l1c
 from imap_processing.ultra.l2 import ultra_l2
+from imap_processing.utils import (
+    check_epochs_within_day_offsets,
+    filter_day_boundary_data,
+    retrieve_mag_l1_inputs_from_l2_offsets,
+)
 
 logger = logging.getLogger(__name__)
+
+RETRY_EXIT_CODE = 75  # Exit code indicating the job should be retried
+# (e.g., imap-data-access 503 SlowDown).
 
 
 def _parse_args() -> argparse.Namespace:
@@ -99,23 +110,27 @@ def _parse_args() -> argparse.Namespace:
     --data-level "l1a"
     --descriptor "all"
     --start-date "20231212"
-    --version "v001"
-    --dependency '[
-            {
-                "type": "ancillary",
-                "files": [
-                    "imap_mag_l1b-cal_20250101_v001.cdf",
-                    "imap_mag_l1b-cal_20250103_20250104_v002.cdf"
-                ]
-            },
-            {
-                "type": "science",
-                "files": [
-                    "imap_idex_l2_sci_20240312_v000.cdf",
-                    "imap_idex_l2_sci_20240312_v001.cdf"
-                ]
+    --dependency '{
+            "dependency": [
+                {
+                    "type": "ancillary",
+                    "files": [
+                        "imap_mag_l1b-cal_20250101_v001.cdf",
+                        "imap_mag_l1b-cal_20250103_20250104_v002.cdf"
+                    ]
+                },
+                {
+                    "type": "science",
+                    "files": [
+                        "imap_idex_l2_sci_20240312_v001.0000.cdf",
+                        "imap_idex_l2_sci_20240312_v001.0001.cdf"
+                    ]
+                }
+            ],
+            "version": {
+                "sci": {"major_version": 2, "minor_version": 1}
             }
-        ]'
+        }'
     --upload-to-sdc
 
     Returns
@@ -131,23 +146,27 @@ def _parse_args() -> argparse.Namespace:
         '--descriptor "all" '
         ' --start-date "20231212" '
         '--repointing "repoint12345" '
-        '--version "v001" '
-        '--dependency "['
-        "    {"
-        '        "type": "ancillary",'
-        '        "files": ['
-        '            "imap_mag_l1b-cal_20250101_v001.cdf",'
-        '            "imap_mag_l1b-cal_20250103_20250104_v002.cdf"'
-        "        ]"
-        "    },"
-        "    {"
-        '        "type": "science",'
-        '        "files": ['
-        '            "imap_idex_l2_sci_20240312_v000.cdf",'
-        '            "imap_idex_l2_sci_20240312_v001.cdf"'
-        "        ]"
+        '--dependency "{'
+        '    "dependency": ['
+        "        {"
+        '            "type": "ancillary",'
+        '            "files": ['
+        '                "imap_mag_l1b-cal_20250101_v001.cdf",'
+        '                "imap_mag_l1b-cal_20250103_20250104_v002.cdf"'
+        "            ]"
+        "        },"
+        "        {"
+        '            "type": "science",'
+        '            "files": ['
+        '                "imap_idex_l2_sci_20240312_v001.0000.cdf",'
+        '                "imap_idex_l2_sci_20240312_v001.0001.cdf"'
+        "            ]"
+        "        }"
+        "    ],"
+        '    "version": {'
+        '        "sci": {"major_version": 2, "minor_version": 1}'
         "    }"
-        "]"
+        "}"
         ' --upload-to-sdc"'
     )
     instrument_help = (
@@ -163,27 +182,33 @@ def _parse_args() -> argparse.Namespace:
         "descriptor like 'sci-1min'. Default is 'all'."
     )
     dependency_help = (
-        "Dependency information in str format."
+        "Dependency information in str format. This is an object that wraps the"
+        " dependency list together with the per-descriptor output versions."
         "Example:"
-        "'["
-        "    {"
-        '        "type": "ancillary",'
-        '        "files": ['
-        '            "imap_mag_l1b-cal_20250101_v001.cdf",'
-        '            "imap_mag_l1b-cal_20250103_20250104_v002.cdf"'
-        "        ]"
-        "    },"
-        "    {"
-        '        "type": "science",'
-        '        "files": ['
-        '            "imap_idex_l2_sci_20240312_v000.cdf",'
-        '            "imap_idex_l2_sci_20240312_v001.cdf"'
-        "        ]"
-        "    }"
-        "]'"
+        "'{"
+        '    "dependency": ['
+        "        {"
+        '            "type": "ancillary",'
+        '            "files": ['
+        '                "imap_mag_l1b-cal_20250101_v001.cdf",'
+        '                "imap_mag_l1b-cal_20250103_20250104_v002.cdf"'
+        "            ]"
+        "        },"
+        "        {"
+        '            "type": "science",'
+        '            "files": ['
+        '                "imap_idex_l2_sci_20240312_v000.cdf",'
+        '                "imap_idex_l2_sci_20240312_v001.cdf"'
+        "            ]"
+        "        }"
+        "    ],"
+        '    "version": {"sci": '
+        '{"major_version": 2, "minor_version": 1}}'
+        "}'"
         "    A path to a JSON file containing this same information may also be"
-        "passed in. If dependency is a string ending in '.json', it will be interpreted"
-        " as such a file path."
+        " passed in. If dependency is a string ending in '.json', it will be"
+        " interpreted as such a file path: an existing local file is used as-is,"
+        " otherwise the file is downloaded from the IMAP SDC."
     )
 
     parser = argparse.ArgumentParser(prog="imap_cli", description=description)
@@ -233,10 +258,12 @@ def _parse_args() -> argparse.Namespace:
         "provided. Format: repoint#####",
     )
 
+    # TODO - Remove support for this eventually
     parser.add_argument(
         "--version",
         type=str,
-        required=True,
+        required=False,
+        default=None,
         help="Version of the data. Format: vXXX",
     )
     parser.add_argument(
@@ -267,7 +294,10 @@ def _parse_args() -> argparse.Namespace:
         logger.info(
             f"Interpreting dependency argument as a JSON file: {args.dependency}"
         )
-        dependency_filepath = download(args.dependency)
+        if not Path(args.dependency).exists():
+            dependency_filepath = download(args.dependency)
+        else:
+            dependency_filepath = args.dependency
         with open(dependency_filepath) as f:
             args.dependency = f.read()
 
@@ -331,44 +361,52 @@ class ProcessInstrument(ABC):
     data_descriptor : str
         The descriptor of the data to process (e.g. ``sci``).
     dependency_str : str
-        A string representation of the dependencies for the instrument in the
-        format:
-        '[
-            {
-                "type": "ancillary",
-                "files": [
-                    "imap_mag_l1b-cal_20250101_v001.cdf",
-                    "imap_mag_l1b-cal_20250103_20250104_v002.cdf"
-                ]
-            },
-            {
-                "type": "ancillary",
-                "files": [
-                    "imap_mag_l1b-lut_20250101_v001.cdf",
-                ]
-            },
-            {
-                "type": "science",
-                "files": [
-                    "imap_mag_l1a_norm-magi_20240312_v000.cdf",
-                    "imap_mag_l1a_norm-magi_20240312_v001.cdf"
-                ]
-            },
-            {
-                "type": "science",
-                "files": [
-                    "imap_idex_l2_sci_20240312_v000.cdf",
-                    "imap_idex_l2_sci_20240312_v001.cdf"
-                ]
+        A string representation of an object that wraps the dependency list
+        produced by ProcessingInputCollection.serialize() together with the
+        per-descriptor output versions produced by the job:
+        '{
+            "dependency": [
+                {
+                    "type": "ancillary",
+                    "files": [
+                        "imap_mag_l1b-cal_20250101_v001.cdf",
+                        "imap_mag_l1b-cal_20250103_20250104_v002.cdf"
+                    ]
+                },
+                {
+                    "type": "ancillary",
+                    "files": [
+                        "imap_mag_l1b-lut_20250101_v001.cdf",
+                    ]
+                },
+                {
+                    "type": "science",
+                    "files": [
+                        "imap_mag_l1a_norm-magi_20240312_v000.cdf",
+                        "imap_mag_l1a_norm-magi_20240312_v001.cdf"
+                    ]
+                },
+                {
+                    "type": "science",
+                    "files": [
+                        "imap_idex_l2_sci_20240312_v000.cdf",
+                        "imap_idex_l2_sci_20240312_v001.cdf"
+                    ]
+                }
+            ],
+            "version": {
+                "sci": {"major_version": 2, "minor_version": 1},
+                ...
             }
-        ]'
-        This is what ProcessingInputCollection.serialize() outputs.
+        }'
+        The version block determines the version of each produced product
+        (matched by descriptor).
     start_date : str
         The start date for the output data in YYYYMMDD format.
     repointing : str
         The repointing for the output data in the format 'repoint#####'.
     version : str
-        The version of the data in vXXX format.
+        Fallback version string.
     upload_to_sdc : bool
         A flag indicating whether to upload the output file to the SDC.
     """
@@ -385,23 +423,61 @@ class ProcessInstrument(ABC):
         dependency_str: str,
         start_date: str,
         repointing: str | None,
-        version: str,
+        version: str,  # TODO - remove this argument eventually
         upload_to_sdc: bool,
     ) -> None:
         self.data_level = data_level
         self.descriptor = data_descriptor
 
-        self.dependency_str = dependency_str
-
         self.start_date = start_date
         self.repointing = repointing
-
-        self.version = version
         self.upload_to_sdc = upload_to_sdc
+
+        # The dependency argument is an object of the form
+        # {"dependency": [...], "version": {<descriptor>: {...}}}. The
+        # per-descriptor product versions are extracted here and the dependency
+        # list is preserved as `self.dependency_str` so that
+        # ProcessingInputCollection.deserialize continues to work unchanged.
+        parsed_dependency = json.loads(dependency_str) if dependency_str else {}
+        # Tolerate the old format where the dependency argument is a bare list
+        # of dependency objects (no wrapping object and no version block).
+        if isinstance(parsed_dependency, list):
+            logger.warning("Old dependency format detected, converting to new format.")
+            parsed_dependency = {"dependency": parsed_dependency}
+        version_block = parsed_dependency.get("version", {})
+        self.dependency_str = json.dumps(parsed_dependency.get("dependency", []))
+        self._fallback_version = version
+
+        # Map each produced descriptor to a Version built from major/minor
+        self.version_map: dict[str, Version] = {
+            descriptor: Version(info["major_version"], info["minor_version"])
+            for descriptor, info in version_block.items()
+        }
+
+    def _resolve_version(self, descriptor: str) -> Version:
+        """
+        Return the Version to use for a product with the given descriptor.
+
+        Parameters
+        ----------
+        descriptor : str
+            The product descriptor (the final field of ``Logical_source``).
+
+        Returns
+        -------
+        Version
+            The Version to use for the product.
+        """
+        if descriptor not in self.version_map:
+            msg = f"No version provided for descriptor: '{descriptor}'"
+            logger.warning(msg)
+        return self.version_map.get(descriptor, self._fallback_version)
 
     def upload_products(self, products: list[Path]) -> None:
         """
         Upload data products to the IMAP SDC.
+
+        If a 503 SlowDown error is reported from the Upload API, a retry will be made
 
         Parameters
         ----------
@@ -414,18 +490,42 @@ class ProcessInstrument(ABC):
                 return
 
             for filename in products:
-                try:
-                    logger.info(f"Uploading file: {filename}")
-                    imap_data_access.upload(filename)
-                except IMAPDataAccessError as e:
-                    msg = str(e)
-                    if "FileAlreadyExists" in msg and "409" in msg:
-                        logger.warning("Skipping upload of existing file, %s", filename)
-                        continue
-                    else:
-                        logger.error(f"Upload failed with error: {msg}")
-                except Exception as e:
-                    logger.error(f"Upload failed unknown error: {e}")
+                max_retries = 3
+
+                for attempt in range(max_retries):
+                    try:
+                        logger.info(f"Uploading file: {filename}")
+                        imap_data_access.upload(filename)
+                        break
+
+                    except IMAPDataAccessError as e:
+                        message = str(e)
+
+                        if "FileAlreadyExists" in message and "409" in message:
+                            logger.warning(
+                                "Skipping upload of existing file, %s", filename
+                            )
+                            break
+                        elif "503" in message and "SlowDown" in message:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    "Upload busy. Waiting 5 seconds before retrying..."
+                                )
+                                sleep(5)
+                                continue
+
+                            logger.error(
+                                f"Upload failed after {max_retries} attempts. Exiting "
+                                f"with code {RETRY_EXIT_CODE}."
+                            )
+                            sys.exit(RETRY_EXIT_CODE)
+
+                        logger.error(f"Upload failed with error: {message}")
+                        raise
+
+                    except Exception as e:
+                        logger.error(f"Upload failed unknown error: {e}")
+                        raise
 
     @final
     def process(self) -> None:
@@ -439,7 +539,7 @@ class ProcessInstrument(ABC):
         3. Post-processing actions such as uploading files to the IMAP SDC.
         4. Final cleanup actions.
         """
-        logger.info(f"IMAP Processing Version: {imap_processing._version.__version__}")
+        logger.info(f"IMAP Processing Version: {imap_processing.__version__}")
         logger.info(f"Processing {self.__class__.__name__} level {self.data_level}")
         logger.info("Beginning preprocessing (download dependencies)")
         dependencies = self.pre_processing()
@@ -449,6 +549,8 @@ class ProcessInstrument(ABC):
         self.post_processing(products, dependencies)
         self.cleanup()
         logger.info("Processing complete")
+        # Log version again for truncated or unusually large logs
+        logger.info(f"IMAP Processing Version: {imap_processing.__version__}")
 
     def pre_processing(self) -> ProcessingInputCollection:
         """
@@ -554,16 +656,10 @@ class ProcessInstrument(ABC):
 
         logger.info("Writing products to local storage")
 
-        logger.info("Dataset version: %s", self.version)
         # Parent files used to create these datasets
         # https://spdf.gsfc.nasa.gov/istp_guide/gattributes.html.
         parent_files = [p.name for p in dependencies.get_file_paths()]
         logger.info("Parent files: %s", parent_files)
-        # Format version to vXXX if not already in that format. Eg.
-        # If version is passed in as 1 or 001, it will be converted to v001.
-        r = re.compile(r"v\d{3}")
-        if not isinstance(self.version, str) or r.match(self.version) is None:
-            self.version = f"v{int(self.version):03d}"  # vXXX
 
         # Start date is either the start date or the repointing.
         # if it is the repointing, default to using the first epoch in the file as
@@ -572,11 +668,23 @@ class ProcessInstrument(ABC):
 
         for ds in processed_data:
             if isinstance(ds, xr.Dataset):
-                ds.attrs["Data_version"] = self.version[1:]  # Strip 'v' from version
+                # Look up the version for this product by its descriptor (the
+                # final field of Logical_source).
+                descriptor = ds.attrs.get("Logical_source", "").split("_")[-1]
+                if descriptor == "":
+                    logger.error("No descriptor found in dataset.")
+                version = self._resolve_version(descriptor)
+                logger.info(f"Product {descriptor} version: {version}")
+                # `Data_version` is stored without the leading `v`.
+                ds.attrs["Data_version"] = str(version).lstrip("v")
                 if self.repointing is not None:
                     ds.attrs["Repointing"] = self.repointing
                 ds.attrs["Start_date"] = self.start_date
-                ds.attrs["Parents"] = parent_files
+                # Don't overwrite Parents if processing already set it (e.g.
+                # MAG L2 records the L1 file actually used, not the passed-in
+                # dependency).
+                if "Parents" not in ds.attrs:
+                    ds.attrs["Parents"] = parent_files
                 products.append(write_cdf(ds))
             else:
                 # A path to a product that was already written out
@@ -617,8 +725,10 @@ class Codice(ProcessInstrument):
         if self.data_level == "l1a":
             # process data
             datasets = codice_l1a.process_l1a(dependencies)
+            for i, ds in enumerate(datasets):
+                datasets[i] = filter_day_boundary_data(ds, self.start_date)
 
-        if self.data_level == "l1b":
+        elif self.data_level == "l1b":
             science_files = dependencies.get_file_paths(source="codice")
             if len(science_files) != 1:
                 raise ValueError(
@@ -628,8 +738,13 @@ class Codice(ProcessInstrument):
             # process data
             datasets = [codice_l1b.process_codice_l1b(science_files[0])]
 
-        if self.data_level == "l2":
+        elif self.data_level == "l2":
             datasets = [codice_l2.process_codice_l2(self.descriptor, dependencies)]
+
+        else:
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
+            )
 
         return datasets
 
@@ -665,7 +780,7 @@ class Glows(ProcessInstrument):
                 )
             datasets = glows_l1a(science_files[0])
 
-        if self.data_level == "l1b":
+        elif self.data_level == "l1b":
             science_files = dependencies.get_file_paths(source="glows", data_type="l1a")
             if len(science_files) != 1:
                 raise ValueError(
@@ -738,7 +853,7 @@ class Glows(ProcessInstrument):
                 # Direct events
                 datasets = [glows_l1b_de(input_dataset, conversion_table_dict)]
 
-        if self.data_level == "l2":
+        elif self.data_level == "l2":
             science_files = dependencies.get_file_paths(source="glows", data_type="l1b")
             if len(science_files) != 1:
                 raise ValueError(
@@ -767,6 +882,11 @@ class Glows(ProcessInstrument):
                 input_dataset,
                 pipeline_settings_combiner.combined_dataset,
                 calibration_combiner.combined_dataset,
+            )
+
+        else:
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
             )
 
         return datasets
@@ -864,9 +984,13 @@ class Hi(ProcessInstrument):
                 l1b_hk_file = dependencies.get_file_paths(
                     source="hi", data_type="l1b", descriptor="hk"
                 )[0]
-                esa_energies_csv = dependencies.get_file_paths(data_type="ancillary")[0]
+                esa_energies_csv = dependencies.get_file_paths(
+                    data_type="ancillary", descriptor="esa-energies"
+                )[0]
                 datasets = hi_l1b.annotate_direct_events(
-                    load_cdf(l1a_de_file), load_cdf(l1b_hk_file), esa_energies_csv
+                    load_cdf(l1a_de_file),
+                    load_cdf(l1b_hk_file),
+                    esa_energies_csv,
                 )
         elif self.data_level == "l1c":
             if "pset" in self.descriptor:
@@ -899,14 +1023,15 @@ class Hi(ProcessInstrument):
                     for dep in anc_dependencies
                 }
 
-                # Verify we have both required ancillary files
+                # Verify we have all required ancillary files
                 if (
                     "cal-prod" not in anc_path_dict
                     or "backgrounds" not in anc_path_dict
                 ):
                     raise ValueError(
-                        f"Missing required ancillary files. Expected 'cal-prod' and "
-                        f"'backgrounds', got {list(anc_path_dict.keys())}"
+                        f"Missing required ancillary files. Expected 'cal-prod' "
+                        f"and 'backgrounds', got "
+                        f"{list(anc_path_dict.keys())}"
                     )
 
                 # Load goodtimes dependency
@@ -1036,13 +1161,18 @@ class Hit(ProcessInstrument):
             # process data to L2 products
             datasets = [hit_l2(l1b_dataset, ancillary_files)]
 
+        else:
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
+            )
+
         return datasets
 
 
 class Idex(ProcessInstrument):
     """Process IDEX."""
 
-    def do_processing(
+    def do_processing(  # noqa: PLR0912
         self, dependencies: ProcessingInputCollection
     ) -> list[xr.Dataset]:
         """
@@ -1068,27 +1198,34 @@ class Idex(ProcessInstrument):
                     f"Unexpected dependencies found for IDEX L1A:"
                     f"{dependency_list}. Expected only two dependency."
                 )
-            # get l0 file
+            # get l0 files
             science_files = dependencies.get_file_paths(source="idex")
-            datasets = PacketParser(science_files[0]).data
+            datasets = idex_l1a(science_files, self.start_date)
         elif self.data_level == "l1b":
-            n_expected_deps = 3 if self.descriptor == "sci-1week" else 1
+            n_expected_deps = 3 if self.descriptor == "sci-10days" else 1
             if len(dependency_list) != n_expected_deps:
                 raise ValueError(
                     f"Unexpected dependencies found for IDEX L1B {self.descriptor}:"
                     f"{dependency_list}. Expected only {n_expected_deps} dependencies."
                 )
-            # get CDF file
             science_files = dependencies.get_file_paths(source="idex")
-            # Load all the science files. There should only be one, but in the case of
-            # multiple files, we want to make sure to load them all and select the one
-            # with the latest time.
-            science_datasets = [load_cdf(f) for f in science_files]
-            if not science_datasets:
+            if not science_files:
                 raise ValueError("No science files found for IDEX L1B processing.")
-            latest_file = max(science_datasets, key=lambda ds: ds["epoch"].data[0])
+            # IDEX l1b requires spice kernels and since there may be events that occur
+            # before the start date of the job, there is a buffer added to the upstream
+            # dependency query. This means that there may be multiple l1a science files
+            # that are returned but we only want to process the file with the same
+            # start date.
+            l1a_file = [f for f in science_files if self.start_date in f.name]
+            if not l1a_file:
+                raise ValueError(
+                    f"No L1A science file found for IDEX L1B processing with start "
+                    f"date {self.start_date}. Out of science files: {science_files}"
+                )
+            l1a_file = l1a_file[0]
+            logger.info(f"Processing IDEX l1b using l1a file: {l1a_file.name}")
             # process data
-            datasets = [idex_l1b(latest_file, self.descriptor)]
+            datasets = [idex_l1b(load_cdf(l1a_file), self.descriptor)]
         elif self.data_level == "l2a":
             if len(dependency_list) != 3:
                 raise ValueError(
@@ -1108,23 +1245,137 @@ class Idex(ProcessInstrument):
                     f"Unexpected dependencies found for IDEX L2B:"
                     f"{dependency_list}. Expected three or four dependencies."
                 )
+            # L2A and L2B are both processed on the same 10-day cadence, so there
+            # should be exactly one L2A science file matching this job's start date.
             sci_files = dependencies.get_file_paths(
-                source="idex", descriptor="sci-1week"
+                source="idex", descriptor="sci-10days"
             )
-            sci_dependencies = [load_cdf(f) for f in sci_files]
-            # sort science files by the first epoch value
-            sci_dependencies.sort(key=lambda ds: ds["epoch"].values[0])
-            hk_files = dependencies.get_file_paths(source="idex", descriptor="msg")
-            # Remove duplicate housekeeping files
-            hk_dependencies = [load_cdf(dep) for dep in list(set(hk_files))]
-            # sort housekeeping files by the first epoch value
-            hk_dependencies.sort(key=lambda ds: ds["epoch"].values[0])
-            datasets = idex_l2b(sci_dependencies, hk_dependencies)
+            hk_files = dependencies.get_file_paths(
+                source="idex", descriptor="msg-10days"
+            )
+            if not sci_files or not hk_files:
+                raise ValueError(
+                    "No L2A science file or L1B msg-10day file found for "
+                    "IDEX L2B processing"
+                )
+            l2a_dataset = load_cdf(sci_files[0])
+            hk_dataset = load_cdf(hk_files[0])
+            datasets = idex_l2b(l2a_dataset, hk_dataset, self.start_date)
+
+        else:
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
+            )
+
         return datasets
 
 
 class Lo(ProcessInstrument):
     """Process IMAP-Lo."""
+
+    @staticmethod
+    def _pointings_at_pivot_angle(
+        dependencies: ProcessingInputCollection, map_pivot_angle: int
+    ) -> set[int]:
+        """
+        Find the pointings that were taken at the pivot angle of a map.
+
+        A pointing's pivot angle is recorded in its goodtimes product, which is
+        also the product the other inputs of that pointing are selected by.
+
+        Parameters
+        ----------
+        dependencies : ProcessingInputCollection
+            Object containing dependencies to process.
+        map_pivot_angle : int
+            The pivot angle [degrees] of the map being made.
+
+        Returns
+        -------
+        set[int]
+            The repointings whose pivot angle is that of the map.
+        """
+        at_pivot_angle = set()
+        for goodtimes_path in dependencies.get_file_paths(
+            source="lo", descriptor="goodtimes"
+        ):
+            goodtimes = load_cdf(goodtimes_path)
+            repointing = imap_data_access.ScienceFilePath(
+                goodtimes_path.name
+            ).repointing
+            if "pivot" not in goodtimes:
+                logger.info(f"Dropping {goodtimes_path.name} - no pivot angle.")
+                continue
+
+            pivot_angle = np.atleast_1d(goodtimes["pivot"].values)[0]
+            if (
+                abs(pivot_angle - map_pivot_angle)
+                < LoConstants.PSET_PIVOT_ANGLE_TOLERANCE
+            ):
+                at_pivot_angle.add(repointing)
+            else:
+                logger.info(
+                    f"Dropping repoint{repointing}, its pivot angle {pivot_angle} "
+                    f"is not the {map_pivot_angle} degree pivot angle of the map."
+                )
+
+        return at_pivot_angle
+
+    def pre_processing(self) -> ProcessingInputCollection:
+        """
+        Complete pre-processing.
+
+        Extends the base pre-processing by dropping, for map products, the Lo
+        science inputs of the pointings that were not taken at the pivot angle
+        of the map being made. A pointing is dropped whole: its goodtimes give
+        the pivot angle, and its other inputs go with them.
+
+        Filtering here, rather than during processing, keeps the `Parents`
+        attribute of the produced map limited to the files it was made from.
+
+        Returns
+        -------
+        dependencies : ProcessingInputCollection
+            Object containing dependencies to process.
+        """
+        dependencies = super().pre_processing()
+        if self.data_level != "l2":
+            return dependencies
+
+        try:
+            map_pivot_angle = MapDescriptor.from_string(self.descriptor).sensor
+        except ValueError:
+            # Not a map product, so there is no pivot angle to select inputs with
+            logger.info(
+                f"Not filtering inputs by pivot angle, {self.descriptor} is not a "
+                f"map descriptor."
+            )
+            return dependencies
+
+        if not isinstance(map_pivot_angle, int):
+            # A map of no particular pivot angle, e.g. "ilo-ena-h-sf-nsp-ram-..."
+            return dependencies
+
+        at_pivot_angle = self._pointings_at_pivot_angle(dependencies, map_pivot_angle)
+
+        filtered_dependencies = ProcessingInputCollection()
+        for processing_input in dependencies.get_processing_inputs():
+            if (
+                processing_input.input_type != ProcessingInputType.SCIENCE_FILE
+                or processing_input.source != "lo"
+            ):
+                filtered_dependencies.add(processing_input)
+                continue
+
+            kept_filenames = [
+                str(imap_file_path.filename)
+                for imap_file_path in processing_input.imap_file_paths
+                if imap_file_path.repointing in at_pivot_angle
+            ]
+            if kept_filenames:
+                filtered_dependencies.add(type(processing_input)(*kept_filenames))
+
+        return filtered_dependencies
 
     def do_processing(
         self, dependencies: ProcessingInputCollection
@@ -1175,20 +1426,47 @@ class Lo(ProcessInstrument):
                 source="lo", data_type="ancillary"
             )
             science_files = dependencies.get_file_paths(source="lo", descriptor="de")
+            science_files += dependencies.get_file_paths(
+                source="lo", data_type="l1b", descriptor="goodtimes"
+            )
+            science_files += dependencies.get_file_paths(
+                source="lo", data_type="l1b", descriptor="bgrates"
+            )
+            science_files += dependencies.get_file_paths(
+                source="lo", data_type="l1b", descriptor="histrates"
+            )
             for file in science_files:
                 dataset = load_cdf(file)
                 data_dict[dataset.attrs["Logical_source"]] = dataset
             datasets = lo_l1c.lo_l1c(data_dict, anc_dependencies)
 
         elif self.data_level == "l2":
-            data_dict = {}
-            science_files = dependencies.get_file_paths(source="lo", descriptor="pset")
             anc_dependencies = dependencies.get_file_paths(data_type="ancillary")
 
-            # Load all pset files into datasets
-            psets = [load_cdf(file) for file in science_files]
-            data_dict[psets[0].attrs["Logical_source"]] = psets
-            datasets = lo_l2.lo_l2(data_dict, anc_dependencies, self.descriptor)
+            # Load every pointing of the map window, grouped into the products
+            # of each pointing.
+            sci_dependencies: dict[int, dict[str, xr.Dataset]] = {}
+            for descriptor in lo_l2.REQUIRED_PRODUCTS:
+                for file in dependencies.get_file_paths(
+                    source="lo", data_type="l1b", descriptor=descriptor
+                ):
+                    repointing = imap_data_access.ScienceFilePath(file.name).repointing
+                    if repointing is None:
+                        logger.warning(
+                            f"Dropping {file.name}, it covers no single pointing."
+                        )
+                        continue
+                    sci_dependencies.setdefault(repointing, {})[descriptor] = load_cdf(
+                        file
+                    )
+
+            datasets = lo_l2.lo_l2(sci_dependencies, anc_dependencies, self.descriptor)
+
+        else:
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
+            )
+
         return datasets
 
 
@@ -1239,7 +1517,7 @@ class Mag(ProcessInstrument):
 
             datasets = mag_l1a(science_files[0])
 
-        if self.data_level == "l1b":
+        elif self.data_level == "l1b":
             science_files = dependencies.get_file_paths(source="mag", data_type="l1a")
             if len(science_files) != 1:
                 raise ValueError(
@@ -1263,20 +1541,48 @@ class Mag(ProcessInstrument):
                 mag_l1b(input_data, current_day, combined_calibration.combined_dataset)
             ]
 
-        if self.data_level == "l1c":
-            science_files = dependencies.get_file_paths(source="mag", data_type="l1b")
+        elif self.data_level == "l1c":
+            start_datetime = datetime.strptime(self.start_date, "%Y%m%d")
+            science_files = dependencies.get_valid_inputs_for_start_date(
+                start_datetime
+            ).get_file_paths(source="mag", data_type="l1b")
             input_data = [load_cdf(dep) for dep in science_files]
-            # Input datasets can be in any order, and are validated within mag_l1c
+
+            # The previous day's L1C may arrive as an extra dependency (delivered by
+            # sds-data-manager orchestration) so today's L1C timeline can continue
+            # the previous day's cadence and phase across the day boundary.
+            previous_day_files = dependencies.get_valid_inputs_for_start_date(
+                start_datetime - timedelta(days=1)
+            ).get_file_paths(source="mag", data_type="l1c")
+            previous_day_dataset = (
+                load_cdf(previous_day_files[0]) if previous_day_files else None
+            )
+
+            # input_data is the burst mode L1B file, normal mode L1B file, or both,
+            # and appears in any order
             if len(input_data) == 1:
-                datasets = [mag_l1c(input_data[0], current_day)]
+                datasets = [
+                    mag_l1c(
+                        input_data[0],
+                        current_day,
+                        previous_day_dataset=previous_day_dataset,
+                    )
+                ]
             elif len(input_data) == 2:
-                datasets = [mag_l1c(input_data[0], current_day, input_data[1])]
+                datasets = [
+                    mag_l1c(
+                        input_data[0],
+                        current_day,
+                        input_data[1],
+                        previous_day_dataset=previous_day_dataset,
+                    )
+                ]
             else:
                 raise ValueError(
-                    f"Invalid dependencies found for MAG L1C:"
+                    f"Invalid current-day dependencies found for MAG L1C:"
                     f"{dependencies}. Expected one or two dependencies."
                 )
-        if self.data_level == "l1d":
+        elif self.data_level == "l1d":
             science_files = dependencies.get_file_paths(source="mag", data_type="l1c")
             science_files.extend(
                 dependencies.get_file_paths(source="mag", data_type="l1b")
@@ -1292,15 +1598,7 @@ class Mag(ProcessInstrument):
                 current_day,
             )
 
-        if self.data_level == "l2":
-            science_files = dependencies.get_file_paths(source="mag", data_type="l1b")
-            science_files.extend(
-                dependencies.get_file_paths(source="mag", data_type="l1c")
-            )
-            # TODO: Overwrite dependencies with versions from offsets file
-            # TODO: Ensure that parent_files attribute works with that
-            input_data = load_cdf(science_files[0])
-
+        elif self.data_level == "l2":
             descriptor_no_frame = str.split(self.descriptor, "-")[0]
 
             # We expect either a norm or a burst input descriptor.
@@ -1329,14 +1627,54 @@ class Mag(ProcessInstrument):
 
             combined_calibration = MagAncillaryCombiner(calibration[0], day_buffer)
             offset_dataset = load_cdf(offsets[0].imap_file_paths[0].construct_path())
-            # TODO: get input data from offsets file
-            # TODO: Test data missing
+
+            # The L1B (burst) or L1C (norm) input file is retrieved from the
+            # offsets file's Parents attribute, so the L2 vectors always match
+            # the exact L1 versions the offsets were generated against. This
+            # ignores any L1B/L1C dependencies passed in to processing. If the
+            # offsets file has no Parents, fall back to the passed-in
+            # dependencies.
+            input_files = retrieve_mag_l1_inputs_from_l2_offsets(offset_dataset)
+            if input_files:
+                input_data = load_cdf(input_files[0])
+            else:
+                science_files = dependencies.get_file_paths(
+                    source="mag", data_type="l1b"
+                )
+                science_files.extend(
+                    dependencies.get_file_paths(source="mag", data_type="l1c")
+                )
+                logger.warning(
+                    "Offsets file %s has no Parents attribute; falling back "
+                    "to passed-in L1B/L1C dependencies for MAG L2 input.",
+                    offsets[0].imap_file_paths[0].construct_path().name,
+                )
+                input_files = [science_files[0]]
+                input_data = load_cdf(input_files[0])
+
             datasets = mag_l2(
                 combined_calibration.combined_dataset,
                 offset_dataset,
                 input_data,
                 current_day,
                 mode=DataMode(descriptor_no_frame.upper()),
+            )
+
+            # Record the L1 file actually used (from the offsets file's
+            # Parents) in place of the passed-in L1B/L1C dependencies, so the
+            # product provenance matches the data that went into it.
+            # post_processing leaves an existing Parents attribute untouched.
+            l2_parents = [
+                file_path.name
+                for file_path in dependencies.get_file_paths()
+                if not file_path.name.startswith(("imap_mag_l1b_", "imap_mag_l1c_"))
+            ]
+            l2_parents.append(input_files[0].name)
+            for dataset in datasets:
+                dataset.attrs["Parents"] = l2_parents
+        else:
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
             )
 
         for ds in datasets:
@@ -1347,6 +1685,10 @@ class Mag(ProcessInstrument):
                     f"Timestamps for output file {ds.attrs['Logical_source']} are not "
                     f"monotonically increasing."
                 )
+
+        # Will raise an error if any timestamps are outside the current day
+        check_epochs_within_day_offsets(datasets, current_day)
+
         return datasets
 
     def post_processing(
@@ -1390,7 +1732,10 @@ class Mag(ProcessInstrument):
                         "Logical_source"
                     ].split("_")[1:]
                     start_date = self.start_date
-                    version = self.version
+                    # Ancillary filenames only support the minor-only (vXXX)
+                    # version format, so render the resolved version that way.
+                    resolved_version = self._resolve_version(descriptor)
+                    version = str(Version(None, resolved_version.minor))
 
                     output_filepath = (
                         imap_data_access.AncillaryFilePath.generate_from_inputs(
@@ -1491,7 +1836,7 @@ class Swapi(ProcessInstrument):
         datasets: list[xr.Dataset] = []
 
         dependency_list = dependencies.processing_input
-        if self.data_level == "l1":
+        if self.data_level in ["l1", "l1a"]:
             # For science, we expect l0 raw file and L1 housekeeping file
             if self.descriptor == "sci" and len(dependency_list) != 3:
                 raise ValueError(
@@ -1509,6 +1854,8 @@ class Swapi(ProcessInstrument):
 
             # process science or housekeeping data
             datasets = swapi_l1(dependencies, descriptor=self.descriptor)
+            for i, ds in enumerate(datasets):
+                datasets[i] = filter_day_boundary_data(ds, self.start_date)
         elif self.data_level == "l2":
             if len(dependency_list) != 3:
                 raise ValueError(
@@ -1529,6 +1876,10 @@ class Swapi(ProcessInstrument):
             lut_notes_df = read_swapi_lut_table(lut_notes_files[0])
             l1_dataset = load_cdf(science_files[0])
             datasets = [swapi_l2(l1_dataset, esa_table_df, lut_notes_df)]
+        else:
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
+            )
 
         return datasets
 
@@ -1565,6 +1916,8 @@ class Swe(ProcessInstrument):
                 )
             science_files = dependencies.get_file_paths(source="swe")
             datasets = swe_l1a(str(science_files[0]))
+            for i, ds in enumerate(datasets):
+                datasets[i] = filter_day_boundary_data(ds, self.start_date)
             # Right now, we only process science data. Therefore,
             # we expect only one dataset to be returned.
 
@@ -1610,6 +1963,9 @@ class Swe(ProcessInstrument):
             datasets = [swe_l2(l1b_datasets)]
         else:
             print("Did not recognize data level. No processing done.")
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
+            )
 
         return datasets
 
@@ -1702,6 +2058,10 @@ class Ultra(ProcessInstrument):
                 data_dict,
                 descriptor=self.descriptor,
                 energy_bin_edges_file=energy_bin_edges_file,
+            )
+        else:
+            raise NotImplementedError(
+                f"Unrecognized data level for {type(self).__name__}:  {self.data_level}"
             )
 
         return datasets

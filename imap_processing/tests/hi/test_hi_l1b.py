@@ -13,20 +13,36 @@ from imap_processing.hi.hi_l1b import (
     any_good_direct_events,
     compute_coincidence_type_and_tofs,
     compute_hae_coordinates,
+    compute_reference_hv_values,
     de_ccsds_qf,
     de_esa_energy_step,
     de_esa_step_met,
+    de_gain_test_filter,
     de_nominal_bin_and_spin_phase,
     get_esa_to_esa_energy_step_lut,
     housekeeping,
 )
 from imap_processing.hi.utils import (
+    CalibrationProductConfig,
     CoincidenceBitmap,
     EsaEnergyStepLookupTable,
     HiConstants,
 )
 from imap_processing.quality_flags import ImapHiL1bDeFlags
 from imap_processing.spice.geometry import SpiceFrame
+
+# Nominal detector voltage config, for use as a permissive default in tests
+# that don't care about gain-test filtering.
+NOMINAL_HV_VALUES = {
+    "pos_defl": 6300.0,
+    "neg_defl": -6300.0,
+    "tof": -8000.0,
+    "mcp_f": -3000.0,
+    "mcp_b": -2125.0,
+    "cem_f": -4500.0,
+    "cem_bk_a": -2350.0,
+    "cem_bk_b": -2350.0,
+}
 
 
 def test_hi_l1b_hk(hi_l0_test_data_path):
@@ -41,9 +57,11 @@ def test_hi_l1b_hk(hi_l0_test_data_path):
 
 @pytest.mark.external_kernel
 @pytest.mark.external_test_data
+@mock.patch("imap_processing.hi.hi_l1b.de_gain_test_filter")
 @mock.patch("imap_processing.hi.hi_l1b.get_esa_to_esa_energy_step_lut")
 def test_hi_annotate_direct_events(
     mock_get_esa_lut,
+    mock_de_gain_test_filter,
     hi_l1_test_data_path,
     use_fake_spin_data_for_time,
     imap_ena_sim_metakernel,
@@ -54,6 +72,16 @@ def test_hi_annotate_direct_events(
     mock_esa_lut = mock.MagicMock(spec=EsaEnergyStepLookupTable())
     mock_esa_lut.query.side_effect = lambda a, b: b
     mock_get_esa_lut.return_value = mock_esa_lut
+
+    # Mock de_gain_test_filter to pass the dataset through unmodified, with
+    # nominal HV delta attrs set (as it would for a matching pointing).
+    def gain_test_filter_side_effect(l1b_de_ds, l1b_hk_ds):
+        l1b_de_ds.attrs.update(
+            CalibrationProductConfig.compute_gain_match_values(NOMINAL_HV_VALUES)
+        )
+        return l1b_de_ds
+
+    mock_de_gain_test_filter.side_effect = gain_test_filter_side_effect
 
     # Start MET time of spin for simulated input data is 482372988
     use_fake_spin_data_for_time(482372987.999)
@@ -69,6 +97,12 @@ def test_hi_annotate_direct_events(
     l1b_datasets = annotate_direct_events(l1a_dataset, xr.Dataset(), esa_energies_csv)
     assert len(l1b_datasets) == 1
     assert l1b_datasets[0].attrs["Logical_source"] == "imap_hi_l1b_45sensor-de"
+    expected_hv_deltas = CalibrationProductConfig.compute_gain_match_values(
+        NOMINAL_HV_VALUES
+    )
+    assert l1b_datasets[0].attrs["mcp_delta_v"] == pytest.approx(
+        expected_hv_deltas["mcp_delta_v"]
+    )
     assert len(l1b_datasets[0].data_vars) == 18
 
 
@@ -340,8 +374,12 @@ def test_compute_hae_coordinates(
 @mock.patch("imap_processing.hi.hi_l1b.get_esa_to_esa_energy_step_lut")
 def test_de_esa_energy_step(mock_get_esa_lut, mock_read_csv, mock_any_good_de):
     """Test coverage for de_esa_energy_step function."""
+    esa_energy_step_fillval = 255
+    # Packet at index 5 fails to find a matching esa_energy_step (FILLVAL).
     mock_esa_lut = mock.MagicMock(spec=EsaEnergyStepLookupTable())
-    mock_esa_lut.query.side_effect = lambda a, b: np.arange(len(a))[::-1] % 9
+    mock_esa_lut.query.side_effect = lambda a, b: np.where(
+        np.arange(len(a)) == 5, esa_energy_step_fillval, np.arange(len(a))[::-1] % 9
+    )
     mock_get_esa_lut.return_value = mock_esa_lut
 
     n_epoch = 20
@@ -352,13 +390,256 @@ def test_de_esa_energy_step(mock_get_esa_lut, mock_read_csv, mock_any_good_de):
         data_vars={
             "ccsds_met": xr.DataArray(np.arange(n_epoch) % 9, dims=["epoch"]),
             "esa_step": xr.DataArray(np.arange(n_epoch), dims=["epoch"]),
+            # Pre-existing "ccsds_qf", as created by de_ccsds_qf().
+            "ccsds_qf": xr.DataArray(np.zeros(n_epoch, dtype=np.uint8), dims=["epoch"]),
         },
     )
-    esa_energy_step_var = de_esa_energy_step(fake_dataset, xr.Dataset(), "Fake path")
+    new_vars = de_esa_energy_step(fake_dataset, xr.Dataset(), "Fake path")
 
+    expected_esa_energy_step = np.arange(n_epoch)[::-1] % 9
+    expected_esa_energy_step[5] = esa_energy_step_fillval
     np.testing.assert_array_equal(
-        esa_energy_step_var["esa_energy_step"].values, np.arange(n_epoch)[::-1] % 9
+        new_vars["esa_energy_step"].values, expected_esa_energy_step
     )
+    # de_esa_energy_step modifies "ccsds_qf" on fake_dataset in place.
+    expected_qf_bits = np.zeros(n_epoch, dtype=np.uint8)
+    expected_qf_bits[5] = ImapHiL1bDeFlags.BAD_ESA_VOLTAGE
+    np.testing.assert_array_equal(fake_dataset["ccsds_qf"].values, expected_qf_bits)
+
+
+class TestDeGainTestFilter:
+    """Test suite for de_gain_test_filter function."""
+
+    @staticmethod
+    def _make_hk_ds(op_modes, shcoarse_values, **hv_overrides):
+        """Build a fake L1B housekeeping dataset for gain test filtering."""
+        n = len(op_modes)
+        hv_values = dict(NOMINAL_HV_VALUES)
+        hv_values.update(hv_overrides)
+        data_vars = {
+            "op_mode": (["epoch"], list(op_modes)),
+            "shcoarse": (["epoch"], np.asarray(shcoarse_values, dtype=float)),
+        }
+        for field, value in hv_values.items():
+            data_vars[field] = (["epoch"], np.full(n, value))
+        return xr.Dataset(data_vars)
+
+    @staticmethod
+    def _make_de_ds(
+        ccsds_met_values, esa_energy_step_fillval=255, esa_step_met_values=None
+    ):
+        """Build a fake partial L1B direct event dataset.
+
+        Parameters
+        ----------
+        esa_step_met_values : array_like or None
+            Values for "esa_step_met" (the time used for gain-test good/bad
+            classification). Defaults to `ccsds_met_values` for tests that
+            don't care about the distinction between the two.
+        """
+        n_epoch = len(ccsds_met_values)
+        if esa_step_met_values is None:
+            esa_step_met_values = ccsds_met_values
+        return xr.Dataset(
+            coords={
+                "epoch": xr.DataArray(np.arange(n_epoch), name="epoch", dims=["epoch"])
+            },
+            data_vars={
+                "ccsds_met": xr.DataArray(
+                    np.asarray(ccsds_met_values, dtype=float), dims=["epoch"]
+                ),
+                "esa_step_met": xr.DataArray(
+                    np.asarray(esa_step_met_values, dtype=float), dims=["epoch"]
+                ),
+                "esa_energy_step": xr.DataArray(
+                    (np.arange(n_epoch) % 9 + 1).astype(np.uint8),
+                    dims=["epoch"],
+                    attrs={"FILLVAL": esa_energy_step_fillval},
+                ),
+                "ccsds_qf": xr.DataArray(
+                    np.zeros(n_epoch, dtype=np.uint8), dims=["epoch"]
+                ),
+            },
+        )
+
+    @mock.patch("imap_processing.hi.hi_l1b.any_good_direct_events", return_value=False)
+    def test_no_good_direct_events(self, mock_any_good_de):
+        """HV delta attrs are all NaN and dataset is otherwise unmodified."""
+        fake_de_ds = xr.Dataset(attrs={"some_attr": "unchanged"})
+
+        result = de_gain_test_filter(fake_de_ds, xr.Dataset())
+
+        assert result is fake_de_ds
+        assert result.attrs["some_attr"] == "unchanged"
+        actual_hv_deltas = {
+            field: result.attrs[field]
+            for field in CalibrationProductConfig.GAIN_MATCH_FIELDS
+        }
+        assert all(np.isnan(value) for value in actual_hv_deltas.values())
+
+    @mock.patch("imap_processing.hi.hi_l1b.any_good_direct_events", return_value=True)
+    def test_no_hvsci_segments(self, mock_any_good_de):
+        """All events flagged bad, esa_energy_step all FILLVAL, attrs all NaN."""
+        hk_ds = self._make_hk_ds(["OTHER", "LVSCI", "OTHER"], [1000, 1001, 1002])
+        esa_energy_step_fillval = 255
+        de_ds = self._make_de_ds(
+            np.arange(6) + 1000, esa_energy_step_fillval=esa_energy_step_fillval
+        )
+
+        result = de_gain_test_filter(de_ds, hk_ds)
+
+        assert result is de_ds
+        assert np.all(result["esa_energy_step"].values == esa_energy_step_fillval)
+        assert np.all(
+            result["ccsds_qf"].values & np.uint8(ImapHiL1bDeFlags.BAD_DETECTOR_VOLTAGE)
+        )
+        actual_hv_deltas = {
+            field: result.attrs[field]
+            for field in CalibrationProductConfig.GAIN_MATCH_FIELDS
+        }
+        assert all(np.isnan(value) for value in actual_hv_deltas.values())
+
+    @mock.patch("imap_processing.hi.hi_l1b.any_good_direct_events", return_value=True)
+    def test_nominal_pointing_multiple_matching_segments(self, mock_any_good_de):
+        """All HVSCI segments match the reference; no events are excluded."""
+        hk_ds = self._make_hk_ds(
+            ["HVSCI", "HVSCI", "HVSCI", "OTHER", "HVSCI", "HVSCI", "HVSCI"],
+            [1000, 1001, 1002, 1003, 1004, 1005, 1006],
+        )
+        de_ds = self._make_de_ds([1000, 1001, 1002, 1004, 1005, 1006])
+        original_esa_energy_step = de_ds["esa_energy_step"].values.copy()
+
+        result = de_gain_test_filter(de_ds, hk_ds)
+
+        assert result is de_ds
+        # No events fall outside a matching segment, so nothing is forced to
+        # FILLVAL and no BAD_DETECTOR_VOLTAGE bits are set.
+        np.testing.assert_array_equal(
+            result["esa_energy_step"].values, original_esa_energy_step
+        )
+        assert np.all(
+            result["ccsds_qf"].values & np.uint8(ImapHiL1bDeFlags.BAD_DETECTOR_VOLTAGE)
+            == 0
+        )
+        expected_hv_deltas = CalibrationProductConfig.compute_gain_match_values(
+            NOMINAL_HV_VALUES
+        )
+        actual_hv_deltas = {
+            field: result.attrs[field]
+            for field in CalibrationProductConfig.GAIN_MATCH_FIELDS
+        }
+        assert actual_hv_deltas == pytest.approx(expected_hv_deltas)
+
+    @mock.patch("imap_processing.hi.hi_l1b.any_good_direct_events", return_value=True)
+    def test_mid_pointing_gain_test_excluded(self, mock_any_good_de):
+        """A HVSCI segment drifting outside tolerance is excluded as a gain test."""
+        hk_ds = self._make_hk_ds(
+            [
+                "HVSCI",
+                "HVSCI",
+                "HVSCI",
+                "OTHER",
+                "HVSCI",
+                "HVSCI",
+                "HVSCI",
+                "OTHER",
+                "HVSCI",
+                "HVSCI",
+                "HVSCI",
+            ],
+            [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010],
+        )
+        # The middle HVSCI segment (indices 4-6) has cem_f drift far beyond
+        # HiConstants.GAIN_TEST_HV_DELTA_V["cem_f"], simulating a mid-pointing
+        # gain test.
+        assert HiConstants.GAIN_TEST_HV_DELTA_V["cem_f"] < 300.0
+        hk_ds["cem_f"].values[4:7] = NOMINAL_HV_VALUES["cem_f"] + 300.0
+
+        # One direct event per housekeeping packet's MET.
+        de_ds = self._make_de_ds([1000, 1001, 1002, 1004, 1005, 1006, 1008, 1009, 1010])
+        esa_energy_step_fillval = de_ds["esa_energy_step"].attrs["FILLVAL"]
+        original_esa_energy_step = de_ds["esa_energy_step"].values.copy()
+
+        result = de_gain_test_filter(de_ds, hk_ds)
+
+        assert result is de_ds
+        expected_bad_mask = np.array(
+            [False, False, False, True, True, True, False, False, False]
+        )
+        expected_esa_energy_step = np.where(
+            expected_bad_mask, esa_energy_step_fillval, original_esa_energy_step
+        )
+        np.testing.assert_array_equal(
+            result["esa_energy_step"].values, expected_esa_energy_step
+        )
+        expected_qf_bits = np.where(
+            expected_bad_mask, np.uint8(ImapHiL1bDeFlags.BAD_DETECTOR_VOLTAGE), 0
+        )
+        np.testing.assert_array_equal(result["ccsds_qf"].values, expected_qf_bits)
+
+        # HV delta attrs reflect the pointing's reference (first segment),
+        # which is unaffected by the excluded mid-pointing gain test segment.
+        expected_hv_deltas = CalibrationProductConfig.compute_gain_match_values(
+            NOMINAL_HV_VALUES
+        )
+        actual_hv_deltas = {
+            field: result.attrs[field]
+            for field in CalibrationProductConfig.GAIN_MATCH_FIELDS
+        }
+        assert actual_hv_deltas == pytest.approx(expected_hv_deltas)
+
+    @mock.patch("imap_processing.hi.hi_l1b.any_good_direct_events", return_value=True)
+    def test_uses_esa_step_met_not_ccsds_met(self, mock_any_good_de):
+        """Classification uses esa_step_met, not the delayed ccsds_met.
+
+        On real flight data, a packet's ccsds_met (creation time) can lag its
+        esa_step_met (when the ESA was actually stepped, i.e. when data
+        collection began) by tens to over a hundred seconds -- enough to
+        spill a packet's ccsds_met across a good/bad segment boundary. Using
+        ccsds_met for classification would wrongly flag this event bad.
+        """
+        hk_ds = self._make_hk_ds(
+            ["HVSCI", "HVSCI", "HVSCI"],
+            [1000, 1001, 1002],
+        )
+        # ccsds_met is far outside the only HVSCI segment (which ends at
+        # MET 1002), simulating flight-software packet-creation delay, but
+        # esa_step_met correctly falls within it.
+        de_ds = self._make_de_ds([1090], esa_step_met_values=[1001])
+
+        result = de_gain_test_filter(de_ds, hk_ds)
+
+        assert result is de_ds
+        assert (
+            result["esa_energy_step"].values[0]
+            != (de_ds["esa_energy_step"].attrs["FILLVAL"])
+        )
+        assert (
+            result["ccsds_qf"].values[0]
+            & np.uint8(ImapHiL1bDeFlags.BAD_DETECTOR_VOLTAGE)
+        ) == 0
+
+
+class TestComputeReferenceHvValues:
+    """Test suite for compute_reference_hv_values function."""
+
+    def test_compute_reference_hv_values(self):
+        """Test that the median of each GAIN_TEST_HV_DELTA_V field is returned."""
+        n = 5
+        fields = list(HiConstants.GAIN_TEST_HV_DELTA_V)
+        data_vars = {
+            field: (["epoch"], np.arange(n, dtype=float) + i * 100)
+            for i, field in enumerate(fields)
+        }
+        hk_segment_ds = xr.Dataset(data_vars, coords={"epoch": np.arange(n)})
+
+        result = compute_reference_hv_values(hk_segment_ds)
+
+        assert set(result.keys()) == set(fields)
+        for i, field in enumerate(fields):
+            expected_median = float(np.median(np.arange(n) + i * 100))
+            assert result[field] == expected_median
+            assert isinstance(result[field], float)
 
 
 class TestGetEsaToEsaEnergyStepLut:
@@ -389,19 +670,24 @@ class TestGetEsaToEsaEnergyStepLut:
         inner_esa_lo,
         outer_esa_values,
         shcoarse_values,
+        **hv_overrides,
     ):
         """Helper method to create mock L1B housekeeping dataset."""
-        return xr.Dataset(
-            {
-                "op_mode": (["epoch"], op_modes),
-                "sci_esa_step": (["epoch"], esa_steps),
-                "inner_esa_state": (["epoch"], inner_esa_state),
-                "inner_esa_hi": (["epoch"], inner_esa_hi),
-                "inner_esa_lo": (["epoch"], inner_esa_lo),
-                "outer_esa": (["epoch"], outer_esa_values),
-                "shcoarse": (["epoch"], shcoarse_values),
-            }
-        )
+        n = len(op_modes)
+        hv_values = dict(NOMINAL_HV_VALUES)
+        hv_values.update(hv_overrides)
+        data_vars = {
+            "op_mode": (["epoch"], op_modes),
+            "sci_esa_step": (["epoch"], esa_steps),
+            "inner_esa_state": (["epoch"], inner_esa_state),
+            "inner_esa_hi": (["epoch"], inner_esa_hi),
+            "inner_esa_lo": (["epoch"], inner_esa_lo),
+            "outer_esa": (["epoch"], outer_esa_values),
+            "shcoarse": (["epoch"], shcoarse_values),
+        }
+        for field, value in hv_values.items():
+            data_vars[field] = (["epoch"], np.full(n, value))
+        return xr.Dataset(data_vars)
 
     @mock.patch("imap_processing.hi.hi_l1b.EsaEnergyStepLookupTable")
     def test_basic_functionality_single_hvsci_segment(self, mock_lut_class):
@@ -424,7 +710,7 @@ class TestGetEsaToEsaEnergyStepLut:
             shcoarse_values=[1000, 1001, 1002, 1003],
         )
 
-        result = get_esa_to_esa_energy_step_lut(l1b_hk_ds, self.esa_energies_lut)
+        lut = get_esa_to_esa_energy_step_lut(l1b_hk_ds, self.esa_energies_lut)
 
         # Verify LUT was instantiated
         mock_lut_class.assert_called_once()
@@ -446,7 +732,7 @@ class TestGetEsaToEsaEnergyStepLut:
         # Second call should be for esa_step 2
         assert calls[1][0] == (1000, 1003, 2, 2)
 
-        assert result == self.mock_lut
+        assert lut == self.mock_lut
 
     @mock.patch("imap_processing.hi.hi_l1b.EsaEnergyStepLookupTable")
     def test_multiple_hvsci_segments(self, mock_lut_class):
@@ -489,11 +775,11 @@ class TestGetEsaToEsaEnergyStepLut:
             shcoarse_values=[1000, 1001, 1002],
         )
 
-        result = get_esa_to_esa_energy_step_lut(l1b_hk_ds, self.esa_energies_lut)
+        lut = get_esa_to_esa_energy_step_lut(l1b_hk_ds, self.esa_energies_lut)
 
         # No add_entry calls should be made
         self.mock_lut.add_entry.assert_not_called()
-        assert result == self.mock_lut
+        assert lut == self.mock_lut
 
     @mock.patch("imap_processing.hi.hi_l1b.EsaEnergyStepLookupTable")
     @mock.patch("imap_processing.hi.hi_l1b.logger")

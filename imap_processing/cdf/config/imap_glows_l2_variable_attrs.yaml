@@ -11,49 +11,48 @@ bins_label:
   VAR_TYPE: metadata
 
 flags_label:
-#  CATDESC: L1B flag identifier for daily-ocurrence counter
-  CATDESC: Flag names for daily-occurence counters of L1B flags
+#  CATDESC: L1B flag identifier for daily-occurrence counter
+  CATDESC: Flag names for daily-occurrence counters of L1B flags
   FIELDNAM: L1B flag name
-  FORMAT: A4
+  FORMAT: A42
   VAR_TYPE: metadata
 
 default_attrs: &default_attrs
   # TODO: Remove unneeded attributes once SAMMI is fixed
-  RESOLUTION: ' '
   DISPLAY_TYPE: no_plot
-  TIME_BASE: J2000
-  TIME_SCALE: Terrestrial Time
-  REFERENCE_POSITION: Rotating Earth Geoid
-  UNITS: ' '
   FILLVAL: *int_fillval
+  UNITS: ' '
   VALIDMIN: *min_epoch
 
 support_data_defaults: &support_data_defaults
   <<: *default_attrs
   DEPEND_0: epoch
-  VALIDMIN: 0
-  VALIDMAX: 1
   DISPLAY_TYPE: time_series
-  VAR_TYPE: support_data
   FORMAT: I10
-  RESOLUTION: ISO8601
+  VALIDMAX: 1
+  VALIDMIN: 0
+  VAR_TYPE: support_data
 
 # UTC Strings
 time_data_defaults: &time_data_defaults
   <<: *support_data_defaults
+  DICT_KEY: SPASE>Support>SupportQuantity:Temporal
   FILLVAL: ' '
   FORMAT: A30
+  REFERENCE_POSITION: Rotating Earth Geoid
+  RESOLUTION: ISO8601
+  TIME_BASE: J2000
+  TIME_SCALE: Terrestrial Time
   UNITS: N/A
-  VALIDMIN: ' '
   VALIDMAX: ' '
-  DICT_KEY: SPASE>Support>SupportQuantity:Temporal
+  VALIDMIN: ' '
 
 lightcurve_defaults: &lightcurve_defaults
   <<: *support_data_defaults
-  DISPLAY_TYPE: no_plot
   DEPEND_1: bins
-  VAR_TYPE: data
+  DISPLAY_TYPE: no_plot
   LABL_PTR_1: bins_label
+  VAR_TYPE: data
 
   derived_from_spice_kernels: &derived_from_spice_kernels
     VAR_NOTES: Derived from SPICE Kernels
@@ -122,9 +121,9 @@ total_l1b_inputs:
 
 identifier:
   <<: *support_data_defaults
-  CATDESC: Spin pointing number to identify observational day
+  CATDESC: Spin-axis pointing number to identify observational day
   DICT_KEY: SPASE>Support>SupportQuantity:Temporal
-  FIELDNAM: Spin pointing number
+  FIELDNAM: Spin-axis pointing number
   FILLVAL: -9223372036854775808
   FORMAT: I5
   LABLAXIS: Pointing no.
@@ -404,11 +403,13 @@ bad_time_flag_occurrences:
   DICT_KEY: SPASE>Support>SupportQuantity:DataQuality
   DISPLAY_TYPE: no_plot
   FIELDNAM: Occurrences of bad-time flags
-  FILLVAL: -1.0E+31
+  FILLVAL: 65535
   FORMAT: I5
-  LABL_PTR_1: flags_label # MS: I do not understand this
   LABLAXIS: No. of cases
-  VALIDMAX: 20000
+  LABL_PTR_1: flags_label # MS: I do not understand this
+  VALIDMAX: 65535
+  VALIDMIN: 0
+  VAR_TYPE: data
 
 spin_angle:
   <<: *lightcurve_defaults
@@ -482,6 +483,7 @@ flux_uncertainties:
 histogram_flag_array:
   <<: *lightcurve_defaults
   CATDESC: Bad-angle flags for histogram bins
+  CDF_DATA_TYPE: CDF_UINT1
   DICT_KEY: SPASE>Support>SupportQuantity:DataQuality
   FIELDNAM: Bad-angle flags for histogram
   FILLVAL: 255
@@ -490,7 +492,7 @@ histogram_flag_array:
   UNITS: ' '
   VALIDMAX: 15 # only 4 bits currently used
   VALIDMIN: 0
-  VAR_TYPE: support_data
+  VAR_TYPE: data
 
 ecliptic_lon:
   <<: *lightcurve_defaults
@@ -521,9 +523,10 @@ ecliptic_lat:
 number_of_bins:
   <<: *support_data_defaults
   CATDESC: Number of bins in histogram
+  CDF_DATA_TYPE: CDF_UINT2
   DICT_KEY: SPASE>Support>SupportQuantity:Other
   FIELDNAM: Number of bins in histogram
-  FILLVAL: -9223372036854775808
+  FILLVAL: *max_uint16
   FORMAT: I4
   LABLAXIS: No. of bins
   UNITS: ' '

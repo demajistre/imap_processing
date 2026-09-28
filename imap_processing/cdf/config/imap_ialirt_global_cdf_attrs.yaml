@@ -1,5 +1,6 @@
 instrument_base: &instrument_base
   Descriptor: IALiRT>IMAP I-ALiRT (IMAP Active Link in Real Time)
+  File_naming_convention: source_descriptor_datatype_yyyyMMdd_vNNN
   TEXT: >
     The Interstellar Mapping and Acceleration Probe (IMAP) mission includes the Active Link
     for Real-Time (I-ALiRT) system, which provides continuous, low-latency space weather data.
@@ -19,4 +20,4 @@ imap_ialirt_l1_realtime:
     <<: *instrument_base
     Data_type: L1_REALTIME>Level-1 Realtime
     Logical_source: imap_ialirt_l1_realtime
-    Logical_source_description: IMAP Active Link for Real-Time (I-ALiRT) Level-1 Data.
+    Logical_source_description: IMAP Active Link for Real-Time (I-ALiRT) Level-1 Data

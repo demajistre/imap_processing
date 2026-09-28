@@ -94,7 +94,10 @@ def test_find_sweep_starts():
     time = np.arange(26)
     sequence_number = time % 12
     ds = xr.Dataset(
-        {"seq_number": sequence_number, "shcoarse": np.arange(1, 27, 1)},
+        {
+            "seq_number": ("epoch", sequence_number),
+            "shcoarse": ("epoch", np.arange(1, 27, 1)),
+        },
         coords={"epoch": met_to_ttj2000ns(time)},
     )
 
@@ -107,7 +110,7 @@ def test_find_sweep_starts():
 
     # Creating test data that doesn't have start sequence.
     # Sequence number range is 0-11.
-    ds["seq_number"] = np.arange(3, 29)
+    ds["seq_number"] = ("epoch", np.arange(3, 29))
     start_indices = find_sweep_starts(ds)
     np.testing.assert_array_equal(start_indices, [])
 
@@ -174,7 +177,7 @@ def test_process_swapi_science(decom_test_data):
     }
 
     # Test CDF File
-    cdf_filename = "imap_swapi_l1_sci_20240924_v999.cdf"
+    cdf_filename = "imap_swapi_l1_sci_20240924_v001.0001.cdf"
     cdf_path = write_cdf(processed_data)
     assert cdf_path.name == cdf_filename
 
@@ -205,10 +208,10 @@ def test_swapi_l1_cdf(mock_get_file_paths, swapi_l0_test_data_path):
     )
     processed_data = swapi_l1(collection_obj, descriptor="hk")
     # hk cdf file
-    l1a_hk_cdf_filename = "imap_swapi_l1a_hk_20240924_v999.cdf"
+    l1a_hk_cdf_filename = "imap_swapi_l1a_hk_20240924_v001.0001.cdf"
     hk_cdf_path = write_cdf(processed_data[0])
     assert hk_cdf_path.name == l1a_hk_cdf_filename
-    l1b_hk_cdf_filename = "imap_swapi_l1b_hk_20240924_v999.cdf"
+    l1b_hk_cdf_filename = "imap_swapi_l1b_hk_20240924_v001.0001.cdf"
     l1b_hk_cdf_path = write_cdf(processed_data[1])
     assert l1b_hk_cdf_path.name == l1b_hk_cdf_filename
 
@@ -236,6 +239,6 @@ def test_swapi_l1_cdf(mock_get_file_paths, swapi_l0_test_data_path):
     assert processed_data[0].attrs["Apid"] == f"{SWAPIAPID.SWP_SCI}"
 
     # Test CDF File
-    cdf_filename = "imap_swapi_l1_sci_20240924_v999.cdf"
+    cdf_filename = "imap_swapi_l1_sci_20240924_v001.0001.cdf"
     cdf_path = write_cdf(processed_data[0])
     assert cdf_path.name == cdf_filename

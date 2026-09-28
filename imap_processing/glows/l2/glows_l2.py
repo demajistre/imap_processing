@@ -7,7 +7,7 @@ import numpy as np
 import xarray as xr
 
 from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
-from imap_processing.glows import FLAG_LENGTH
+from imap_processing.glows import BAD_TIME_FLAG_NAMES, FLAG_LENGTH
 from imap_processing.glows.l1b.glows_l1b_data import (
     PipelineSettings,
 )
@@ -21,6 +21,66 @@ from imap_processing.spice.time import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_global_attr_to_string(value: object) -> str:
+    """
+    Convert a scalar-like global attribute value to a CDF_CHAR-compatible string.
+
+    Parameters
+    ----------
+    value : object
+        Global attribute value to normalize.
+
+    Returns
+    -------
+    str
+        String representation suitable for writing as a CDF_CHAR global attribute.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple, np.ndarray)):
+        array = np.asarray(value)
+        if array.size == 0:
+            return ""
+        value = array.reshape(-1)[0]
+    return str(value)
+
+
+def _pad_daily_lightcurve_bins(value: object, fillval: object) -> np.ndarray:
+    """
+    Pad chopped daily-lightcurve bin data back to the standard bin count.
+
+    Parameters
+    ----------
+    value : object
+        Chopped daily-lightcurve bin data.
+    fillval : object
+        CDF fill value used for padded bins.
+
+    Returns
+    -------
+    numpy.ndarray
+        Bin data padded to the standard bin count.
+    """
+    value_array = np.asarray(value)
+    padded_dtype = value_array.dtype
+    fillval_dtype = np.asarray(fillval).dtype
+
+    if np.issubdtype(padded_dtype, np.integer):
+        try:
+            cast_fillval = np.array(fillval, dtype=padded_dtype).item()
+        except (OverflowError, TypeError, ValueError):
+            padded_dtype = np.result_type(padded_dtype, fillval_dtype)
+        else:
+            if cast_fillval != fillval:
+                padded_dtype = np.result_type(padded_dtype, fillval_dtype)
+
+    padded = np.full(GlowsConstants.STANDARD_BIN_COUNT, fillval, dtype=padded_dtype)
+    padded[: len(value_array)] = value_array
+    return padded
 
 
 def glows_l2(
@@ -71,11 +131,11 @@ def glows_l2(
         logger.warning("All flux and exposure times are zero. Returning empty list.")
         return []
     else:
-        return [create_l2_dataset(l2, cdf_attrs)]
+        return [create_l2_dataset(l2, cdf_attrs, input_dataset.attrs)]
 
 
 def create_l2_dataset(
-    histogram_l2: HistogramL2, attrs: ImapCdfAttributes
+    histogram_l2: HistogramL2, attrs: ImapCdfAttributes, input_attrs: dict
 ) -> xr.Dataset:
     """
     Create a xarray dataset from a HistogramL2 dataclass.
@@ -88,17 +148,18 @@ def create_l2_dataset(
         L2 data.
     attrs : ImapCdfAttributes
         CDF attributes for GLOWS L2.
+    input_attrs : dict
+        Global attributes from the input L1B dataset to propagate.
 
     Returns
     -------
     xarray.Dataset
         L2 dataset for output to CDF file.
     """
-    # Each L2 file only has one timestamp.
-    # TODO: If we want this to point to the start time, we need to set the attribute
-    #  variable BIN_LOCATION to 0. Otherwise, we need this to be halfway between start
-    #  time and end time.
-    time_data = np.array([histogram_l2.start_time], dtype=np.float64)
+    # Each L2 file only has one timestamp: the midpoint between start and end time.
+    time_data = np.array(
+        [(histogram_l2.start_time + histogram_l2.end_time) / 2], dtype=np.float64
+    )
     # TODO: Create CDF attributes
     epoch_time = xr.DataArray(
         time_data,
@@ -115,20 +176,22 @@ def create_l2_dataset(
     )
 
     bins_label = xr.DataArray(
-        -1,
+        bins.data.astype(str),
         name="bins_label",
+        dims=["bins_label"],
         attrs=attrs.get_variable_attributes("bins_label", check_schema=False),
     )
 
     flags = xr.DataArray(
-        np.ones(FLAG_LENGTH, dtype=np.uint8),
+        np.arange(FLAG_LENGTH, dtype=np.uint8),
         dims=["flags"],
         attrs=attrs.get_variable_attributes("flags_dim", check_schema=False),
     )
 
     flags_label = xr.DataArray(
-        -1,
+        np.array(BAD_TIME_FLAG_NAMES),
         name="flags_label",
+        dims=["flags_label"],
         attrs=attrs.get_variable_attributes("flags_label", check_schema=False),
     )
 
@@ -149,6 +212,11 @@ def create_l2_dataset(
         },
         attrs=attrs.get_global_attributes("imap_glows_l2_hist"),
     )
+
+    output.attrs["flight_software_version"] = _normalize_global_attr_to_string(
+        input_attrs.get("flight_software_version", "")
+    )
+    output.attrs["pkts_file_name"] = input_attrs.get("pkts_file_name", [])
 
     ecliptic_variables = [
         "spacecraft_location_average",
@@ -187,7 +255,9 @@ def create_l2_dataset(
             # Convert time to UTC
             utc_string = [met_to_utc(ttj2000ns_to_met(value))]
             output[key] = xr.DataArray(
-                utc_string, dims=["epoch"], attrs=attrs.get_variable_attributes(key)
+                utc_string,
+                dims=["epoch"],
+                attrs=attrs.get_variable_attributes(key),
             )
         elif key != "daily_lightcurve":
             val = value
@@ -199,12 +269,11 @@ def create_l2_dataset(
                 attrs=attrs.get_variable_attributes(key),
             )
 
-    n_bins = histogram_l2.daily_lightcurve.number_of_bins
     for key, value in dataclasses.asdict(histogram_l2.daily_lightcurve).items():
         if key == "number_of_bins":
             # number_of_bins does not have a bins dimension.
             output[key] = xr.DataArray(
-                np.array([value]),
+                np.array([value], dtype=np.uint16),
                 dims=["epoch"],
                 attrs=attrs.get_variable_attributes(key),
             )
@@ -213,9 +282,7 @@ def create_l2_dataset(
             # avoid operating on FILLVAL data. Re-expand to STANDARD_BIN_COUNT
             # here, filling unused bins with the variable's CDF FILLVAL.
             var_attrs = attrs.get_variable_attributes(key)
-            fillval = var_attrs["FILLVAL"]
-            padded = np.full(GlowsConstants.STANDARD_BIN_COUNT, fillval)
-            padded[:n_bins] = value
+            padded = _pad_daily_lightcurve_bins(value, var_attrs["FILLVAL"])
             output[key] = xr.DataArray(
                 np.array([padded]),
                 dims=["epoch", "bins"],

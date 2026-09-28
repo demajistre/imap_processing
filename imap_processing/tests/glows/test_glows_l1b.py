@@ -20,6 +20,7 @@ from imap_processing.glows.l1b.glows_l1b_data import (
     HistogramL1B,
     PipelineSettings,
 )
+from imap_processing.spice.geometry import cartesian_to_spherical
 from imap_processing.spice.time import met_to_datetime64
 from imap_processing.tests.glows.conftest import mock_update_spice_parameters
 
@@ -44,7 +45,7 @@ def hist_dataset():
         "spin_period_variance": np.zeros((20,)),
         "pulse_length_average": np.zeros((20,)),
         "pulse_length_variance": np.zeros((20,)),
-        "imap_start_time": np.zeros((20,)),
+        "imap_start_time": np.arange(1, 21, dtype=np.float64),
         "imap_time_offset": np.zeros((20,)),
         "glows_start_time": np.zeros((20,)),
         "glows_time_offset": np.zeros((20,)),
@@ -116,7 +117,7 @@ def de_dataset():
         np.arange(20),
         name="epoch",
         dims=["epoch"],
-        attrs=cdf_attrs.get_variable_attributes("epoch"),
+        attrs=cdf_attrs.get_variable_attributes("epoch", check_schema=False),
     )
 
     within_the_second = xr.DataArray(
@@ -252,6 +253,8 @@ def test_histogram_mapping(
                 mock_ancillary_exclusions,
                 mock_ancillary_parameters,
                 pipeline_settings,
+                0.0,  # daily_total_counts_average
+                0.0,  # daily_total_counts_std_dev
             )
         ).values()
     )
@@ -318,6 +321,8 @@ def test_process_histogram(
         mock_ancillary_exclusions,
         mock_ancillary_parameters,
         pipeline_settings,
+        0.0,  # daily_total_counts_average
+        0.0,  # daily_total_counts_std_dev
     )
 
     output = process_histogram(
@@ -330,7 +335,9 @@ def test_process_histogram(
 
     # flags[0:10]  = onboard flags (1=good, 0=bad), one per bit of flags_set_onboard
     # flags[10]    = is_generated_on_ground (1=onboard, 0=ground)
-    # flags[11]    = is_beyond_daily_statistical_error (placeholder, always 1)
+    # flags[11]    = is_beyond_daily_statistical_error (1 here: total counts of 0
+    #                matches the daily_total_counts_average/std_dev of 0.0/0.0 passed
+    #                in above, so it's within the n-sigma band)
     # flags[12:16] = std_dev threshold flags
     # flags[16]    = is_beyond_background
     assert test_l1b.flags[6] == 0  # is_night
@@ -340,6 +347,52 @@ def test_process_histogram(
     assert test_l1b.flags[14] == 0  # is_spin_std_ok
     assert test_l1b.flags[15] == 0  # is_pulse_ok
     assert test_l1b.flags[16] == 1  # is_beyond_background
+
+
+@patch.object(
+    HistogramL1B,
+    "flag_uv_and_excluded",
+    return_value=(np.zeros(3600, dtype=bool), np.zeros(3600, dtype=bool)),
+)
+@patch.object(HistogramL1B, "update_spice_parameters", autospec=True)
+def test_process_histogram_daily_reference_excludes_night(
+    mock_spice_function,
+    mock_flag_uv_and_excluded,
+    hist_dataset,
+    mock_ancillary_exclusions,
+    mock_ancillary_parameters,
+    mock_pipeline_settings,
+):
+    """The daily total-counts reference excludes night blocks.
+
+    Daytime blocks share one count, so the reference std is 0 and the band is a
+    single point. A night block with a different count falls outside it (flag 0)
+    only because it was excluded from -- not averaged into -- the reference.
+    """
+    mock_spice_function.side_effect = mock_update_spice_parameters
+
+    onboard = np.zeros(20)
+    n_events = np.full(20, 100.0)
+    onboard[[0, 1]] = 64.0  # flags_set_onboard bit 6 (is_night)
+    n_events[[0, 1]] = 500.0
+    hist_dataset["flags_set_onboard"][:] = onboard
+    hist_dataset["number_of_events"][:] = n_events
+
+    pipeline_settings = PipelineSettings(
+        mock_pipeline_settings.sel(
+            epoch=mock_pipeline_settings.epoch[0], method="nearest"
+        )
+    )
+    output = process_histogram(
+        hist_dataset,
+        mock_ancillary_exclusions,
+        mock_ancillary_parameters,
+        pipeline_settings,
+    )
+    flag_idx = [f.name for f in dataclasses.fields(HistogramL1B)].index("flags")
+    flags = output[flag_idx].values  # (epoch, 17); column 11 = is_beyond_daily
+    assert flags[5, 11] == 1  # a daytime block sits inside the daytime band
+    assert flags[0, 11] == 0  # a night block is excluded, so its count is outside
 
 
 @patch.object(
@@ -376,6 +429,43 @@ def test_bins_from_histogram_not_nbins(
     for da in output:
         if "bins" in da.sizes:
             assert da.sizes["bins"] == 3600
+
+
+@patch.object(
+    HistogramL1B,
+    "flag_uv_and_excluded",
+    return_value=(np.zeros(3600, dtype=bool), np.zeros(3600, dtype=bool)),
+)
+@patch.object(HistogramL1B, "update_spice_parameters", autospec=True)
+def test_process_histogram_skips_zero_imap_start_time(
+    mock_spice_function,
+    mock_flag_uv_and_excluded,
+    hist_dataset,
+    mock_ancillary_exclusions,
+    mock_ancillary_parameters,
+    mock_pipeline_settings,
+):
+    mock_spice_function.side_effect = mock_update_spice_parameters
+    pipeline_settings = PipelineSettings(
+        mock_pipeline_settings.sel(
+            epoch=mock_pipeline_settings.epoch[0], method="nearest"
+        )
+    )
+
+    # Set two epochs to invalid time
+    hist_dataset["imap_start_time"].values[3] = 0.0
+    hist_dataset["imap_start_time"].values[7] = 0.0
+
+    output = process_histogram(
+        hist_dataset,
+        mock_ancillary_exclusions,
+        mock_ancillary_parameters,
+        pipeline_settings,
+    )
+    # 2 invalid epochs dropped; 18 valid epochs remain in every output DataArray
+    for da in output:
+        assert da.sizes["epoch"] == 18
+    assert len(output[0].coords["epoch"]) == 18
 
 
 def test_process_de(de_dataset, ancillary_dict, mock_ancillary_parameters):
@@ -592,6 +682,8 @@ def test_hist_spice_output(
                 epoch=mock_pipeline_settings.epoch[0], method="nearest"
             ),
         ),
+        "daily_total_counts_average": 0.0,
+        "daily_total_counts_std_dev": 0.0,
     }
 
     kernels = [
@@ -629,6 +721,9 @@ def test_hist_spice_output(
         # (since the 0.05° threshold is exactly half the 0.1° bin spacing.
         assert np.count_nonzero(region_mask) == 1
 
+        assert np.all(uv_mask[1397:1437])
+        assert region_mask[1417]
+
         # Test flag_from_mask_dataset using the fixture data
         instr_mask = hist_data.flag_from_mask_dataset(
             day_exclusions.exclusions_by_instr_team
@@ -637,3 +732,35 @@ def test_hist_spice_output(
         assert np.count_nonzero(instr_mask) == 10
 
         # TODO: Maxine will validate actual data with GLOWS team
+
+
+def test_calculate_calculate_look_vectors_dps_uses_correct_azimuth_calculation(
+    furnish_kernels,
+):
+    kernels = [
+        "imap_130.tf",
+    ]
+    with furnish_kernels(kernels):
+        imap_spin_angle_bin_cntr = np.array([0, 90, 180, 270])
+        some_position_angle_offset_average = np.double(41.5)
+
+        expected_azimuth = (
+            np.array([360, 90, 180, 270]) - some_position_angle_offset_average
+        )
+        expected_radius = np.array([1, 1, 1, 1])
+
+        # As-built mounting elevation of GLOWS in the s/c frame is 15.025791 degrees
+        expected_elevation = np.array([15.025791, 15.025791, 15.025791, 15.025791])
+
+        look_vectors = HistogramL1B.calculate_look_vectors_dps(
+            imap_spin_angle_bin_cntr, some_position_angle_offset_average
+        )
+
+        actual_spherical = cartesian_to_spherical(look_vectors)
+        actual_azimuth = actual_spherical[:, 1]
+        actual_radius = actual_spherical[:, 0]
+        actual_elevation = actual_spherical[:, 2]
+
+        np.testing.assert_allclose(expected_azimuth, actual_azimuth)
+        np.testing.assert_allclose(expected_radius, actual_radius)
+        np.testing.assert_allclose(expected_elevation, actual_elevation)

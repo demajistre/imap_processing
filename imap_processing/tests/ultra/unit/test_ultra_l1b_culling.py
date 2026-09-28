@@ -359,10 +359,10 @@ def test_flag_low_voltage(test_data):
     n_spins = 20
     mock_status_dataset = xr.Dataset(
         data_vars={
-            "shcoarse": np.arange(n_spins),
+            "shcoarse": ("epoch", np.arange(n_spins)),
             # Set Voltage below threshold
-            "rightdeflection_v": np.full(n_spins, 0.5),
-            "leftdeflection_v": np.full(n_spins, 1.5),
+            "rightdeflection_v": ("epoch", np.full(n_spins, 0.5)),
+            "leftdeflection_v": ("epoch", np.full(n_spins, 1.5)),
         }
     )
     spins = np.arange(n_spins)
@@ -452,15 +452,15 @@ def test_get_energy_and_spin_dependent_rejection_mask():
     ]  # Example energy bin edges (4 edges = 3 bins)
     goodtimes_dataset = xr.Dataset(
         data_vars={
-            "spin_number": np.arange(n_spins),
-            "quality_low_voltage": np.full(n_spins, 0),
-            "quality_high_energy": np.full(n_spins, 0),
-            "quality_statistics": np.full(n_spins, 0),
-            "energy_range_flags": energy_range_flags,
-            "energy_range_edges": energy_range_edges,
-            "quality_upstream_ion_1": np.full(n_spins, 0),
-            "quality_upstream_ion_2": np.full(n_spins, 0),
-            "quality_spectral": np.full(n_spins, 0),
+            "spin_number": ("spin", np.arange(n_spins)),
+            "quality_low_voltage": ("spin", np.full(n_spins, 0)),
+            "quality_high_energy": ("spin", np.full(n_spins, 0)),
+            "quality_statistics": ("spin", np.full(n_spins, 0)),
+            "energy_range_flags": ("energy_bin", energy_range_flags),
+            "energy_range_edges": ("energy_edge", energy_range_edges),
+            "quality_upstream_ion_1": ("spin", np.full(n_spins, 0)),
+            "quality_upstream_ion_2": ("spin", np.full(n_spins, 0)),
+            "quality_spectral": ("spin", np.full(n_spins, 0)),
         }
     )
     # update quality flags to test that events get rejected
@@ -839,10 +839,9 @@ def test_flag_statistical_outliers_invalid_events():
         energy_range_edges,
         mask,
     )
-    # check that no flags are set because there were no valid events to calculate
-    # statistics on.
+    # check that all flags are set because the mask marks all events as invalid.
     np.testing.assert_array_equal(
-        quality_flags, np.zeros_like(quality_flags, dtype=bool)
+        quality_flags, np.ones_like(quality_flags, dtype=bool)
     )
     # check that all energy bins are marked as converged (no valid events is not a
     # failure case for convergence since we just can't calculate statistics.
@@ -873,11 +872,11 @@ def test_validate_stat_cull(setup_repoint_47_data):
     """Validate that statistical-outlier quality flags match expected results."""
     # read test data from csv files
     results_df = pd.read_csv(
-        TEST_PATH / "validate_stat_culling_results_repoint00047_v2.csv"
+        TEST_PATH / "validate_stat_culling_results_repoint00047_v3.csv"
     )
     de_ds, _, spin_tbin_edges = setup_repoint_47_data
     # Get the energy ranges
-    energy_ranges = np.array([4.2, 9.4425, 21.2116, 47.2388, 105.202, 316.335])
+    energy_ranges = get_binned_energy_ranges(build_energy_bins()[0])
 
     # Create a mask of flagged events to test that the stat cull algorithm
     # properly ignores these. The test data was created using this exact mask as well.

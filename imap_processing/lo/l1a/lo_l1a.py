@@ -90,8 +90,15 @@ def lo_l1a(dependency: Path) -> list[xr.Dataset]:
         ds = combine_segmented_packets(ds)
 
         ds = parse_events(ds, attr_mgr)
-        ds = add_dataset_attrs(ds, attr_mgr, logical_source)
-        datasets_to_return.append(ds)
+        if ds["de_count"].sum() == 0:
+            # No direct events were reported in any of the ASC groups. The
+            # per-event variables would all be zero length, which cannot be
+            # written to a CDF, so skip the product entirely. This matches the
+            # behavior for a file with no ILO_SCI_DE packets at all.
+            logger.info("No direct events found. Skipping the DE data product.")
+        else:
+            ds = add_dataset_attrs(ds, attr_mgr, logical_source)
+            datasets_to_return.append(ds)
     if LoAPID.ILO_STAR in datasets_by_apid:
         logger.info(
             f"\nProcessing {LoAPID(LoAPID.ILO_STAR).name} "
@@ -180,21 +187,25 @@ def add_dataset_attrs(
     # Get global attributes
     dataset.attrs.update(attr_mgr.get_global_attributes(logical_source))
     # Get attributes for shcoarse and epoch
-    dataset.shcoarse.attrs.update(attr_mgr.get_variable_attributes("shcoarse"))
-    dataset.epoch.attrs.update(attr_mgr.get_variable_attributes("epoch"))
+    dataset.shcoarse.attrs.update(
+        attr_mgr.get_variable_attributes("shcoarse", check_schema=False)
+    )
+    dataset.epoch.attrs.update(
+        attr_mgr.get_variable_attributes("epoch", check_schema=False)
+    )
 
     if logical_source == "imap_lo_l1a_spin":
         spin = xr.DataArray(
             data=np.arange(0, 28, dtype=np.uint8),
             name="spin",
             dims=["spin"],
-            attrs=attr_mgr.get_variable_attributes("spin"),
+            attrs=attr_mgr.get_variable_attributes("spin", check_schema=False),
         )
         spin_label = xr.DataArray(
             data=spin.values.astype(str),
             name="spin_label",
             dims=["spin_label"],
-            attrs=attr_mgr.get_variable_attributes("spin_label"),
+            attrs=attr_mgr.get_variable_attributes("spin_label", check_schema=False),
         )
 
         dataset = dataset.assign_coords(spin=spin, spin_label=spin_label)
@@ -226,11 +237,6 @@ def add_dataset_attrs(
                 "chksum",
             ]
         )
-        # An empty DEPEND_0 is being added to support_data
-        # variables that should only have DEPEND_1
-        # Removing Depend_0 here.
-        # TODO: Should look for a fix to this issue
-        del dataset["spin"].attrs["DEPEND_0"]
 
     elif logical_source == "imap_lo_l1a_histogram":
         # Create coordinates for the dataset
@@ -238,38 +244,46 @@ def add_dataset_attrs(
             data=np.arange(0, 6, dtype=np.uint8),
             name="azimuth_60",
             dims=["azimuth_60"],
-            attrs=attr_mgr.get_variable_attributes("azimuth_60"),
+            attrs=attr_mgr.get_variable_attributes("azimuth_60", check_schema=False),
         )
         azimuth_60_label = xr.DataArray(
             data=azimuth_60.values.astype(str),
             name="azimuth_60_label",
             dims=["azimuth_60_label"],
-            attrs=attr_mgr.get_variable_attributes("azimuth_60_label"),
+            attrs=attr_mgr.get_variable_attributes(
+                "azimuth_60_label", check_schema=False
+            ),
         )
         azimuth_6 = xr.DataArray(
             data=np.arange(0, 60, dtype=np.uint8),
             name="azimuth_6",
             dims=["azimuth_6"],
-            attrs=attr_mgr.get_variable_attributes("azimuth_6"),
+            attrs=attr_mgr.get_variable_attributes("azimuth_6", check_schema=False),
         )
         azimuth_6_label = xr.DataArray(
             data=azimuth_6.values.astype(str),
             name="azimuth_6_label",
             dims=["azimuth_6_label"],
-            attrs=attr_mgr.get_variable_attributes("azimuth_6_label"),
+            attrs=attr_mgr.get_variable_attributes(
+                "azimuth_6_label", check_schema=False
+            ),
         )
 
         esa_step = xr.DataArray(
             data=np.arange(1, 8, dtype=np.uint8),
             name="esa_step",
             dims=["esa_step"],
-            attrs=attr_mgr.get_variable_attributes("esa_step_coord"),
+            attrs=attr_mgr.get_variable_attributes(
+                "esa_step_coord", check_schema=False
+            ),
         )
         esa_step_label = xr.DataArray(
             esa_step.values.astype(str),
             name="esa_step_label",
             dims=["esa_step_label"],
-            attrs=attr_mgr.get_variable_attributes("esa_step_label"),
+            attrs=attr_mgr.get_variable_attributes(
+                "esa_step_label", check_schema=False
+            ),
         )
 
         dataset = dataset.assign_coords(
@@ -294,13 +308,6 @@ def add_dataset_attrs(
                 "pkt_len",
             ]
         )
-        # An empty DEPEND_0 is being added to support_data
-        # variables that should only have DEPEND_1
-        # Removing Depend_0 here.
-        # TODO: Should look for a fix to this issue
-        del dataset["azimuth_60"].attrs["DEPEND_0"]
-        del dataset["azimuth_6"].attrs["DEPEND_0"]
-        del dataset["esa_step"].attrs["DEPEND_0"]
 
     elif logical_source == "imap_lo_l1a_de":
         # Create the coordinates for the dataset
@@ -308,14 +315,16 @@ def add_dataset_attrs(
             data=np.arange(sum(dataset["de_count"].values), dtype=np.uint16),
             name="direct_events",
             dims=["direct_events"],
-            attrs=attr_mgr.get_variable_attributes("direct_events"),
+            attrs=attr_mgr.get_variable_attributes("direct_events", check_schema=False),
         )
 
         direct_events_label = xr.DataArray(
             direct_events.values.astype(str),
             name="direct_events_label",
             dims=["direct_events_label"],
-            attrs=attr_mgr.get_variable_attributes("direct_events_label"),
+            attrs=attr_mgr.get_variable_attributes(
+                "direct_events_label", check_schema=False
+            ),
         )
 
         # For DEs, shcoarse applies to each ASC group and is not per individual epoch
@@ -340,24 +349,6 @@ def add_dataset_attrs(
                 "data",
             ]
         )
-        # An empty DEPEND_0 is being added to support_data
-        # variables that should only have DEPEND_1
-        # Removing Depend_0 here.
-        # TODO: Should look for a fix to this issue
-        for var in [
-            "direct_events",
-            "coincidence_type",
-            "de_time",
-            "mode",
-            "esa_step",
-            "tof0",
-            "tof1",
-            "tof2",
-            "tof3",
-            "pos",
-            "cksm",
-        ]:
-            dataset[var].attrs.pop("DEPEND_0")
 
     return dataset
 

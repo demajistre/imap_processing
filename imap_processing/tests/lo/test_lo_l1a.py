@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 from imap_processing import imap_module_directory
+from imap_processing.cdf.utils import write_cdf
 from imap_processing.lo.l1a.lo_l1a import lo_l1a
 
 
@@ -23,10 +24,34 @@ def test_lo_l1a():
 
     # Assert
     assert len(output_dataset) == len(expected_logical_source)
+
+    no_depend_0_vars = [
+        "direct_events",
+        "coincidence_type",
+        "de_time",
+        "mode",
+        "esa_step",
+        "tof0",
+        "tof1",
+        "tof2",
+        "tof3",
+        "pos",
+        "cksm",
+        "spin",
+        "azimuth_6",
+        "azimuth_60",
+        "spin_label",
+    ]
     for dataset, logical_source in zip(
         output_dataset, expected_logical_source, strict=False
     ):
+        # Try writing out the dataset to cdf in an attempt to catch any issues
+        # with attributes that cdflib doesn't like
+        _ = write_cdf(dataset)
         assert logical_source == dataset.attrs["Logical_source"]
+        for var in dataset:
+            if var in no_depend_0_vars or var.endswith("label"):
+                assert "DEPEND_0" not in dataset[var].attrs
 
 
 def test_lo_l1a_dataset():

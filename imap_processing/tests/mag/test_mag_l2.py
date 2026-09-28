@@ -1,10 +1,12 @@
 from unittest.mock import patch
 
+import cdflib
 import numpy as np
 import pytest
 import xarray as xr
 
 from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
+from imap_processing.cdf.utils import write_cdf
 from imap_processing.mag.constants import FILLVAL, DataMode
 from imap_processing.mag.l2.mag_l2 import mag_l2, retrieve_matrix_from_l2_calibration
 from imap_processing.mag.l2.mag_l2_data import MagL2, ValidFrames
@@ -100,10 +102,43 @@ def test_mag_l2_attributes(
         assert "DICT_KEY" in vectors_attrs
 
         assert f"CoordinateSystemName:{frame}" in vectors_attrs["DICT_KEY"]
+        assert vectors_attrs["UNITS"] == "nT"
+        assert vectors_attrs["FORMAT"] == "F13.5"
+        assert np.isclose(vectors_attrs["VALIDMIN"], -1.0e5)
+        assert np.isclose(vectors_attrs["VALIDMAX"], 1.0e5)
+        expected_vector_text = {
+            "SRF": (
+                "Magnetic field in the Spacecraft Reference Frame (SRF)",
+                "Magnetic Field SRF",
+            ),
+            "GSE": ("Magnetic field in GSE coordinates", "Magnetic Field GSE"),
+            "GSM": ("Magnetic field in GSM coordinates", "Magnetic Field GSM"),
+            "RTN": ("Magnetic field in RTN coordinates", "Magnetic Field RTN"),
+            "DSRF": (
+                "Magnetic field in the Despun Spacecraft Reference Frame (DSRF)",
+                "Magnetic Field DSRF",
+            ),
+        }
+        assert vectors_attrs["CATDESC"] == expected_vector_text[frame][0]
+        assert vectors_attrs["FIELDNAM"] == expected_vector_text[frame][1]
 
         assert "magnitude" in dataset.data_vars
         assert "range" in dataset.data_vars
         assert dataset["magnitude"].attrs["UNITS"] == "nT"
+        assert dataset["magnitude"].attrs["VAR_TYPE"] == "data"
+        assert (
+            dataset["magnitude"].attrs["CATDESC"] == "Magnitude of the magnetic field"
+        )
+        assert dataset["range"].attrs["CATDESC"] == "Range of the magnetometer sensor"
+        expected_direction_label = (
+            np.array(["B_R", "B_T", "B_N"])
+            if frame == "RTN"
+            else np.array(["Bx", "By", "Bz"])
+        )
+        np.testing.assert_array_equal(
+            dataset["direction_label"].data,
+            expected_direction_label,
+        )
         assert dataset["range"].attrs["DICT_KEY"] == (
             "SPASE>Support>SupportQuantity:InstrumentMode"
         )
@@ -140,6 +175,28 @@ def test_mag_l2(norm_dataset, mag_test_l2_data):
     for i, dataset in enumerate(l2):
         assert expected_frames[i].var_name in dataset.data_vars
         assert expected_frames[i].name in dataset.attrs["Data_type"]
+        dataset.attrs["Data_version"] = "001"
+        cdf_filepath = write_cdf(dataset)
+        with cdflib.CDF(cdf_filepath) as cdf_file:
+            vector_info = cdf_file.varinq(expected_frames[i].var_name)
+            vector_attrs = cdf_file.varattsget(expected_frames[i].var_name)
+            direction_label = cdf_file.varget("direction_label")
+
+        assert vector_info.Data_Type_Description == "CDF_FLOAT"
+        assert np.isclose(vector_attrs["FILLVAL"], np.float32(-1.0e31))
+        assert vector_attrs["FORMAT"] == "F13.5"
+        assert np.isclose(vector_attrs["VALIDMIN"], np.float32(-1.0e5))
+        assert np.isclose(vector_attrs["VALIDMAX"], np.float32(1.0e5))
+        assert vector_attrs["UNITS"] == "nT"
+        expected_direction_label = (
+            np.array(["B_R", "B_T", "B_N"])
+            if expected_frames[i] == ValidFrames.RTN
+            else np.array(["Bx", "By", "Bz"])
+        )
+        np.testing.assert_array_equal(
+            direction_label,
+            expected_direction_label,
+        )
 
 
 def test_mag_l2_some_epochs_not_in_spice(norm_dataset, mag_test_l2_data):
@@ -213,7 +270,7 @@ def test_offset_application(norm_dataset, mag_test_l2_data):
     new_timeshift[1] = -0.00001
     new_timeshift[2] = 1e-9
 
-    expected_timeshift = norm_dataset["epoch"].data
+    expected_timeshift = norm_dataset["epoch"].data.copy()
     # Timeshift is provided in seconds, epoch is in nanoseconds
     expected_timeshift[0] = expected_timeshift[0] + 10000
     expected_timeshift[1] = expected_timeshift[1] - 10000
@@ -302,6 +359,30 @@ def test_midnight_boundary(norm_dataset):
 
     # midnight not included in previous day
     assert midnight not in l2.epoch
+
+
+def test_truncate_to_24h_no_data_raises(norm_dataset):
+    day = np.datetime64("2025-10-17").astype("datetime64[D]")
+
+    # Shift all timestamps 5 days forward so none fall within the target day
+    shifted_timestamps = norm_dataset["epoch"].data + int(5 * 8.64e13)
+
+    l2 = MagL2(
+        vectors=norm_dataset["vectors"].data[:, :3],
+        epoch=shifted_timestamps,
+        range=norm_dataset["vectors"].data[:, 3],
+        global_attributes={},
+        quality_flags=np.zeros(len(norm_dataset["epoch"].data)),
+        quality_bitmask=np.zeros(len(norm_dataset["epoch"].data)),
+        data_mode=DataMode.NORM,
+        offsets=np.zeros((len(norm_dataset["epoch"].data), 3)),
+        timedelta=np.zeros(len(norm_dataset["epoch"].data)),
+    )
+
+    with pytest.raises(
+        ValueError, match="After truncating to 24 hours, no data remains."
+    ):
+        l2.truncate_to_24h(day)
 
 
 @pytest.mark.parametrize(
@@ -558,3 +639,90 @@ def test_qf(norm_dataset):
     assert "quality_bitmask" in output.data_vars
     assert np.array_equal(output["quality_flags"].data, qf)
     assert np.array_equal(output["quality_bitmask"].data, qf_bitmask)
+    assert output["quality_flags"].attrs["VAR_TYPE"] == "data"
+    assert output["quality_flags"].attrs["UNITS"] == "0=good"
+    assert (
+        output["quality_flags"].attrs["CATDESC"]
+        == "Data quality flag. 0: Good data, 1: Bad data."
+    )
+    assert output["quality_flags"].attrs["FIELDNAM"] == "Quality Flag"
+    assert (
+        "More detail on the data quality can be found in the quality bitmask."
+        in output["quality_flags"].attrs["VAR_NOTES"]
+    )
+    assert output["quality_bitmask"].attrs["FIELDNAM"] == "Quality Bitmask"
+    assert output["quality_bitmask"].attrs["LABLAXIS"] == "QB"
+    assert output["quality_bitmask"].dtype == np.uint16
+    assert output["quality_bitmask"].attrs["CATDESC"] == (
+        "Bitmask indicating when spacecraft related activities influenced "
+        "the measurement."
+    )
+    assert (
+        "Bit 0: Data is sourced from secondary sensor"
+        in output["quality_bitmask"].attrs["VAR_NOTES"]
+    )
+    assert (
+        "Bits 4-7: Reserved for in flight calibration"
+        in output["quality_bitmask"].attrs["VAR_NOTES"]
+    )
+
+    output.attrs["Data_version"] = "001"
+    cdf_filepath = write_cdf(output)
+    with cdflib.CDF(cdf_filepath) as cdf_file:
+        qf_attrs = cdf_file.varattsget("quality_flags")
+        qf_bitmask_attrs = cdf_file.varattsget("quality_bitmask")
+        qf_bitmask_info = cdf_file.varinq("quality_bitmask")
+
+    assert qf_attrs["FORMAT"] == "I1"
+    assert int(qf_attrs["VALIDMAX"]) == 1
+    assert qf_bitmask_info.Data_Type_Description == "CDF_UINT2"
+    assert qf_bitmask_attrs["FORMAT"] == "I3"
+    assert int(qf_bitmask_attrs["FILLVAL"]) == 65535
+    assert int(qf_bitmask_attrs["VALIDMIN"]) == 0
+    assert int(qf_bitmask_attrs["VALIDMAX"]) == 255
+
+
+def test_mag_l2_burst_inherits_shared_metadata(norm_dataset, mag_test_l2_data):
+    """Test that burst output inherits the shared MAG L2 metadata cleanup."""
+    calibration_dataset = mag_test_l2_data[0]
+    offset_dataset = mag_test_l2_data[1]
+
+    test_dataset = norm_dataset.copy()
+    test_dataset.attrs["Logical_source"] = "imap_mag_l1c_burst-mago"
+
+    with patch(
+        "imap_processing.mag.l2.mag_l2_data.frame_transform",
+        side_effect=lambda *args, **kwargs: args[1],
+    ):
+        burst_datasets = mag_l2(
+            calibration_dataset,
+            offset_dataset,
+            test_dataset,
+            np.datetime64("2025-10-17"),
+            mode=DataMode.BURST,
+            frames=[ValidFrames.SRF],
+        )
+
+    assert len(burst_datasets) == 1
+    burst_dataset = burst_datasets[0]
+
+    assert burst_dataset["quality_flags"].attrs["VAR_TYPE"] == "data"
+    assert burst_dataset["quality_flags"].attrs["UNITS"] == "0=good"
+    assert burst_dataset["magnitude"].attrs["VAR_TYPE"] == "data"
+    assert (
+        burst_dataset["magnitude"].attrs["CATDESC"] == "Magnitude of the magnetic field"
+    )
+    assert burst_dataset["b_srf"].attrs["UNITS"] == "nT"
+    assert (
+        burst_dataset["b_srf"].attrs["CATDESC"]
+        == "Magnetic field in the Spacecraft Reference Frame (SRF)"
+    )
+    assert burst_dataset["b_srf"].attrs["FIELDNAM"] == "Magnetic Field SRF"
+    np.testing.assert_array_equal(
+        burst_dataset["direction_label"].data,
+        np.array(["Bx", "By", "Bz"]),
+    )
+    assert (
+        "Bit 0: Data is sourced from secondary sensor"
+        in burst_dataset["quality_bitmask"].attrs["VAR_NOTES"]
+    )

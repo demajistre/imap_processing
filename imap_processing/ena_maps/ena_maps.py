@@ -756,6 +756,7 @@ class HiPointingSet(LoHiBasePointingSet):
         "exposure_times": "exposure_factor",
         "background_rates": "bg_rate",
         "background_rates_uncertainty": "bg_rate_sys_err",
+        "counts": "ena_count",
     }
 
     def __init__(self, dataset: xr.Dataset | str | Path):
@@ -804,8 +805,8 @@ class LoPointingSet(LoHiBasePointingSet):
             The midpoint value [J2000 ET] of the pointing set.
         """
         epoch_delta = met_to_ttj2000ns(
-            self.data["pointing_end_met"].data
-        ) - met_to_ttj2000ns(self.data["pointing_start_met"].data)
+            self.data["pointing_end_met"].item()
+        ) - met_to_ttj2000ns(self.data["pointing_start_met"].item())
         return float(ttj2000ns_to_et(self.epoch + epoch_delta / 2))
 
 
@@ -1454,13 +1455,20 @@ class RectangularSkyMap(AbstractSkyMap):
                     name=f"{coord_name}_label",
                     dims=[coord_name],
                 )
-            # We can set the correct delta value of the spatial coordinates
+            # Set the correct delta values for the time coordinate
             if coord_name == CoordNames.TIME.value:
+                # Delta minus is always zero because epoch is the start time
+                cdf_ds[f"{coord_name}_delta_minus"] = xr.DataArray(
+                    xr.zeros_like(cdf_ds[coord_name]),
+                    name=f"{coord_name}_delta_minus",
+                    dims=[coord_name],
+                )
                 cdf_ds[f"{coord_name}_delta"] = xr.DataArray(
                     xr.full_like(cdf_ds[coord_name], self.max_epoch - self.min_epoch),
                     name=f"{coord_name}_delta",
                     dims=[coord_name],
                 )
+            # Set the correct delta values of the spatial coordinates
             elif coord_name in self.spatial_coords:
                 cdf_ds[f"{coord_name}_delta"] = xr.DataArray(
                     xr.full_like(cdf_ds[coord_name], self.spacing_deg / 2),
@@ -1491,11 +1499,25 @@ class RectangularSkyMap(AbstractSkyMap):
         # Now set global attributes
         map_attrs = cdf_attrs.get_global_attributes(f"imap_{instrument}_{level}_enamap")
         map_attrs["Spacing_degrees"] = str(self.spacing_deg)
-        for key in ["Data_type", "Logical_source", "Logical_source_description"]:
+        for key in ["Data_type", "Logical_source"]:
             map_attrs[key] = map_attrs[key].format(
                 descriptor=descriptor,
                 sensor=sensor,
             )
+        # Use the MapDescriptor to generate the Logical_source_description
+        # when possible, but preserve previous behavior for non-descriptor
+        # strings so later validation still raises the intended errors.
+        try:
+            md = naming.MapDescriptor.from_string(descriptor)
+        except ValueError:
+            map_attrs["Logical_source_description"] = map_attrs[
+                "Logical_source_description"
+            ].format(
+                descriptor=descriptor,
+                sensor=sensor,
+            )
+        else:
+            map_attrs["Logical_source_description"] = md.to_logical_source_description()
         # Always add the following attributes to the map
         map_attrs.update(
             {
@@ -1533,12 +1555,11 @@ class RectangularSkyMap(AbstractSkyMap):
             {"DELTA_PLUS_VAR": "epoch_delta", "BIN_LOCATION": 0}
         )
 
-        # And CATDESC for principal data
+        # Generate CATDESC for all map variables data
         md = naming.MapDescriptor.from_string(descriptor)
-        principal_data = md.principal_data_var
-        if principal_data in cdf_ds:
-            cdf_ds[principal_data].attrs["CATDESC"] = md.to_catdesc()
-
+        for data_var in cdf_ds.data_vars.keys():
+            if map_var_catdesc := md.build_map_var_catdesc(data_var):
+                cdf_ds[data_var].attrs["CATDESC"] = map_var_catdesc
         return cdf_ds
 
     def to_properties_dict(self) -> dict:
@@ -1798,8 +1819,10 @@ class HealpixSkyMap(AbstractSkyMap):
             )
         # Log the mean pixel value and the number of subdivisions for debugging
         logger.debug(
-            f"    Mean pixel value at Number of subdivisions: {num_subdivisions}: "
-            f"array of shape {mean_pixel_value.shape}: {mean_pixel_value}"
+            "    Mean pixel value at Number of subdivisions: %s: array of shape %s: %s",
+            num_subdivisions,
+            mean_pixel_value.shape,
+            mean_pixel_value,
         )
         return mean_pixel_value
 

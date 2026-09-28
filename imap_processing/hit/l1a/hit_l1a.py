@@ -150,6 +150,8 @@ def subcom_sectorates(sci_dataset: xr.Dataset) -> xr.Dataset:
 
     # Update counts for science frames where data is available
     for i, mod_10 in enumerate(hdr_min_count_mod_10):
+        # NOTE: this ignore is needed to avoid a mypy error in Git
+        # tests.
         data_by_species_and_energy_range[mod_10]["counts"][i] = updated_dataset[  # type: ignore[index]
             "sectorates"
         ].values[i]
@@ -389,8 +391,6 @@ def subset_sectored_counts(
         A dataset of complete sectored counts and corresponding livetime values
         for the processing day.
     """
-    # TODO: Update to use fill values for partial frames rather than drop them
-
     # Modify livetime_counter to use a new epoch coordinate
     # that is aligned with the original epoch dimension. This
     # ensures that livetime doesn't get filtered when the original

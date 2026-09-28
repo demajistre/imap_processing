@@ -212,7 +212,11 @@ class MagL2L1dBase:
         )
 
         direction_label = xr.DataArray(
-            direction.values.astype(str),
+            np.array(
+                ["B_R", "B_T", "B_N"]
+                if self.frame == ValidFrames.RTN
+                else ["Bx", "By", "Bz"]
+            ),
             name="direction_label",
             dims=["direction_label"],
             attrs=attribute_manager.get_variable_attributes(
@@ -242,14 +246,14 @@ class MagL2L1dBase:
             self.quality_flags,
             name="quality_flags",
             dims=["epoch"],
-            attrs=attribute_manager.get_variable_attributes("qf_bitmask"),
+            attrs=attribute_manager.get_variable_attributes("qf"),
         )
 
         quality_bitmask = xr.DataArray(
-            self.quality_bitmask,
+            self.quality_bitmask.astype(np.uint16),
             name="quality_bitmask",
             dims=["epoch"],
-            attrs=attribute_manager.get_variable_attributes("qf"),
+            attrs=attribute_manager.get_variable_attributes("qf_bitmask"),
         )
 
         rng = xr.DataArray(
@@ -322,6 +326,9 @@ class MagL2L1dBase:
 
         if self.epoch_et is not None:
             self.epoch_et = self.epoch_et[day_start_index:day_end_index]
+
+        if self.epoch.shape[0] == 0:
+            raise ValueError("After truncating to 24 hours, no data remains.")
 
     @staticmethod
     def calculate_magnitude(

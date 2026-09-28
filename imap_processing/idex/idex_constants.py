@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 
+from imap_processing import imap_module_directory
 from imap_processing.spice.geometry import SpiceFrame
 
 
@@ -46,10 +47,17 @@ NS_TO_S = 1e-9
 # Microseconds to seconds conversion
 US_TO_S = 1e-6
 
+# Low-rate timing constants
+LOW_SAMPLE_RATE_HZ: float = 4.0625e6
+SAMPLES_PER_BLOCK: int = 8
+DT_BLOCK: float = SAMPLES_PER_BLOCK / LOW_SAMPLE_RATE_HZ
+
 # Seconds in a day
 SECONDS_IN_DAY = 86400
 # Nanoseconds in day
 NANOSECONDS_IN_DAY = SECONDS_IN_DAY * int(1e9)
+# Picocoulombs to coulombs conversion factor
+PICOCOULOMB_TO_COULOMB = 1e-12
 # fg to kg conversion factor
 FG_TO_KG = 1e-15
 
@@ -57,16 +65,33 @@ TARGET_HIGH_FREQUENCY_CUTOFF = 100
 
 TARGET_NOISE_FREQUENCY = 7000
 
+# This CSV was provided by the IDEX team.
+# It defines the start and stop date of each 10-day window for IDEX l1a processing.
+# All IDEX data will be grouped into these 10-day windows from l1a-l2a.
+# the last window of each year may be less than 10 days. That is expected.
+IDEX_10_DAY_RANGES_PATH = f"{imap_module_directory}/idex/idex_10_day_CDF_names.csv"
+
 
 class ConversionFactors(float, Enum):
-    """Conversion factor values (DN to picocoulombs) for each of the six waveforms."""
+    """Conversion factors from DN to the engineering units for each waveform.
 
-    TOF_High = 2.89e-4
-    TOF_Low = 5.14e-4
-    TOF_Mid = 1.13e-2
+    TOF channels are reported in milliamperes (mA); target and ion-grid channels are
+    reported in picocoulombs (pC).
+    """
+
+    TOF_High = 7.50e-5
+    TOF_Low = 1.34e-1
+    TOF_Mid = 2.93e-3
     Target_Low = 1.58e1
     Target_High = 1.63e-1
     Ion_Grid = 7.46e-4
+
+
+# Constants for the ion-grid V(R) relation, where R is the ion-grid to target
+# charge ratio expressed in percent and velocity is returned in km/s.
+ION_GRID_VELOCITY_SCALE = 55.0
+ION_GRID_VELOCITY_EXPONENT = -3.2
+ION_GRID_VELOCITY_OFFSET = 1.5
 
 
 SPICE_ARRAYS = [

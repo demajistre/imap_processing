@@ -10,16 +10,54 @@ from pathlib import Path
 
 import imap_data_access
 import numpy as np
+import pandas as pd
 import xarray as xr
 from cdflib.logging import logger as cdflib_logger
 from cdflib.xarray import cdf_to_xarray, xarray_to_cdf
 from cdflib.xarray.cdf_to_xarray import ISTP_TO_XARRAY_ATTRS
+from imap_data_access.file_validation import Version
 
 import imap_processing
-from imap_processing._version import __version__, __version_tuple__  # noqa: F401
 from imap_processing.spice.time import TTJ2000_EPOCH
 
 logger = logging.getLogger(__name__)
+
+
+def _cdf_compatible_dataset(dataset: xr.Dataset) -> xr.Dataset:
+    """Return a shallow copy whose extension arrays are NumPy-backed.
+
+    ``cdflib`` expects array-valued variables to be backed by NumPy arrays.  In
+    particular, it cannot serialize the string extension arrays that pandas 3
+    uses by default.  Converting at the CDF boundary keeps the in-memory dataset
+    unchanged and also supports explicitly created extension arrays on pandas 2.
+
+    Parameters
+    ----------
+    dataset : xarray.Dataset
+        Dataset to prepare for serialization by ``cdflib``.
+
+    Returns
+    -------
+    xarray.Dataset
+        Shallow copy with extension-array variables converted to NumPy arrays.
+    """
+    converted = dataset.copy(deep=False)
+    for name, variable in dataset.variables.items():
+        if not isinstance(variable.data, pd.api.extensions.ExtensionArray):
+            continue
+
+        numpy_variable = xr.Variable(
+            variable.dims,
+            variable.data.to_numpy(copy=True),
+            attrs=variable.attrs,
+        )
+        numpy_variable.encoding = variable.encoding.copy()
+        if name in dataset.coords:
+            converted = converted.assign_coords({name: numpy_variable})
+        else:
+            converted[name] = numpy_variable
+
+    return converted
 
 
 def load_cdf(
@@ -121,16 +159,22 @@ def write_cdf(
     version = dataset.attrs.get("Data_version", None)
     if version is None:
         warnings.warn(
-            "No Data_version attribute found in dataset. Using default v999.",
+            "No Data_version attribute found in dataset. Using default 001.0001",
             stacklevel=2,
         )
-        version = "999"
+        version = "001.0001"
         dataset.attrs["Data_version"] = version
-    elif not re.match(r"\d{3}", version):
-        raise ValueError(
-            f"The Data_version attribute {version} does not match expected format XXX."
-        )
 
+    # Data_version may be stored without the leading 'v'; add it before validating.
+    version_string = version if str(version).startswith("v") else f"v{version}"
+    try:
+        version_obj = Version.from_version(version_string)
+    except ValueError as e:
+        raise ValueError(
+            f"The Data_version attribute {version} is not a valid version string. "
+            f"Please use the format matching the pattern "
+            f"'{Version.science_version_pattern}' instead."
+        ) from e
     repointing = dataset.attrs.get("Repointing", None)
 
     repointing_int = int(repointing[-5:]) if repointing else None
@@ -139,7 +183,8 @@ def write_cdf(
         data_level=data_level,
         descriptor=descriptor,
         start_time=start_date,
-        version=f"v{version}",  # Ensure version is prefixed with 'v'
+        major_version=version_obj.major,
+        minor_version=version_obj.minor,
         repointing=repointing_int,
     )
     file_path = Path(science_file.construct_path())
@@ -152,7 +197,7 @@ def write_cdf(
     # The Logical_file_id is always the name of the file without the extension
     dataset.attrs["Logical_file_id"] = file_path.stem
     # Add the processing version to the dataset attributes
-    dataset.attrs["ground_software_version"] = imap_processing._version.__version__
+    dataset.attrs["ground_software_version"] = imap_processing.__version__
     dataset.attrs["Generation_date"] = datetime.datetime.now(
         datetime.timezone.utc
     ).strftime("%Y%m%d")
@@ -177,7 +222,11 @@ def write_cdf(
             # strict ISTP compliance
             logger.info("Disabling cdflib ISTP logging for level 1 data products")
             cdflib_logger.setLevel(logging.ERROR)
-        xarray_to_cdf(dataset, str(file_path), **extra_cdf_kwargs)
+        xarray_to_cdf(
+            _cdf_compatible_dataset(dataset),
+            str(file_path),
+            **extra_cdf_kwargs,
+        )
     finally:
         # Set back to the previous logging level
         cdflib_logger.setLevel(prev_cdflib_level)
@@ -218,7 +267,7 @@ def parse_filename_like(filename_like: str) -> re.Match:
         r"(?P<descriptor>[^_]+)"  # Required descriptor
         r"(_(?P<start_date>\d{8}))?"  # Optional start date
         r"(-repoint(?P<repointing>\d{5}))?"  # Optional repointing field
-        r"(?:_(?P<version>v\d{3}))?"  # Optional version
+        rf"(?:_(?P<version>{Version.version_regex()}))?"  # Optional version
         r"(?:\.(?P<extension>cdf|pkts))?$"  # Optional extension
     )
     match = re.match(regex_str, filename_like)

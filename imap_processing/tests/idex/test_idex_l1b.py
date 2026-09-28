@@ -10,10 +10,13 @@ import xarray as xr
 from imap_processing import imap_module_directory
 from imap_processing.cdf.imap_cdf_manager import ImapCdfAttributes
 from imap_processing.cdf.utils import write_cdf
+from imap_processing.idex.idex_constants import DT_BLOCK, ConversionFactors
+from imap_processing.idex.idex_event_flags import ALL_FLAG_NAMES, EVENT_FLAG_NAMES
 from imap_processing.idex.idex_l1b import (
     TRIGGER_LABELS,
     EventMessage,
     TriggerOrigin,
+    get_event_dead_time,
     get_spice_data,
     get_trigger_mode_and_level,
     get_trigger_origin,
@@ -21,6 +24,7 @@ from imap_processing.idex.idex_l1b import (
     unpack_instrument_settings,
 )
 from imap_processing.idex.idex_utils import get_idex_attrs
+from imap_processing.spice.time import ttj2000ns_to_met
 from imap_processing.tests.idex import conftest
 
 
@@ -52,8 +56,18 @@ def test_l1b_logical_source(l1b_dataset: xr.Dataset):
     l1b_dataset : xr.Dataset
         A ``xarray`` dataset containing the test data
     """
-    expected_src = "imap_idex_l1b_sci-1week"
+    expected_src = "imap_idex_l1b_sci-10days"
     assert l1b_dataset.attrs["Logical_source"] == expected_src
+
+
+def test_event_flags_are_carried_to_l1b(l1b_dataset: xr.Dataset):
+    """Verify event flags are present and core flags remain exclusive."""
+    for flag_name in ALL_FLAG_NAMES:
+        assert flag_name in l1b_dataset
+        assert set(np.unique(l1b_dataset[flag_name])) <= {0, 1}
+
+    core_flags = sum(l1b_dataset[flag_name] for flag_name in EVENT_FLAG_NAMES[:3])
+    np.testing.assert_array_equal(core_flags, np.ones_like(core_flags))
 
 
 def test_idex_cdf_file(l1b_dataset: xr.Dataset):
@@ -67,7 +81,7 @@ def test_idex_cdf_file(l1b_dataset: xr.Dataset):
 
     file_name = write_cdf(l1b_dataset)
     assert file_name.exists()
-    assert file_name.name == "imap_idex_l1b_sci-1week_20231218_v999.cdf"
+    assert file_name.name == "imap_idex_l1b_sci-10days_20231218_v001.0001.cdf"
 
 
 def test_idex_waveform_units(l1b_dataset: xr.Dataset):
@@ -89,17 +103,14 @@ def test_idex_waveform_units(l1b_dataset: xr.Dataset):
         assert l1b_dataset[var_name].attrs["UNITS"] == row["unit"]
 
     # Check waveform units
-    waveform_var_names = [
-        "TOF_High",
-        "TOF_Low",
-        "TOF_Mid",
-        "Ion_Grid",
-        "Target_Low",
-        "Target_High",
-    ]
+    for var_name in ("TOF_High", "TOF_Low", "TOF_Mid"):
+        assert l1b_dataset[var_name].attrs["UNITS"] == "mA"
 
-    for var_name in waveform_var_names:
+    for var_name in ("Ion_Grid", "Target_Low", "Target_High"):
         assert l1b_dataset[var_name].attrs["UNITS"] == "pC"
+
+    for var_name in ("trigger_level_lg", "trigger_level_mg", "trigger_level_hg"):
+        assert l1b_dataset[var_name].attrs["UNITS"] == "mA"
 
 
 def test_unpack_instrument_settings():
@@ -166,9 +177,9 @@ def test_get_trigger_settings_success(decom_test_data_sci):
     expected_modes_mg[0] = "MGThreshold"
     expected_levels_lg = np.full(n_epochs, np.nan)
     expected_levels_hg = expected_levels_lg.copy()
-    expected_levels_hg[1:] = 0.16762
+    expected_levels_hg[1:] = 580.0 * 7.50e-5
     expected_levels_mg = expected_levels_lg.copy()
-    expected_levels_mg[0] = 1023.0 * 1.13e-2
+    expected_levels_mg[0] = 1023.0 * 2.93e-3
 
     var_names = ["trigger_mode_lg", "trigger_mode_mg", "trigger_mode_hg"]
     expected_modes = [expected_modes_lg, expected_modes_mg, expected_modes_hg]
@@ -234,7 +245,6 @@ def test_get_spice_data(
     mock_spice_functions,
     use_fake_spin_data_for_time,
     decom_test_data_sci,
-    furnish_kernels,
 ):
     """
     Test the get_spice_data() function.
@@ -244,15 +254,14 @@ def test_get_spice_data(
     decom_test_data_sci : xarray.Dataset
         L1a dataset
     """
-    kernels = ["naif0012.tls"]
-    times = decom_test_data_sci["shcoarse"].data
+    times = ttj2000ns_to_met(decom_test_data_sci["epoch"].data)
     use_fake_spin_data_for_time(np.min(times), np.max(times))
 
     # Mock attribute manager variable attrs
     idex_attrs = ImapCdfAttributes()
 
     with (
-        furnish_kernels(kernels),
+        # furnish_kernels(kernels),
         mock.patch.object(idex_attrs, "get_variable_attributes") as mock_attrs,
     ):
         mock_attrs.return_value = {"CATDESC": "Test var"}
@@ -334,6 +343,13 @@ def test_validate_l1b_idex_data_variables(
         event=np.arange(l1b_dataset.sizes["epoch"])
     )
     # Compare each corresponding variable
+    # The team validation file stores TOF waveforms using the legacy pC factors.
+    # Convert those reference arrays to the corrected L1B mA units before comparing.
+    legacy_tof_factors = {
+        "TOF L": 5.14e-1,
+        "TOF H": 2.89e-4,
+        "TOF M": 1.13e-2,
+    }
     for var in l1b_example_data.data_vars:
         if var not in arrays_to_skip:
             # Get the corresponding array name
@@ -348,15 +364,18 @@ def test_validate_l1b_idex_data_variables(
                 l1b_dataset[cdf_var]
             except KeyError:
                 continue
+            expected_data = np.squeeze(l1b_example_data[var])
+            if var in legacy_tof_factors:
+                expected_data = expected_data * (
+                    ConversionFactors[cdf_var].value / legacy_tof_factors[var]
+                )
             if l1b_dataset[cdf_var].dtype == object:
-                assert (
-                    l1b_dataset[cdf_var].data == np.squeeze(l1b_example_data[var])
-                ).all(), warning
+                assert (l1b_dataset[cdf_var].data == expected_data).all(), warning
 
             else:
                 np.testing.assert_array_almost_equal(
                     l1b_dataset[cdf_var].data,
-                    np.squeeze(l1b_example_data[var]),
+                    expected_data,
                     decimal=4,
                     err_msg=warning,
                 )
@@ -371,15 +390,18 @@ def test_l1b_msg_processing(decom_test_data_msg: xr.Dataset):
         A dataset containing the MSG data produced by the l1a processing.
     """
     msg_ds = decom_test_data_msg.copy()
-    # Set 2 consecutive events to have pulser on and pulser off
+    # Set an on and an off within 5 seconds
     msg_ds.messages[2] = EventMessage.PULSER_ON.value
-    msg_ds.messages[3] = EventMessage.PULSER_OFF.value
-    # Set 2 to have a non-consecutive pulser on and pulser off to check that
-    # non-consecutive events are treated as non-valid pulser on and off events
+    msg_ds.messages[4] = EventMessage.PULSER_OFF.value
+    new_epoch = msg_ds.epoch.values.copy()
+    new_epoch[3] = new_epoch[2]
+    new_epoch[4] = new_epoch[2] + 4_000_000_000  # Four seconds in ns
+    # Set an on and an off outside of 5 seconds
     msg_ds.messages[20] = EventMessage.PULSER_ON.value
     msg_ds.messages[22] = EventMessage.PULSER_OFF.value
+    msg_ds = msg_ds.assign_coords(epoch=new_epoch)
     # Process the MSG data with the l1b function
-    test_l1b_msg = idex_l1b(msg_ds, "msg")
+    test_l1b_msg = idex_l1b(msg_ds, "msg-10days")
     expected_vars = [
         "epoch",
         "pulser_on",
@@ -417,5 +439,30 @@ def test_no_valid_messages(decom_test_data_msg: xr.Dataset):
     msg_ds = decom_test_data_msg.copy()
     # Set all messages to a value that is not a valid pulser on or off event
     msg_ds.messages[:] = "Not a science or pulser event"
-    result = idex_l1b(msg_ds, "msg")
+    result = idex_l1b(msg_ds, "msg-10days")
     assert result is None
+
+
+def test_get_event_dead_time():
+    """Check that dead time is computed correctly from txhdrblocks."""
+    base = np.array([0, 1, 3, 63, 0, 63], dtype=np.uint32)
+    shift = np.array([0, 1, 2, 15, 15, 0], dtype=np.uint32)
+    txhdrblocks = (base << 24) | (shift << 20)
+
+    l1a_dataset = xr.Dataset(
+        {"idx__txhdrblocks": xr.DataArray(txhdrblocks, dims="epoch")}
+    )
+    dead_time = get_event_dead_time(l1a_dataset, get_idex_attrs("l1b"))["dead_time"]
+
+    expected_dead_time = (
+        base.astype(np.float64) * (2.0 ** shift.astype(np.float64)) * DT_BLOCK
+    )
+
+    np.testing.assert_array_equal(
+        dead_time.data,
+        expected_dead_time,
+        err_msg=(
+            "The dead_time values did not match the expected values: "
+            f"{expected_dead_time}. Found: {dead_time.data}"
+        ),
+    )

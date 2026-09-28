@@ -192,8 +192,9 @@ class TestHiPointingSet:
         np.testing.assert_array_equal(hi_pset.az_el_points.shape, (3600, 2))
         # check that the midpoint_j2000_et property is equal to the expected value
         assert hi_pset.midpoint_j2000_et == ttj2000ns_to_et(hi_pset.epoch + delta / 2)
-        for var_name in ["exposure_factor", "bg_rate", "bg_rate_sys_err"]:
+        for var_name in ["exposure_factor", "bg_rate", "bg_rate_sys_err", "ena_count"]:
             assert var_name in hi_pset.data
+        assert "counts" not in hi_pset.data
 
     def test_from_cdf(self, hi_pset_cdf_path):
         """Test coverage for instantiating HiPointingSet from cdf."""
@@ -208,8 +209,8 @@ class TestHiPointingSet:
         rect_map = ena_maps.RectangularSkyMap(
             spacing_deg=2, spice_frame=geometry.SpiceFrame.IMAP_HAE
         )
-        rect_map.project_pset_values_to_map(hi_pset, ["counts", "exposure_factor"])
-        assert rect_map.data_1d["counts"].max() > 0
+        rect_map.project_pset_values_to_map(hi_pset, ["ena_count", "exposure_factor"])
+        assert rect_map.data_1d["ena_count"].max() > 0
 
 
 @pytest.fixture
@@ -948,6 +949,11 @@ class TestRectangularSkyMap:
             name="ena_intesity",
             dims=[k for k in coord_sizes.keys()][:-1],
         )
+        mock_dataset["ena_intensity_stat_uncert"] = xr.DataArray(
+            np.ones(tuple(s for s in coord_sizes.values())[:-1]),
+            name="counts",
+            dims=[k for k in coord_sizes.keys()][:-1],
+        )
         # Add one variable that is expected to get removed because it has a
         # dimension that is not in the list of `coord_names`
         mock_dataset["extra_dimension_var"] = xr.DataArray(
@@ -994,15 +1000,23 @@ class TestRectangularSkyMap:
         # Check the epoch values
         assert CoordNames.TIME.value in cdf_dataset
         assert cdf_dataset[CoordNames.TIME.value].values[0] == skymap.min_epoch
-        assert (
-            cdf_dataset[CoordNames.TIME.value].attrs["DELTA_PLUS_VAR"] == "epoch_delta"
-        )
         # Check epoch_delta
+        assert (
+            cdf_dataset[CoordNames.TIME.value].attrs["DELTA_PLUS_VAR"]
+            == f"{CoordNames.TIME.value}_delta"
+        )
+        assert (
+            cdf_dataset[CoordNames.TIME.value].attrs["DELTA_MINUS_VAR"]
+            == f"{CoordNames.TIME.value}_delta_minus"
+        )
         assert f"{CoordNames.TIME.value}_delta" in cdf_dataset
         assert (
             cdf_dataset[f"{CoordNames.TIME.value}_delta"].values[0]
             == skymap.max_epoch - skymap.min_epoch
         )
+        # Check epoch_delta_minus
+        assert f"{CoordNames.TIME.value}_delta_minus" in cdf_dataset
+        assert cdf_dataset[f"{CoordNames.TIME.value}_delta_minus"].values == 0
 
         # Energy related checks
         assert CoordNames.ENERGY_L2.value in cdf_dataset
@@ -1035,6 +1049,11 @@ class TestRectangularSkyMap:
         assert (
             cdf_dataset["ena_intensity"].attrs["CATDESC"]
             == "IMAP Hi45 H Inten, HAE SC Frame, No Surv Corr, Ram, 6 deg, 6 Mon"
+        )
+        assert (
+            cdf_dataset["ena_intensity_stat_uncert"].attrs["CATDESC"]
+            == "IMAP Hi45 H Inten Stat. Unc."
+            ", HAE SC Frame, No Surv Corr, Ram, 6 deg, 6 Mon"
         )
 
     @mock.patch("imap_processing.ena_maps.ena_maps.RectangularSkyMap.to_dataset")
@@ -1096,6 +1115,26 @@ class TestRectangularSkyMap:
             _ = skymap.build_cdf_dataset(
                 "hi", "l2", "h45-ena-h-sf-nsp-ram-hae-6deg-6mo", sensor="45"
             )
+
+    @mock.patch("imap_processing.ena_maps.ena_maps.RectangularSkyMap.to_dataset")
+    def test_build_cdf_dataset_invalid_descriptor(
+        self, mock_to_dataset, mock_data_for_build_cdf_dataset
+    ):
+        """Test build_cdf_dataset with a descriptor that MapDescriptor can't parse.
+
+        Logical_source_description falls back to the old format-string
+        behavior (rather than crashing) when the descriptor isn't a valid
+        MapDescriptor string, but the later CATDESC generation step still
+        re-parses the descriptor and so still raises the original ValueError.
+        """
+        mock_to_dataset.return_value = mock_data_for_build_cdf_dataset
+
+        skymap = ena_maps.RectangularSkyMap(6, geometry.SpiceFrame.ECLIPJ2000)
+        skymap.min_epoch = 10
+        skymap.max_epoch = 15
+
+        with pytest.raises(ValueError, match="Invalid map_descriptor format"):
+            skymap.build_cdf_dataset("hi", "l2", "foo_descriptor", sensor="45")
 
     @mock.patch("imap_processing.ena_maps.ena_maps.RectangularSkyMap.to_dataset")
     def test_keep_vars_with_no_attributes(

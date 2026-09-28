@@ -154,9 +154,24 @@ class GLOWSL1bFlags(FlagNameMixin):
     IS_SUSPECTED_TRANSIENT = 2**3  # Is the bin a suspected transient.
 
 
+class SweL1bFlags(FlagNameMixin):
+    """SWE L1b flags."""
+
+    NONE = CommonFlags.NONE
+    INF = CommonFlags.INF
+    NEG = CommonFlags.NEG
+    LAST_CAL_INTERVAL = (
+        2**2
+    )  # bit 2, counter values extrapolated using last two cal entries
+
+
 class ImapHiL1bDeFlags(FlagNameMixin):
     """IMAP Hi L1B Direct Event CCSDS packet quality flags."""
 
     NONE = CommonFlags.NONE
     PACKET_FULL = 2**0  # bit 0, packet contained 664 events (max capacity)
+    BAD_ESA_VOLTAGE = 2**1  # bit 1, ESA voltage didn't match any esa_energy_step
     BADSPIN = ENAFlags.BADSPIN  # bit 2, packet contained events from an invalid spin
+    BAD_DETECTOR_VOLTAGE = (
+        2**3
+    )  # bit 3, detector HV deviated from the pointing's reference voltages

@@ -70,7 +70,10 @@ def hi_l1c(
     logger.info("Running Hi l1c processing")
 
     l1c_dataset = generate_pset_dataset(
-        de_dataset, calibration_prod_config_path, goodtimes_ds, background_config_path
+        de_dataset,
+        calibration_prod_config_path,
+        goodtimes_ds,
+        background_config_path,
     )
 
     return [l1c_dataset]
@@ -108,6 +111,12 @@ def generate_pset_dataset(
     logical_source_parts = parse_filename_like(de_dataset.attrs["Logical_source"])
     # read calibration product configuration file
     config_df = CalibrationProductConfig.from_csv(calibration_prod_config_path)
+    # Select this pointing's matched gain state up front
+    hv_deltas = {
+        field: de_dataset.attrs[field]
+        for field in CalibrationProductConfig.GAIN_MATCH_FIELDS
+    }
+    gain_config_df = config_df.cal_prod_config.select_gain_config(hv_deltas)
     # read background configuration file
     background_df = BackgroundConfig.from_csv(background_config_path)
 
@@ -123,9 +132,12 @@ def generate_pset_dataset(
         pset_dataset.epoch.data[0] + pset_dataset.epoch_delta.data[0] / 2
     )
     pset_dataset.update(pset_geometry(pset_midpoint_et, logical_source_parts["sensor"]))
+    # Look up the per-esa_energy_step geometric factor for this pointing's
+    # gain state.
+    pset_dataset = add_pset_geometric_factor(pset_dataset, gain_config_df)
     # Bin the counts into the spin-bins
     pset_dataset.update(
-        pset_counts(pset_dataset.coords, config_df, de_dataset, goodtimes_ds)
+        pset_counts(pset_dataset.coords, gain_config_df, de_dataset, goodtimes_ds)
     )
     # Calculate and add the exposure time to the pset_dataset
     pset_dataset.update(pset_exposure(pset_dataset.coords, de_dataset, goodtimes_ds))
@@ -343,9 +355,66 @@ def pset_geometry(pset_et: float, sensor_str: str) -> dict[str, xr.DataArray]:
     return geometry_vars
 
 
+def add_pset_geometric_factor(
+    pset_ds: xr.Dataset,
+    gain_config_df: pd.DataFrame | None,
+) -> xr.Dataset:
+    """
+    Add the geometric_factor variable to a pset dataset in place.
+
+    Parameters
+    ----------
+    pset_ds : xarray.Dataset
+        The PSET dataset being built. Must have "esa_energy_step" and
+        "calibration_prod" coordinates.
+    gain_config_df : pandas.DataFrame or None
+        This pointing's matched gain state configuration (see
+        CalibrationProductConfig.select_gain_config()), indexed by
+        (calibration_prod, esa_energy_step), or None if the pointing's HV
+        deltas didn't match exactly one gain_config_id.
+
+    Returns
+    -------
+    xarray.Dataset
+        The input pset_ds, updated in place with a "geometric_factor"
+        variable, dims (epoch, esa_energy_step, calibration_prod).
+
+    Notes
+    -----
+    A pointing's gain state is constant for the whole pointing (see
+    `hi_l1b.de_gain_test_filter`), so the L1B DE product only records the
+    pointing's reference detector voltage deltas as global attributes rather
+    than duplicating the geometric factor across every direct event. Records
+    the geometric_factor value for each (esa_energy_step, calibration_prod)
+    pair directly from gain_config_df's rows. Not yet consumed by L2 processing
+    (deferred to a follow-on ticket that handles combining PSETs from different
+    gain states into a single map).
+    """
+    geometric_factor_var = create_dataset_variables(
+        ["geometric_factor"],
+        coords=pset_ds.coords,
+        att_manager_lookup_str="hi_pset_{0}",
+    )
+    if gain_config_df is not None:
+        # gain_config_df is indexed by (calibration_prod, esa_energy_step).
+        # Convert to xarray and reindex onto the pset's own coordinate
+        # values so it broadcasts directly into the output array (which
+        # only has dims, not coordinate labels, to reindex_like).
+        gain_factor_da = gain_config_df["geometric_factor"].to_xarray()
+        gain_factor_da = gain_factor_da.reindex(
+            esa_energy_step=pset_ds["esa_energy_step"].data,
+            calibration_prod=pset_ds["calibration_prod"].data,
+        )
+        geometric_factor_var["geometric_factor"].values[0] = gain_factor_da.transpose(
+            "esa_energy_step", "calibration_prod"
+        ).values
+    pset_ds.update(geometric_factor_var)
+    return pset_ds
+
+
 def pset_counts(
     pset_coords: dict[str, xr.DataArray],
-    config_df: pd.DataFrame,
+    gain_config_df: pd.DataFrame | None,
     l1b_de_dataset: xr.Dataset,
     goodtimes_ds: xr.Dataset,
 ) -> dict[str, xr.DataArray]:
@@ -356,8 +425,10 @@ def pset_counts(
     ----------
     pset_coords : dict[str, xarray.DataArray]
         The PSET coordinates from the xarray.Dataset.
-    config_df : pandas.DataFrame
-        The calibration product configuration dataframe.
+    gain_config_df : pandas.DataFrame or None
+        This pointing's matched gain state configuration indexed by
+        (calibration_prod, esa_energy_step), or None if the pointing's HV
+        deltas didn't match exactly one gain_config_id.
     l1b_de_dataset : xarray.Dataset
         The L1B dataset for the pointing being processed.
     goodtimes_ds : xarray.Dataset
@@ -366,7 +437,8 @@ def pset_counts(
     Returns
     -------
     dict[str, xarray.DataArray]
-        Dictionary containing counts DataArray.
+        Dictionary containing counts DataArray. All zero if gain_config_df
+        is None.
     """
     # Generate counts variable filled with zeros
     counts_var = create_dataset_variables(
@@ -375,6 +447,8 @@ def pset_counts(
         att_manager_lookup_str="hi_pset_{0}",
         fill_value=0,
     )
+    if gain_config_df is None:
+        return counts_var
 
     # Create mapping from calibration product numbers to array indices
     cal_prod_to_index = {
@@ -409,7 +483,7 @@ def pset_counts(
     # esa energy step combination. Use the shared generator to iterate over all
     # config combinations and get qualified event masks.
     for esa_energy, config_row, qualified_mask in iter_qualified_events_by_config(
-        de_ds, config_df, esa_energy_steps
+        de_ds, gain_config_df, esa_energy_steps
     ):
         # Filter events using the qualified mask
         filtered_de_ds = de_ds.isel(event_met=qualified_mask)
@@ -421,8 +495,11 @@ def pset_counts(
         spin_bin_indices = (filtered_de_ds["spin_phase"].data * N_SPIN_BINS).astype(int)
         # When iterating over rows of a dataframe, the names of the multi-index
         # are not preserved. Below, `config_row.Index[0]` gets the
-        # calibration_prod value from the namedtuple representing the
-        # dataframe row. We map this to the array index using cal_prod_to_index.
+        # calibration_prod value (index level 0 of gain_config_df's
+        # (calibration_prod, esa_energy_step) MultiIndex, already sliced to
+        # this pointing's single gain_config_id above) from the namedtuple
+        # representing the dataframe row. We map this to the array index
+        # using cal_prod_to_index.
         i_cal_prod = cal_prod_to_index[config_row.Index[0]]
         np.add.at(
             counts_var["counts"].data[0, i_esa, i_cal_prod],
@@ -451,7 +528,7 @@ def _compute_background_counts(
         The PSET coordinates from the xarray.Dataset.
     background_config_df : pandas.DataFrame
         Background configuration DataFrame with MultiIndex
-        (calibration_prod, background_index).
+        (calibration_prod, background_index, esa_energy_step).
     l1b_de_dataset : xarray.Dataset
         The L1B dataset for the pointing being processed.
     goodtimes_ds : xarray.Dataset
@@ -513,20 +590,22 @@ def _compute_background_counts(
     if n_events == 0:
         return background_counts
 
+    # Get TOF configuration (one row per calibration_prod, background_index)
+    # TOF windows are the same across ESA steps, so we use get_tof_config()
+    tof_config = background_config_df.background_config.get_tof_config()
+
     for cal_prod in pset_coords["calibration_prod"].values:
-        # Check that cal_prod exists in background_config_df
-        if cal_prod not in background_config_df.index.get_level_values(
-            "calibration_prod"
-        ):
+        # Check that cal_prod exists in tof_config
+        if cal_prod not in tof_config.index.get_level_values("calibration_prod"):
             raise ValueError(
                 f"Calibration product {cal_prod} not found in background "
                 f"configuration. Available calibration products: "
-                f"{sorted(background_config_df.index.get_level_values('calibration_prod').unique().tolist())}"
+                f"{sorted(tof_config.index.get_level_values('calibration_prod').unique().tolist())}"
             )
 
-        # Take a cross-section of the background configuration DataFrame
+        # Take a cross-section of the TOF configuration DataFrame
         # to get rows relevant to the current calibration product
-        cal_prod_rows = background_config_df.xs(cal_prod, level="calibration_prod")
+        cal_prod_rows = tof_config.xs(cal_prod, level="calibration_prod")
 
         # Use iter_background_events_by_config to get filtered events
         for config_row, filtered_de_ds in iter_background_events_by_config(
@@ -564,7 +643,13 @@ def pset_backgrounds(
 
     Computes background counts internally by filtering and binning events
     according to the background configuration, then calculates background
-    rates and uncertainties.
+    rates and uncertainties. Scaling factors and uncertainties are applied
+    per ESA energy step.
+
+    After computing the combined background rate, a constant offset
+    (HiConstants.EXCESS_BACKGROUND_COUNT_RATE) is subtracted to correct for
+    excess counts from the outer ESA during background testing. The result
+    is clipped to zero to prevent negative rates.
 
     Parameters
     ----------
@@ -572,7 +657,7 @@ def pset_backgrounds(
         The PSET coordinates from the xarray.Dataset.
     background_config_df : pandas.DataFrame
         Background configuration DataFrame with MultiIndex
-        (calibration_prod, background_index).
+        (calibration_prod, background_index, esa_energy_step).
     l1b_de_dataset : xarray.Dataset
         The L1B dataset for the pointing being processed.
     goodtimes_ds : xarray.Dataset
@@ -617,38 +702,86 @@ def pset_backgrounds(
     count_rates = background_counts / total_exposure_time
 
     # Convert background config DataFrame to xarray Dataset
+    # Config now has dims: (calibration_prod, background_index, esa_energy_step)
     config_ds = background_config_df.to_xarray()
-    if not config_ds["calibration_prod"].equals(pset_coords["calibration_prod"]):
+
+    # Validate calibration products match (compare values, not DataArray metadata)
+    if not np.array_equal(
+        config_ds["calibration_prod"].values, pset_coords["calibration_prod"].values
+    ):
         raise ValueError(
             f"Calibration products in pset_coords and background_config_df "
             f"do not match. pset_coords: {pset_coords['calibration_prod'].values}, "
             f"background_config_df: {config_ds['calibration_prod'].values}"
         )
+
+    # Validate ESA energy steps match (compare values, not DataArray metadata)
+    if not np.array_equal(
+        config_ds["esa_energy_step"].values, pset_coords["esa_energy_step"].values
+    ):
+        raise ValueError(
+            f"ESA energy steps in pset_coords and background_config_df "
+            f"do not match. pset_coords: {pset_coords['esa_energy_step'].values}, "
+            f"background_config_df: {config_ds['esa_energy_step'].values}"
+        )
+
+    # scaling_factors_da: (calibration_prod, background_index, esa_energy_step)
     scaling_factors_da = config_ds["scaling_factor"]
     uncertainties_da = config_ds["uncertainty"]
 
     # Compute scaled rates
+    # count_rates: (epoch, calibration_prod, background_index)
+    # scaling_factors_da: (calibration_prod, background_index, esa_energy_step)
+    # scaled_rates: (epoch, calibration_prod, background_index, esa_energy_step)
     scaled_rates = count_rates * scaling_factors_da
 
-    # Compute uncertainties (Poisson + scaling factor, combined in quadrature)
+    # Compute uncertainties: Poisson + scaling factor (combined in quadrature)
     poisson_unc = (
         np.sqrt(background_counts) / total_exposure_time
     ) * scaling_factors_da
     scaling_unc = count_rates * uncertainties_da
+    # combined_unc: (epoch, calibration_prod, background_index, esa_energy_step)
     combined_unc = np.sqrt(poisson_unc**2 + scaling_unc**2)
 
     # Sum over background_index dimension to get final rates
+    # total_rates: (epoch, calibration_prod, esa_energy_step)
     total_rates = scaled_rates.sum(dim="background_index", skipna=True)
     total_unc = np.sqrt((combined_unc**2).sum(dim="background_index", skipna=True))
 
-    # Broadcast to (epoch, esa_energy_step, calibration_prod, spin_angle_bin)
-    # Backgrounds are isotropic and independent of ESA step, so we
-    # broadcast across esa_energy_step and spin_angle_bin dimensions.
-    output_vars["background_rates"].values[:] = total_rates.values[
-        :, np.newaxis, :, np.newaxis
+    # Apply outer ESA background offset correction (do not go negative)
+    # This corrects for excess counts from the outer ESA during background testing.
+    total_rates = np.maximum(total_rates - HiConstants.EXCESS_BACKGROUND_COUNT_RATE, 0)
+
+    # Add uncertainty related to above excess count rate correction
+    # ESAs 7, 8, 9 get an extra 0.0025/s uncertainty to account for possible
+    # unidentified additional background in these ESA steps. The constant
+    # UPPER_ESA_EXTRA_BACKGROUND_UNC is defined as a xr.DataArray with the correct
+    # esa_energy_step coordinate such that it broadcasts appropriately across each
+    # calibration product.
+    # Fill zeros for any esa_energy_steps not in the extra background DataArray
+    upper_esa_unc = HiConstants.UPPER_ESA_EXTRA_BACKGROUND_UNC.reindex(
+        esa_energy_step=pset_coords["esa_energy_step"].values,
+        fill_value=0.0,
+    )
+    total_unc = np.sqrt(
+        total_unc**2
+        + HiConstants.EXCESS_BACKGROUND_COUNT_RATE_UNC**2
+        + upper_esa_unc**2
+    )
+
+    # Broadcast to output variable dimensions (e.g., epoch, esa_energy_step,
+    # calibration_prod, spin_angle_bin). Backgrounds are isotropic, so we
+    # broadcast across the last dimension (spin_angle_bin).
+    # Get the output dimension order from the output variable (excluding last dim)
+    output_dims = output_vars["background_rates"].dims[:-1]
+    total_rates_transposed = total_rates.transpose(*output_dims)
+    total_unc_transposed = total_unc.transpose(*output_dims)
+
+    output_vars["background_rates"].values[:] = total_rates_transposed.values[
+        ..., np.newaxis
     ]
-    output_vars["background_rates_uncertainty"].values[:] = total_unc.values[
-        :, np.newaxis, :, np.newaxis
+    output_vars["background_rates_uncertainty"].values[:] = total_unc_transposed.values[
+        ..., np.newaxis
     ]
 
     return output_vars

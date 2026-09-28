@@ -191,21 +191,25 @@ def test_process_housekeeping(housekeeping_dataset, attribute_manager):
 
     # Define the dataset attributes
     dataset_attrs = {
-        "Acknowledgement": "Please acknowledge the IMAP Mission Principal "
-        "Investigator, Prof. David J. McComas of Princeton "
-        "University.\n",
+        "Acknowledgement": "Users should acknowledge the sources of data used "
+        "in all publications, presentations, and reports using an "
+        "appropriate DOI. Appropriate acknowledgement to institutions, "
+        "personnel, and funding agencies should be given, including "
+        "acknowledging the IMAP Mission Principal Investigator, Prof. David "
+        "J. McComas of Princeton University (Contract #80GSFC19C0027). IMAP "
+        "Rules-of-the-Road for data usage can be found in the IMAP CMAD.\n",
         "Data_type": "L1A_HK>Level-1A Housekeeping",
         "Data_version": None,
         "Descriptor": "HIT>IMAP High-energy Ion Telescope",
         "Discipline": "Solar Physics>Heliospheric Physics",
-        "File_naming_convention": "source_descriptor_datatype_yyyyMMdd_vNNN",
+        "File_naming_convention": "source_descriptor_datatype_yyyyMMdd_vMMM.mmmm",
         "HTTP_LINK": "https://imap.princeton.edu/",
         "Instrument_type": "Particles (space)",
         "LINK_TITLE": "IMAP The Interstellar Mapping and Acceleration Probe",
         "Logical_file_id": None,
         "Logical_source": "imap_hit_l1a_hk",
         "Logical_source_description": "IMAP Mission HIT Instrument Level-1A "
-        "Housekeeping Data.",
+        "Housekeeping Data",
         "Mission_group": "IMAP",
         "PI_affiliation": "Princeton University",
         "PI_name": "Prof. David J. McComas",
@@ -222,7 +226,8 @@ def test_process_housekeeping(housekeeping_dataset, attribute_manager):
         "of ion measurements, such as observing shock-accelerated ions, "
         "determining the origin of the solar energetic particles (SEPs) "
         "spectra, and resolving particle transport in the heliosphere. "
-        "See https://imap.princeton.edu/instruments/hit for more details.\n",
+        "See https://imap.princeton.edu/spacecraft/instruments/"
+        "high-energy-ion-telescope-hit for more details.\n",
     }
 
     # Define the coordinates and dimensions. Both have equivalent values
@@ -236,6 +241,13 @@ def test_process_housekeeping(housekeeping_dataset, attribute_manager):
     # Check that the dataset has the correct attributes, coordinates, and dimensions
     assert processed_hskp_dataset.attrs == dataset_attrs
     assert processed_hskp_dataset.coords.keys() == dataset_coords_dims
+    # Check that sc_tick has DEPEND_0 == "epoch". This is needed since the
+    # hit l1a counts product contains a coordinate named sc_tick with no DEPEND_0
+    # and hit l1a housekeeping shares a CDF config yaml
+    assert processed_hskp_dataset["sc_tick"].attrs["DEPEND_0"] == "epoch"
+    # Check that housekeeping coordinates don't have DEPEND_0
+    for coord in processed_hskp_dataset.coords.values():
+        assert "DEPEND_0" not in coord.attrs
 
 
 def test_add_energy_variables():
