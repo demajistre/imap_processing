@@ -41,4 +41,4 @@ for cull in cullList:
 
 for cull in cullList:
     print(cull)
-    cull_util.cullplot(culls[cull],pointings[cull],saveFile=froot+f"{sensor}_{cull}.png",addTitle=f" {cull}")
+    cull_util.cullplot(culls[cull],pointings[cull],saveFile=froot+f"{sensor}_{cull}_v2.png",addTitle=f" {cull}")

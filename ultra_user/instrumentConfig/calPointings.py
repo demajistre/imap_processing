@@ -24,6 +24,10 @@ class CalPointings:
             thresh_map[cfg] = thresholds[ic, :]
         self.thresh_map = thresh_map
 
+        self.voltage_thresh_map = dict(zip(cdat['cal_config'], cdat['deflector_Vthresh']))
+
+
+
     def getCalPointings(self,calPeriod:str)->list:
         return self.cal_period_map[calPeriod]
 
@@ -52,3 +56,5 @@ class CalPointings:
         calPeriod = self.getCalPeriod(pointing)
         return self.thresh_map[calPeriod]
 
+    def get_delector_Vthresh(self,calPeriod:str) -> float:
+        return self.voltage_thresh_map[calPeriod]

@@ -14,6 +14,7 @@ class UltraCull0():
                  sensor='90', earthAng45=np.radians(20), sep_threshold_per_spin=None, useRawOnly=False):
         cp = calPointings.CalPointings(sensor=sensor)
         self.calPeriod = cp.getCalPeriod(repoint)
+        self.deflector_Vthreshold = cp.get_delector_Vthresh(self.calPeriod)
         if sep_threshold_per_spin is None:
             thresholds = cp.get_cull_thresholds_from_pointing(repoint)
             threshPerSpin = thresholds/spin_range
@@ -86,7 +87,7 @@ class UltraCull0():
                 earth = ENA_planets.ENA_planets(t0)
                 local_uv = earth.local_uvec(myDe['velocity_dps_sc'][ii, :])
                 coslim = np.cos(self.earthAng45)
-                jj = np.nonzero(np.abs(local_uv[0, :] < coslim))[0]
+                jj = np.nonzero(np.abs(local_uv[0, :]) < coslim)[0]
                 ii = ii[jj]
             except:
                 print(f"No DPS frame data for {self.repoint}, t0 = {spiceTime.et_to_utc(t0)} ({t0})")
@@ -146,7 +147,9 @@ class UltraCull0():
                 dvMax[ic] = np.max(np.array(vset))
         return dvMean, dvMin, dvMax
 
-    def lowVoltagespins(self, threshold: float, return_binned=True) -> Dict:
+    def lowVoltagespins(self, threshold: float = None, return_binned=True) -> Dict:
+        if threshold is None:
+            threshold = self.deflector_Vthreshold
         ii = np.nonzero(np.minimum(self.status['rightdeflection_v'], self.status['leftdeflection_v']) < threshold)[0]
         binmask = np.full(self.n_spinbin, True)
         if ii.size == 0:

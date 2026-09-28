@@ -74,7 +74,7 @@ def get_pointings_from_calPeriods(calPointing:str,calRoot:str="resource/",sensor
 
 def runculls(pointings: list, energy_ranges: np.ndarray, sensor='90', earthAng45=np.radians(15), spin_range=20,
              n_iter=5,upstream_chans1=None, upstream_chans2=None, spec_chans=None,
-             sep_threshold_per_spin=None, nAddChans=5,cullPackage="serial_hiEnergy_stat",vthresh=3400,
+             sep_threshold_per_spin=None, nAddChans=5,cullPackage="serial_hiEnergy_stat",vthresh=None,
              useRawOnly=False,removeBadPointings=True):
     if upstream_chans1 is None:
         upstream_chans1 = [0,1,2]
